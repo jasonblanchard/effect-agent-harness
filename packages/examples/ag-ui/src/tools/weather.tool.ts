@@ -1,5 +1,5 @@
-import { createTool } from "@mastra/core/tools";
-import { z } from "zod";
+import { Effect, Schema } from "effect";
+import { Tool, Toolkit } from "effect/ai";
 
 interface GeocodingResponse {
   results: {
@@ -21,24 +21,34 @@ interface WeatherResponse {
   };
 }
 
-export const weatherTool = createTool({
-  id: "get-weather",
+export const GetWeather = Tool.make("get-weather", {
   description: "Get current weather for a location",
-  inputSchema: z.object({
-    location: z.string().describe("City name"),
+  parameters: Schema.Struct({
+    location: Schema.String.annotate({ description: "City name" }),
   }),
-  outputSchema: z.object({
-    temperature: z.number(),
-    feelsLike: z.number(),
-    humidity: z.number(),
-    windSpeed: z.number(),
-    windGust: z.number(),
-    conditions: z.string(),
-    location: z.string(),
+  success: Schema.Struct({
+    temperature: Schema.Number,
+    feelsLike: Schema.Number,
+    humidity: Schema.Number,
+    windSpeed: Schema.Number,
+    windGust: Schema.Number,
+    conditions: Schema.String,
+    location: Schema.String,
   }),
-  execute: async (inputData) => {
-    return await getWeather(inputData.location);
-  },
+  failure: Schema.Struct({ message: Schema.String }),
+  // Report failures (e.g. unknown locations) back to the model instead of
+  // failing the run.
+  failureMode: "return",
+});
+
+export const WeatherToolkit = Toolkit.make(GetWeather);
+
+export const WeatherToolkitLayer = WeatherToolkit.toLayer({
+  "get-weather": ({ location }) =>
+    Effect.tryPromise({
+      try: () => getWeather(location),
+      catch: (error) => ({ message: error instanceof Error ? error.message : String(error) }),
+    }),
 });
 
 const getWeather = async (location: string) => {
