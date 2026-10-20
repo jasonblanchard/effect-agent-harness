@@ -44,6 +44,20 @@ async function chatLoop() {
               onTextMessageEndEvent() {
                 console.log("\n");
               },
+              onToolCallStartEvent({ event }) {
+                console.log("🔧 Tool call:", event.toolCallName);
+              },
+              onToolCallArgsEvent({ event }) {
+                process.stdout.write(event.delta);
+              },
+              onToolCallEndEvent() {
+                console.log("");
+              },
+              onToolCallResultEvent({ event }) {
+                if (event.content) {
+                  console.log("🔍 Tool call result:", event.content);
+                }
+              },
             },
           );
         } catch (error) {
