@@ -13,7 +13,8 @@ describe("AgUi.RunAgentInput", () => {
       expect(input.threadId).toBe("t1");
       expect(input.runId).toBe("r1");
       expect(input.messages).toEqual([{ id: "m1", role: "user", content: "hi" }]);
-    }));
+    }),
+  );
 
   it.effect("accepts and ignores extra fields", () =>
     Effect.gen(function* () {
@@ -36,11 +37,13 @@ describe("AgUi.RunAgentInput", () => {
       });
       expect(Object.keys(input).sort()).toEqual(["messages", "runId", "threadId"]);
       expect(input.messages.map((m) => m.role)).toEqual(["activity", "assistant"]);
-    }));
+    }),
+  );
 
   it.effect("fails when runId is missing", () =>
     Effect.gen(function* () {
       const exit = yield* Effect.exit(AgUi.decodeRunAgentInput({ threadId: "t1", messages: [] }));
       expect(Exit.isFailure(exit)).toBe(true);
-    }));
+    }),
+  );
 });

@@ -1,15 +1,27 @@
 {
-  "name": "effentic",
+  "name": "effentic-monorepo",
   "version": "0.0.1",
   "description": "",
+  "keywords": [],
+  "license": "ISC",
+  "author": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "tsc": "tsc"
+    "test": "pnpm -r --if-present run test",
+    "tsc": "pnpm -r --if-present run tsc",
+    "lint": "pnpm -r --if-present run lint",
+    "format": "pnpm -r --if-present run format && oxfmt '!packages/**'",
+    "format:check": "pnpm -r --if-present run format:check && oxfmt --check '!packages/**'",
+    "prepare": "effect-tsgo patch --typescript --oxlint"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "devDependencies": {
+    "@effect/tsgo": "0.54.1",
+    "oxfmt": "^0.73.0",
+    "oxlint": "1.89.0",
+    "oxlint-tsgolint": "7.0.2004",
+    "typescript": "catalog:"
+  },
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
@@ -17,9 +29,5 @@
       "onFail": "download"
     }
   },
-  "packageManager": "pnpm@12.14.0",
-  "type": "module",
-  "devDependencies": {
-    "typescript": "catalog:"
-  }
+  "packageManager": "pnpm@12.14.0"
 }

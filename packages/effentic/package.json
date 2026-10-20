@@ -2,17 +2,20 @@
   "name": "effentic",
   "version": "0.0.1",
   "description": "",
+  "keywords": [],
+  "license": "ISC",
+  "author": "",
+  "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "test": "vitest run",
-    "tsc": "tsc"
+    "tsc": "tsc",
+    "lint": "oxlint -c ../../.oxlintrc.json",
+    "format": "oxfmt -c ../../.oxfmtrc.json",
+    "format:check": "oxfmt -c ../../.oxfmtrc.json --check"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "module",
   "dependencies": {
     "@ag-ui/core": "^1.0.3",
     "effect": "catalog:"

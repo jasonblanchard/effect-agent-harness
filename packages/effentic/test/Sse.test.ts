@@ -51,7 +51,8 @@ describe("Sse.encode", () => {
         { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
         { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" },
       ]);
-    }));
+    }),
+  );
 });
 
 describe("Agent.make", () => {
@@ -74,7 +75,8 @@ describe("Agent.make", () => {
         EventType.TEXT_MESSAGE_CONTENT,
       ]);
       expect(interrupted).toBe(true);
-    }));
+    }),
+  );
 });
 
 // -----------------------------------------------------------------------------
@@ -98,12 +100,12 @@ const makeHandler = (steps: ReadonlyArray<Step>) => {
           Effect.map((input) =>
             HttpServerResponse.stream(Sse.encode(runAgent(input)).pipe(Stream.encodeText), {
               contentType: Sse.contentType,
-            })
+            }),
           ),
-          Effect.catch(() => Effect.succeed(HttpServerResponse.text("Invalid RunAgentInput", { status: 400 }))),
+          Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
         ),
       );
-    })
+    }),
   ).pipe(Layer.provide(layer));
   const { handler, dispose } = HttpRouter.toWebHandler(AgentRoute, { disableLogger: true });
   disposers.push(dispose);
@@ -113,7 +115,11 @@ const makeHandler = (steps: ReadonlyArray<Step>) => {
 describe("HttpAgent against a caller-owned SSE route", () => {
   it("runs a multi-turn conversation with tool calls", async () => {
     const { handler, prompts } = makeHandler([
-      [...text("0", "Let me check."), ...toolCall("toolu_1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+      [
+        ...text("0", "Let me check."),
+        ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
+        finish("tool-calls"),
+      ],
       [...text("0", "It is 18°C in Paris."), finish("stop")],
       [...text("0", "Still 18°C."), finish("stop")],
     ]);
@@ -148,9 +154,9 @@ describe("HttpAgent against a caller-owned SSE route", () => {
     expect(seen).toEqual([
       "text:Let me check.",
       "tool:get-weather",
-      "args:{\"location\":\"Paris\"}",
+      'args:{"location":"Paris"}',
       "tool-end",
-      "result:{\"temperature\":18}",
+      'result:{"temperature":18}',
       "text:It is 18°C in Paris.",
     ]);
     expect(agent.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);

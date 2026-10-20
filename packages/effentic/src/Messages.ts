@@ -61,13 +61,15 @@ export const toPrompt = (messages: ReadonlyArray<AgUi.Message>, options?: ToProm
         }
         encoded.push({
           role: "tool",
-          content: [{
-            type: "tool-result",
-            id: message.toolCallId,
-            name,
-            isFailure: false,
-            result: parseJson(textOf(message.content)),
-          }],
+          content: [
+            {
+              type: "tool-result",
+              id: message.toolCallId,
+              name,
+              isFailure: false,
+              result: parseJson(textOf(message.content)),
+            },
+          ],
         });
         break;
       }
@@ -83,8 +85,9 @@ const textOf = (content: unknown): string => {
   }
   if (Array.isArray(content)) {
     return content
-      .filter((part): part is { type: "text"; text: string } =>
-        typeof part === "object" && part !== null && part.type === "text" && typeof part.text === "string"
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          typeof part === "object" && part !== null && part.type === "text" && typeof part.text === "string",
       )
       .map((part) => part.text)
       .join("");

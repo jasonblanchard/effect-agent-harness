@@ -16,17 +16,23 @@ export interface AgentOptions<Tools extends Record<string, Tool.Any>> {
   readonly maxSteps?: number | undefined;
 }
 
-export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded>()("StepLimitExceeded", {
-  maxSteps: Schema.Number,
-}) {
+export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded, { readonly brand: unique symbol }>()(
+  "StepLimitExceeded",
+  {
+    maxSteps: Schema.Finite,
+  },
+) {
   override get message(): string {
     return `Step limit exceeded: the model was still calling tools after ${this.maxSteps} steps`;
   }
 }
 
-export class ModelStreamError extends Schema.TaggedError<ModelStreamError>()("ModelStreamError", {
-  error: Schema.Unknown,
-}) {
+export class ModelStreamError extends Schema.TaggedError<ModelStreamError, { readonly brand: unique symbol }>()(
+  "ModelStreamError",
+  {
+    error: Schema.Unknown,
+  },
+) {
   override get message(): string {
     return errorMessage(this.error);
   }
@@ -45,52 +51,57 @@ export type Requirements<Tools extends Record<string, Tool.Any>> =
  * well-formed AG-UI event stream. Failures are reported in-band as
  * `RUN_ERROR`, so the stream itself never fails.
  */
-export const run = <Tools extends Record<string, Tool.Any>>(options: AgentOptions<Tools>) =>
-(input: AgUi.RunAgentInput): Stream.Stream<AgUi.Event, never, Requirements<Tools>> =>
-  Stream.unwrap(Effect.gen(function* () {
-    const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
-      Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
-    );
-    const maxSteps = options.maxSteps ?? 10;
-    let current: StepState | undefined;
-
-    const step = (prompt: Prompt.Prompt, index: number): Stream.Stream<AgUi.Event, unknown, Requirements<Tools>> =>
-      Stream.unwrap(Effect.gen(function* () {
-        if (index > maxSteps) {
-          return yield* new StepLimitExceeded({ maxSteps });
-        }
-        const state = new StepState(yield* ids.generateId());
-        current = state;
-        const parts: Array<Response.AnyPart> = [];
-
-        const events = LanguageModel.streamText({ prompt, toolkit: options.toolkit }).pipe(
-          Stream.mapEffect((part) => {
-            parts.push(part as Response.AnyPart);
-            return handlePart(state, part as Response.StreamPart<Record<string, Tool.Any>>, ids);
-          }),
-          Stream.flattenIterable,
+export const run =
+  <Tools extends Record<string, Tool.Any>>(options: AgentOptions<Tools>) =>
+  (input: AgUi.RunAgentInput): Stream.Stream<AgUi.Event, never, Requirements<Tools>> =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
+          Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
         );
+        const maxSteps = options.maxSteps ?? 10;
+        let current: StepState | undefined;
 
-        const next = Stream.suspend(() => {
-          const closing = Stream.fromIterable(state.close());
-          return state.finishReason === "tool-calls"
-            ? Stream.concat(closing, step(Prompt.concat(prompt, Prompt.fromResponseParts(parts)), index + 1))
-            : closing;
-        });
+        const step = (prompt: Prompt.Prompt, index: number): Stream.Stream<AgUi.Event, unknown, Requirements<Tools>> =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              if (index > maxSteps) {
+                return yield* new StepLimitExceeded({ maxSteps });
+              }
+              const state = new StepState(yield* ids.generateId());
+              current = state;
+              const parts: Array<Response.AnyPart> = [];
 
-        return Stream.concat(events, next);
-      }));
+              const events = LanguageModel.streamText({ prompt, toolkit: options.toolkit }).pipe(
+                Stream.mapEffect((part) => {
+                  parts.push(part as Response.AnyPart);
+                  return handlePart(state, part as Response.StreamPart<Record<string, Tool.Any>>, ids);
+                }),
+                Stream.flattenIterable,
+              );
 
-    return Stream.make(AgUi.runStarted(input)).pipe(
-      Stream.concat(step(Messages.toPrompt(input.messages, { system: options.system }), 1)),
-      Stream.concat(Stream.sync(() => AgUi.runFinished(input))),
-      Stream.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Stream.failCause(cause as Cause.Cause<never>)
-          : Stream.fromIterable([...(current?.close() ?? []), AgUi.runError(causeMessage(cause))])
-      ),
+              const next = Stream.suspend(() => {
+                const closing = Stream.fromIterable(state.close());
+                return state.finishReason === "tool-calls"
+                  ? Stream.concat(closing, step(Prompt.concat(prompt, Prompt.fromResponseParts(parts)), index + 1))
+                  : closing;
+              });
+
+              return Stream.concat(events, next);
+            }),
+          );
+
+        return Stream.make(AgUi.runStarted(input)).pipe(
+          Stream.concat(step(Messages.toPrompt(input.messages, { system: options.system }), 1)),
+          Stream.concat(Stream.sync(() => AgUi.runFinished(input))),
+          Stream.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Stream.failCause(cause as Cause.Cause<never>)
+              : Stream.fromIterable([...(current?.close() ?? []), AgUi.runError(causeMessage(cause))]),
+          ),
+        );
+      }),
     );
-  }));
 
 /**
  * Captures the agent's services once and returns a runner whose streams have
@@ -196,12 +207,14 @@ const handlePart = (
       if (state.openTools.delete(part.id)) {
         events.push(AgUi.toolCallEnd(part.id));
       }
-      return ids.generateId().pipe(
-        Effect.map((messageId) => [
-          ...events,
-          AgUi.toolCallResult(messageId, part.id, JSON.stringify(part.encodedResult ?? null)),
-        ]),
-      );
+      return ids
+        .generateId()
+        .pipe(
+          Effect.map((messageId) => [
+            ...events,
+            AgUi.toolCallResult(messageId, part.id, JSON.stringify(part.encodedResult ?? null)),
+          ]),
+        );
     }
     case "finish": {
       state.finishReason = part.reason;

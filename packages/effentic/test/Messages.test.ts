@@ -5,20 +5,21 @@ import * as Messages from "../src/Messages.ts";
 const simplify = (messages: ReadonlyArray<AgUi.Message>, system?: string) =>
   Messages.toPrompt(messages, { system }).content.map((message) => ({
     role: message.role,
-    content: typeof message.content === "string"
-      ? message.content
-      : message.content.map((part) => {
-        switch (part.type) {
-          case "text":
-            return { type: "text", text: part.text };
-          case "tool-call":
-            return { type: "tool-call", id: part.id, name: part.name, params: part.params };
-          case "tool-result":
-            return { type: "tool-result", id: part.id, name: part.name, result: part.result };
-          default:
-            return { type: part.type };
-        }
-      }),
+    content:
+      typeof message.content === "string"
+        ? message.content
+        : message.content.map((part) => {
+            switch (part.type) {
+              case "text":
+                return { type: "text", text: part.text };
+              case "tool-call":
+                return { type: "tool-call", id: part.id, name: part.name, params: part.params };
+              case "tool-result":
+                return { type: "tool-result", id: part.id, name: part.name, result: part.result };
+              default:
+                return { type: part.type };
+            }
+          }),
   }));
 
 describe("Messages.toPrompt", () => {
@@ -29,9 +30,9 @@ describe("Messages.toPrompt", () => {
         id: "a1",
         role: "assistant",
         content: "Let me check.",
-        toolCalls: [{ id: "toolu_1", function: { name: "get-weather", arguments: "{\"location\":\"Paris\"}" } }],
+        toolCalls: [{ id: "toolu_1", function: { name: "get-weather", arguments: '{"location":"Paris"}' } }],
       },
-      { id: "t1", role: "tool", toolCallId: "toolu_1", content: "{\"temperature\":18}" },
+      { id: "t1", role: "tool", toolCallId: "toolu_1", content: '{"temperature":18}' },
       { id: "a2", role: "assistant", content: "It is 18°C." },
       { id: "u2", role: "user", content: "And tomorrow?" },
     ]);
@@ -81,7 +82,11 @@ describe("Messages.toPrompt", () => {
 
   it("extracts text from content parts and keeps non-JSON tool content as a string", () => {
     const result = simplify([
-      { id: "u1", role: "user", content: [{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }] },
+      {
+        id: "u1",
+        role: "user",
+        content: [{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }],
+      },
       { id: "a1", role: "assistant", toolCalls: [{ id: "c1", function: { name: "f", arguments: "" } }] },
       { id: "t1", role: "tool", toolCallId: "c1", content: "not json" },
     ]);

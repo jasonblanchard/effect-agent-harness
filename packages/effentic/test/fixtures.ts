@@ -78,7 +78,7 @@ export const counterIds = (prefix = "id") => {
 export const GetWeather = Tool.make("get-weather", {
   description: "Get current weather for a location",
   parameters: Schema.Struct({ location: Schema.String }),
-  success: Schema.Struct({ temperature: Schema.Number }),
+  success: Schema.Struct({ temperature: Schema.Finite }),
   failure: Schema.Struct({ message: Schema.String }),
   failureMode: "return",
 });

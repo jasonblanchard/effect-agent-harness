@@ -27,11 +27,11 @@ export const GetWeather = Tool.make("get-weather", {
     location: Schema.String.annotate({ description: "City name" }),
   }),
   success: Schema.Struct({
-    temperature: Schema.Number,
-    feelsLike: Schema.Number,
-    humidity: Schema.Number,
-    windSpeed: Schema.Number,
-    windGust: Schema.Number,
+    temperature: Schema.Finite,
+    feelsLike: Schema.Finite,
+    humidity: Schema.Finite,
+    windSpeed: Schema.Finite,
+    windGust: Schema.Finite,
     conditions: Schema.String,
     location: Schema.String,
   }),
@@ -52,9 +52,7 @@ export const WeatherToolkitLayer = WeatherToolkit.toLayer({
 });
 
 const getWeather = async (location: string) => {
-  const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
-    location,
-  )}&count=1`;
+  const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
   const geocodingResponse = await fetch(geocodingUrl);
   const geocodingData = (await geocodingResponse.json()) as GeocodingResponse;
 

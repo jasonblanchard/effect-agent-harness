@@ -44,11 +44,13 @@ const modelFailure = AiError.make({
 
 describe("verify", () => {
   it("rejects sequences the AG-UI client would reject", async () => {
-    await expect(verify([
-      { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" } as AgUi.Event,
-      { type: EventType.TEXT_MESSAGE_START, messageId: "m1", role: "assistant" } as AgUi.Event,
-      { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" } as AgUi.Event,
-    ])).rejects.toThrow(/text messages are still active/);
+    await expect(
+      verify([
+        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" } as AgUi.Event,
+        { type: EventType.TEXT_MESSAGE_START, messageId: "m1", role: "assistant" } as AgUi.Event,
+        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" } as AgUi.Event,
+      ]),
+    ).rejects.toThrow(/text messages are still active/);
   });
 });
 
@@ -64,14 +66,15 @@ describe("Agent.run", () => {
         { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
         { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" },
       ]);
-    }));
+    }),
+  );
 
   it.effect("resolves tool calls and continues with a new step", () =>
     Effect.gen(function* () {
       const { events, prompts } = yield* runScripted([
         [
           ...text("0", "Let me check."),
-          ...toolCall("toolu_1", "get-weather", { location: "Paris" }, ["{\"location\":", "\"Paris\"}"]),
+          ...toolCall("toolu_1", "get-weather", { location: "Paris" }, ['{"location":', '"Paris"}']),
           finish("tool-calls"),
         ],
         [...text("0", "It is 18°C."), finish("stop")],
@@ -100,11 +103,11 @@ describe("Agent.run", () => {
         toolCallName: "get-weather",
         parentMessageId: (step1Start as { messageId: string }).messageId,
       });
-      expect([args1, args2].map((e) => (e as { delta: string }).delta)).toEqual(["{\"location\":", "\"Paris\"}"]);
+      expect([args1, args2].map((e) => (e as { delta: string }).delta)).toEqual(['{"location":', '"Paris"}']);
       expect(result).toMatchObject({
         type: EventType.TOOL_CALL_RESULT,
         toolCallId: "toolu_1",
-        content: "{\"temperature\":18}",
+        content: '{"temperature":18}',
       });
 
       // Anthropic-style part id "0" on both steps must not leak into AG-UI ids.
@@ -119,7 +122,8 @@ describe("Agent.run", () => {
       expect(second[2]).toMatchObject({
         content: [{ type: "tool-result", id: "toolu_1", name: "get-weather", result: { temperature: 18 } }],
       });
-    }));
+    }),
+  );
 
   it.effect("returns tool failures to the model", () =>
     Effect.gen(function* () {
@@ -128,10 +132,11 @@ describe("Agent.run", () => {
         [...text("0", "I couldn't find that place."), finish("stop")],
       ]);
       const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
-      expect(result).toMatchObject({ content: "{\"message\":\"Location 'Nowhere' not found\"}" });
+      expect(result).toMatchObject({ content: '{"message":"Location \'Nowhere\' not found"}' });
       expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
       expect(prompts).toHaveLength(2);
-    }));
+    }),
+  );
 
   it.effect("ends with RUN_ERROR when the step limit is exceeded", () =>
     Effect.gen(function* () {
@@ -143,7 +148,8 @@ describe("Agent.run", () => {
       expect(prompts).toHaveLength(2);
       expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
       expect((events.at(-1) as { message: string }).message).toContain("Step limit exceeded");
-    }));
+    }),
+  );
 
   it.effect("closes an open text message before RUN_ERROR when the model fails", () =>
     Effect.gen(function* () {
@@ -157,15 +163,18 @@ describe("Agent.run", () => {
         EventType.TEXT_MESSAGE_END,
         EventType.RUN_ERROR,
       ]);
-    }));
+    }),
+  );
 
   it.effect("closes an open tool call before RUN_ERROR on an error part", () =>
     Effect.gen(function* () {
-      const { events } = yield* runScripted([[
-        { type: "tool-params-start", id: "toolu_1", name: "get-weather" },
-        { type: "tool-params-delta", id: "toolu_1", delta: "{\"loc" },
-        { type: "error", error: { message: "overloaded" } },
-      ]]);
+      const { events } = yield* runScripted([
+        [
+          { type: "tool-params-start", id: "toolu_1", name: "get-weather" },
+          { type: "tool-params-delta", id: "toolu_1", delta: '{"loc' },
+          { type: "error", error: { message: "overloaded" } },
+        ],
+      ]);
       expect(types(events)).toEqual([
         EventType.RUN_STARTED,
         EventType.TOOL_CALL_START,
@@ -174,7 +183,8 @@ describe("Agent.run", () => {
         EventType.RUN_ERROR,
       ]);
       expect(events.at(-1)).toMatchObject({ message: "overloaded" });
-    }));
+    }),
+  );
 
   it.effect("closes a text message the model never ended", () =>
     Effect.gen(function* () {
@@ -186,7 +196,8 @@ describe("Agent.run", () => {
         EventType.TEXT_MESSAGE_END,
         EventType.RUN_FINISHED,
       ]);
-    }));
+    }),
+  );
 
   it.effect("uses one message id for every text block in a step", () =>
     Effect.gen(function* () {
@@ -194,7 +205,8 @@ describe("Agent.run", () => {
       const starts = events.filter((e) => e.type === EventType.TEXT_MESSAGE_START);
       expect(starts).toHaveLength(2);
       expect(new Set(starts.map((e) => (e as { messageId: string }).messageId))).toEqual(new Set(["id-1"]));
-    }));
+    }),
+  );
 
   it.effect("emits complete tool calls from providers that do not stream parameters", () =>
     Effect.gen(function* () {
@@ -204,14 +216,16 @@ describe("Agent.run", () => {
       ]);
       expect(events.slice(1, 4)).toEqual([
         { type: EventType.TOOL_CALL_START, toolCallId: "call_1", toolCallName: "get-weather", parentMessageId: "id-1" },
-        { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_1", delta: "{\"location\":\"Paris\"}" },
+        { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_1", delta: '{"location":"Paris"}' },
         { type: EventType.TOOL_CALL_END, toolCallId: "call_1" },
       ]);
-    }));
+    }),
+  );
 
   it.effect("sends the system prompt before the client history", () =>
     Effect.gen(function* () {
       const { prompts } = yield* runScripted([[finish("stop")]], { system: "Be helpful." });
       expect(prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
-    }));
+    }),
+  );
 });
