@@ -19,9 +19,6 @@
   },
   "packageManager": "pnpm@12.14.0",
   "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
   "devDependencies": {
     "typescript": "catalog:"
   }

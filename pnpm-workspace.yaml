@@ -1,4 +1,4 @@
 packages:
-  - packages/*
+  - packages/**
 catalog:
   typescript: ^7.0.2

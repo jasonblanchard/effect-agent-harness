@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "tsc": "tsc",
-    "dev": "node --env-file-if-exists=../../.env src/index.ts"
+    "dev": "node --env-file-if-exists=../../../.env src/index.ts"
   },
   "keywords": [],
   "author": "",
