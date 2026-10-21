@@ -1,6 +1,7 @@
-import { Cause, Effect, Option, Schema, Stream } from "effect";
+import { Cause, Effect, Option, Predicate, Schema, Stream } from "effect";
 import { IdGenerator, LanguageModel, Prompt } from "effect/ai";
 import type { Response, Tool, Toolkit } from "effect/ai";
+import type { RunFinishedOutcome } from "@ag-ui/core";
 import * as AgUi from "./AgUi.ts";
 import * as Messages from "./Messages.ts";
 
@@ -12,8 +13,10 @@ export interface AgentOptions<Tools extends Record<string, Tool.Any>> {
   readonly toolkit: Toolkit.Toolkit<Tools>;
   /** System prompt placed before the client-provided history. */
   readonly system?: string | undefined;
-  /** Maximum number of model steps per run. Defaults to 10. */
+  /** Maximum number of model steps per run, a positive integer. Defaults to 10. */
   readonly maxSteps?: number | undefined;
+  /** What to do with client-sent `system`/`developer` messages. See {@link Messages.ToPromptOptions}. */
+  readonly clientSystem?: Messages.ToPromptOptions["clientSystem"];
 }
 
 export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded, { readonly brand: unique symbol }>()(
@@ -50,16 +53,28 @@ export type Requirements<Tools extends Record<string, Tool.Any>> =
  * the model step by step (resolving tool calls in between) and emits a
  * well-formed AG-UI event stream. Failures are reported in-band as
  * `RUN_ERROR`, so the stream itself never fails.
+ *
+ * Interrupting the stream (the consumer stops reading) cancels the run without
+ * a terminal event, since nothing can be emitted once it is interrupted. A
+ * caller that stops runs on its own (a deadline, shutdown) should do so
+ * in-band, e.g. by failing a tool or the model call, so the client still
+ * receives `RUN_ERROR`.
+ *
+ * `RUN_ERROR.message` carries the underlying error's message, which may include
+ * provider details; callers serving untrusted clients can rewrite it by mapping
+ * the stream. `RUN_ERROR.code` is the error's tag.
  */
-export const run =
-  <Tools extends Record<string, Tool.Any>>(options: AgentOptions<Tools>) =>
-  (input: AgUi.RunAgentInput): Stream.Stream<AgUi.Event, never, Requirements<Tools>> =>
+export const run = <Tools extends Record<string, Tool.Any>>(options: AgentOptions<Tools>) => {
+  const maxSteps = options.maxSteps ?? 10;
+  if (!Number.isInteger(maxSteps) || maxSteps < 1) {
+    throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
+  }
+  return (input: AgUi.RunAgentInput): Stream.Stream<AgUi.Event, never, Requirements<Tools>> =>
     Stream.unwrap(
       Effect.gen(function* () {
         const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
           Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
         );
-        const maxSteps = options.maxSteps ?? 10;
         let current: StepState | undefined;
 
         const step = (prompt: Prompt.Prompt, index: number): Stream.Stream<AgUi.Event, unknown, Requirements<Tools>> =>
@@ -74,6 +89,8 @@ export const run =
 
               const events = LanguageModel.streamText({ prompt, toolkit: options.toolkit }).pipe(
                 Stream.mapEffect((part) => {
+                  // The toolkit's own part type is narrower than both of these,
+                  // which only widen the tool names and parameter types.
                   parts.push(part as Response.AnyPart);
                   return handlePart(state, part as Response.StreamPart<Record<string, Tool.Any>>, ids);
                 }),
@@ -82,7 +99,9 @@ export const run =
 
               const next = Stream.suspend(() => {
                 const closing = Stream.fromIterable(state.close());
-                return state.finishReason === "tool-calls"
+                // Continue only when every call made in this step was answered.
+                // An unanswered call ends the run and is reported as pending.
+                return state.finishReason === "tool-calls" && state.unanswered().length === 0
                   ? Stream.concat(closing, step(Prompt.concat(prompt, Prompt.fromResponseParts(parts)), index + 1))
                   : closing;
               });
@@ -91,17 +110,30 @@ export const run =
             }),
           );
 
+        const prompt = Messages.toPrompt(input.messages, {
+          system: options.system,
+          clientSystem: options.clientSystem,
+        });
+
         return Stream.make(AgUi.runStarted(input)).pipe(
-          Stream.concat(step(Messages.toPrompt(input.messages, { system: options.system }), 1)),
-          Stream.concat(Stream.sync(() => AgUi.runFinished(input))),
-          Stream.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Stream.failCause(cause as Cause.Cause<never>)
-              : Stream.fromIterable([...(current?.close() ?? []), AgUi.runError(causeMessage(cause))]),
-          ),
+          Stream.concat(step(prompt, 1)),
+          Stream.concat(Stream.sync(() => AgUi.runFinished(input, outcomeOf(current)))),
+          Stream.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) {
+              // An interrupt-only cause has no failures, so its error type is irrelevant.
+              return Stream.failCause(cause as Cause.Cause<never>);
+            }
+            const error = Cause.squash(cause);
+            return Stream.fromIterable([
+              ...(current?.close() ?? []),
+              AgUi.runError(errorMessage(error), errorCode(error)),
+            ]);
+          }),
+          Stream.withSpan("effentic/Agent.run", { attributes: { threadId: input.threadId, runId: input.runId } }),
         );
       }),
     );
+};
 
 /**
  * Captures the agent's services once and returns a runner whose streams have
@@ -128,6 +160,7 @@ class StepState {
   readonly openText = new Set<string>();
   readonly openTools = new Set<string>();
   readonly seenTools = new Set<string>();
+  readonly answeredTools = new Set<string>();
   finishReason: Response.FinishReason | undefined;
   readonly messageId: string;
 
@@ -148,7 +181,17 @@ class StepState {
     this.openTools.clear();
     return events;
   }
+
+  /** Tool calls made in this step that got no result. */
+  unanswered(): Array<string> {
+    return [...this.seenTools].filter((id) => !this.answeredTools.has(id));
+  }
 }
+
+const outcomeOf = (state: StepState | undefined): RunFinishedOutcome => {
+  const pending = state?.unanswered() ?? [];
+  return pending.length > 0 ? { type: "success", pendingToolCallIds: pending } : { type: "success" };
+};
 
 const handlePart = (
   state: StepState,
@@ -203,6 +246,7 @@ const handlePart = (
       if (part.preliminary === true) {
         return Effect.succeed([]);
       }
+      state.answeredTools.add(part.id);
       const events: Array<AgUi.Event> = [];
       if (state.openTools.delete(part.id)) {
         events.push(AgUi.toolCallEnd(part.id));
@@ -229,11 +273,16 @@ const handlePart = (
   }
 };
 
-const causeMessage = (cause: Cause.Cause<unknown>): string => errorMessage(Cause.squash(cause));
-
 const errorMessage = (error: unknown): string => {
-  if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string") {
+  if (Predicate.hasProperty(error, "message") && Predicate.isString(error.message)) {
     return error.message;
   }
-  return typeof error === "string" ? error : "Unknown error";
+  return Predicate.isString(error) ? error : "Unknown error";
 };
+
+/** The error's tag; for an `AiError`, the tag of its reason (e.g. `RateLimitError`). */
+const errorCode = (error: unknown): string | undefined =>
+  (Predicate.hasProperty(error, "reason") ? tagOf(error.reason) : undefined) ?? tagOf(error);
+
+const tagOf = (value: unknown): string | undefined =>
+  Predicate.hasProperty(value, "_tag") && Predicate.isString(value._tag) ? value._tag : undefined;

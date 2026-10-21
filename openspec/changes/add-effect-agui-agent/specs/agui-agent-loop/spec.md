@@ -5,7 +5,7 @@ Runs a language-model agent with server-side tools for one AG-UI run. It turns t
 ## ADDED Requirements
 
 ### Requirement: Run lifecycle
-The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input.
+The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input. `RUN_STARTED` SHALL declare the AG-UI `protocolVersion`, and `RUN_FINISHED` SHALL carry the success outcome. `RUN_ERROR` SHALL carry a `code` naming the kind of failure when one is known.
 
 #### Scenario: Successful run
 - **WHEN** a run is started with `threadId` "t1" and `runId` "r1" and the model replies with text only
@@ -47,13 +47,18 @@ For every tool call the model makes, the agent SHALL emit `TOOL_CALL_START` with
 - **THEN** the tool call's `parentMessageId` equals that step's text `messageId`
 
 ### Requirement: Server-side tool execution and multi-step loop
-The agent SHALL run each tool call against its configured tools and emit a `TOOL_CALL_RESULT` with the result serialized as JSON in `content`. If the model's step ends by requesting tool calls, the agent SHALL send the tool results back to the model and continue with a new step. Otherwise it SHALL finish the run.
+The agent SHALL run each tool call against its configured tools and emit a `TOOL_CALL_RESULT` with the result serialized as JSON in `content`. If the model's step ends by requesting tool calls and every call in that step has a result, the agent SHALL send the tool results back to the model and continue with a new step. Otherwise it SHALL finish the run, listing any tool calls the step made without a result in the outcome's `pendingToolCallIds`.
 
 #### Scenario: Weather question answered with a tool
 - **WHEN** the user asks for the weather in Paris and the model calls "get-weather"
 - **THEN** the agent emits `TOOL_CALL_RESULT` whose `content` is the JSON-serialized tool result
 - **AND** the model is called again with that result
 - **AND** the model's follow-up text is streamed before `RUN_FINISHED`
+
+#### Scenario: Tool call without a result
+- **WHEN** the model's step ends by requesting a tool call that no configured tool answers
+- **THEN** the model is not called again
+- **AND** the run ends with `RUN_FINISHED` whose outcome lists that call in `pendingToolCallIds`
 
 ### Requirement: Tool failures are returned to the model
 When a tool handler fails, the agent SHALL report the failure to the model as that tool call's result and emit it as `TOOL_CALL_RESULT`. It SHALL NOT end the run because of the failure.
@@ -94,16 +99,24 @@ The `toolCallId` on `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END` and `TO
 
 ### Requirement: Conversation history from the client
 The agent SHALL rebuild the model conversation from the run input's `messages` on every run and SHALL NOT keep conversation state between runs. It SHALL convert:
-- system and developer messages into system instructions
-- user messages into user turns
+- system and developer messages into system instructions, only when configured to allow them (they SHALL be dropped by default)
+- user messages with text into user turns
 - assistant messages into assistant turns containing their text and tool calls
-- tool messages into tool results, with the tool name taken from the matching earlier assistant tool call
+- tool messages into tool results, with the tool name taken from the matching earlier assistant tool call, marked as failed when the message carries an `error`
 
-It SHALL ignore message roles it does not support. A configured system prompt SHALL come before the converted history.
+It SHALL ignore message roles it does not support. A configured system prompt SHALL come before the converted history. Every tool call sent to the model SHALL have a result: a tool call with no tool message before the next user, system or assistant message, or before the end of the history, SHALL be sent with a failed result.
 
 #### Scenario: Follow-up question uses earlier context
 - **WHEN** a second run's `messages` contain the first run's user message, the assistant message with its tool call, the tool message, and a new user message
 - **THEN** the model receives all of them as conversation history, with the tool result linked to its tool call by ID
+
+#### Scenario: Earlier run stopped before a tool result
+- **WHEN** `messages` contain an assistant tool call followed by a user message, with no tool message for that call
+- **THEN** the model receives the tool call followed by a failed result for it, and the run proceeds
+
+#### Scenario: Client system messages dropped by default
+- **WHEN** the agent is not configured to allow client system messages and `messages` include a `system` message
+- **THEN** that message is not sent to the model and the configured system prompt still is
 
 #### Scenario: Unsupported message role
 - **WHEN** `messages` include an `activity` message

@@ -51,3 +51,14 @@
 - [x] 7.1 `tsc` passes for both packages and all tests pass
 - [x] 7.2 Manual run of `pnpm dev` in the example with `index.ts` unchanged: plain chat streams text; "what's the weather in Paris?" shows the tool call, args and result, then the answer; a follow-up turn uses earlier context; an unknown city returns a graceful answer
 - [x] 7.3 Run `openspec validate add-effect-agui-agent --strict` and fix any issues
+
+## 8. Review follow-ups
+
+- [x] 8.1 Repair tool calls with no result in the client history (synthetic failed result) so a failed or aborted run does not break the thread
+- [x] 8.2 Continue the loop only when every tool call in the step was answered; otherwise finish with `outcome.pendingToolCallIds`
+- [x] 8.3 Add a `clientSystem: "allow" | "drop"` option (default `"drop"`) to `toPrompt` and `AgentOptions`
+- [x] 8.4 Map `ToolMessage.error` to a failed tool result; skip user messages with no text
+- [x] 8.5 Set `RUN_STARTED.protocolVersion`, `RUN_FINISHED.outcome` and `RUN_ERROR.code`
+- [x] 8.6 Validate `maxSteps`; wrap the run in a tracing span; parse JSON with `Schema`
+- [x] 8.7 Document the emitter seam, provider-executed tool limits, in-band deadlines and error redaction in `design.md`
+

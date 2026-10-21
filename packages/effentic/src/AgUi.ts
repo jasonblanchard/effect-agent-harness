@@ -1,7 +1,8 @@
-import { EventType } from "@ag-ui/core";
+import { EventType, PROTOCOL_VERSION } from "@ag-ui/core";
 import type {
   RunErrorEvent,
   RunFinishedEvent,
+  RunFinishedOutcome,
   RunStartedEvent,
   TextMessageContentEvent,
   TextMessageEndEvent,
@@ -36,6 +37,8 @@ export const Message = Schema.Struct({
   content: Schema.optional(Schema.Unknown),
   toolCalls: Schema.optional(Schema.Array(ToolCall)),
   toolCallId: Schema.optional(Schema.String),
+  /** Set on a `tool` message whose tool call failed. */
+  error: Schema.optional(Schema.String),
 });
 export type Message = typeof Message.Type;
 
@@ -68,18 +71,21 @@ export const runStarted = (input: { readonly threadId: string; readonly runId: s
   type: EventType.RUN_STARTED,
   threadId: input.threadId,
   runId: input.runId,
+  protocolVersion: PROTOCOL_VERSION,
 });
 
-export const runFinished = (input: { readonly threadId: string; readonly runId: string }): RunFinishedEvent => ({
+export const runFinished = (
+  input: { readonly threadId: string; readonly runId: string },
+  outcome: RunFinishedOutcome = { type: "success" },
+): RunFinishedEvent => ({
   type: EventType.RUN_FINISHED,
   threadId: input.threadId,
   runId: input.runId,
+  outcome,
 });
 
-export const runError = (message: string): RunErrorEvent => ({
-  type: EventType.RUN_ERROR,
-  message,
-});
+export const runError = (message: string, code?: string): RunErrorEvent =>
+  code === undefined ? { type: EventType.RUN_ERROR, message } : { type: EventType.RUN_ERROR, message, code };
 
 export const textMessageStart = (messageId: string): TextMessageStartEvent => ({
   type: EventType.TEXT_MESSAGE_START,

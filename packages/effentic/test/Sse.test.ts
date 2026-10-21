@@ -44,12 +44,12 @@ describe("Sse.encode", () => {
       const runAgent = yield* Agent.make({ toolkit: WeatherToolkit }).pipe(Effect.provide(layer));
       const frames = yield* Stream.runCollect(Sse.encode(runAgent(input)));
       expect(parseSse(frames.join(""))).toEqual([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" },
+        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
         { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
         { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" },
+        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
       ]);
     }),
   );

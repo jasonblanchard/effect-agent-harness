@@ -22,10 +22,14 @@ const input: AgUi.RunAgentInput = {
   messages: [{ id: "u1", role: "user", content: "What is the weather in Paris?" }],
 };
 
-const runScripted = (steps: ReadonlyArray<Step>, options?: { readonly maxSteps?: number; readonly system?: string }) =>
+const runScripted = (
+  steps: ReadonlyArray<Step>,
+  options?: { readonly maxSteps?: number; readonly system?: string },
+  runInput: AgUi.RunAgentInput = input,
+) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run({ toolkit: WeatherToolkit, ...options })(input).pipe(
+    const events = yield* Agent.run({ toolkit: WeatherToolkit, ...options })(runInput).pipe(
       Stream.runCollect,
       Effect.provide([model.layer, WeatherToolkitLayer, counterIds()]),
     );
@@ -59,12 +63,12 @@ describe("Agent.run", () => {
     Effect.gen(function* () {
       const { events } = yield* runScripted([[...text("0", "Hel", "lo"), finish("stop")]]);
       expect(events).toEqual([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" },
+        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
         { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
         { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" },
+        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
       ]);
     }),
   );
@@ -147,6 +151,7 @@ describe("Agent.run", () => {
       );
       expect(prompts).toHaveLength(2);
       expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
+      expect(events.at(-1)).toMatchObject({ code: "StepLimitExceeded" });
       expect((events.at(-1) as { message: string }).message).toContain("Step limit exceeded");
     }),
   );
@@ -163,6 +168,7 @@ describe("Agent.run", () => {
         EventType.TEXT_MESSAGE_END,
         EventType.RUN_ERROR,
       ]);
+      expect(events.at(-1)).toMatchObject({ code: "UnknownError" });
     }),
   );
 
@@ -228,4 +234,54 @@ describe("Agent.run", () => {
       expect(prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
     }),
   );
+
+  it.effect("finishes with the unanswered calls as pending instead of calling the model again", () =>
+    Effect.gen(function* () {
+      // The provider ran this call, so the toolkit does not and no result arrives.
+      const { events, prompts } = yield* runScripted([
+        [
+          {
+            type: "tool-call",
+            id: "srv_1",
+            name: "get-weather",
+            params: { location: "Paris" },
+            providerExecuted: true,
+          },
+          finish("tool-calls"),
+        ],
+      ]);
+      expect(prompts).toHaveLength(1);
+      expect(events.at(-1)).toEqual({
+        type: EventType.RUN_FINISHED,
+        threadId: "t1",
+        runId: "r1",
+        outcome: { type: "success", pendingToolCallIds: ["srv_1"] },
+      });
+    }),
+  );
+
+  it.effect("recovers a thread whose previous run stopped before the tool result", () =>
+    Effect.gen(function* () {
+      const { prompts } = yield* runScripted([[...text("0", "Sorry."), finish("stop")]], undefined, {
+        ...input,
+        messages: [
+          { id: "u1", role: "user", content: "Weather in Paris?" },
+          {
+            id: "a1",
+            role: "assistant",
+            toolCalls: [{ id: "toolu_1", function: { name: "get-weather", arguments: '{"location":"Paris"}' } }],
+          },
+          { id: "u2", role: "user", content: "Hello?" },
+        ],
+      });
+      expect(prompts[0]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
+      expect(prompts[0]!.content[2]).toMatchObject({ content: [{ type: "tool-result", isFailure: true }] });
+    }),
+  );
+
+  it("rejects a step limit that is not a positive integer", () => {
+    for (const maxSteps of [0, -1, 1.5, Number.NaN]) {
+      expect(() => Agent.run({ toolkit: WeatherToolkit, maxSteps })).toThrow(RangeError);
+    }
+  });
 });
