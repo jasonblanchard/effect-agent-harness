@@ -9,7 +9,7 @@
   "scripts": {
     "tsc": "tsc",
     "dev": "node --env-file-if-exists=../../../.env src/index.ts",
-    "lint": "oxlint -c ../../../.oxlintrc.json",
+    "lint": "oxlint --deny-warnings -c ../../../.oxlintrc.json",
     "format": "oxfmt -c ../../../.oxfmtrc.json",
     "format:check": "oxfmt -c ../../../.oxfmtrc.json --check"
   },

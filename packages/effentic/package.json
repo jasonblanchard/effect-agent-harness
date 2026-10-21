@@ -12,7 +12,7 @@
   "scripts": {
     "test": "vitest run",
     "tsc": "tsc",
-    "lint": "oxlint -c ../../.oxlintrc.json",
+    "lint": "oxlint --deny-warnings -c ../../.oxlintrc.json",
     "format": "oxfmt -c ../../.oxfmtrc.json",
     "format:check": "oxfmt -c ../../.oxfmtrc.json --check"
   },

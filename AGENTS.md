@@ -18,7 +18,7 @@ Run from the repo root. Each one delegates to the packages via `pnpm -r --if-pre
 | `pnpm format`       | oxfmt, writes packages and root-level files |
 | `pnpm format:check` | oxfmt, check only                           |
 
-Before calling work done, run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check`, and fix every finding. Don't silence a lint rule without saying why.
+Before calling work done, run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check`, and fix every finding. Lint runs with `--deny-warnings`, so warnings fail too. Don't silence a lint rule without saying why. CI (`.github/workflows/ci.yml`) runs the same four commands on every push to `main` and on every pull request.
 
 To target one package, filter by name: `pnpm --filter effentic test`. The root package is `effentic-monorepo`, so `--filter effentic` matches only the library.
 
