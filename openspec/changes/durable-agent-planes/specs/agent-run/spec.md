@@ -7,7 +7,7 @@ Runs an agent's defined behaviour (system prompt, tools, step limit) from a mode
 ## ADDED Requirements
 
 ### Requirement: Behaviour is defined once as a value
-An agent definition SHALL consist of a tool set, an optional system prompt and a step limit (a positive integer, default 10), and SHALL NOT reference any model provider, conversation store, checkpoint store or event log. The same definition SHALL be runnable under different sets of provided services without modification.
+An agent definition SHALL consist of a tool set, an optional system prompt and a step limit (a positive integer, default 10), and SHALL NOT reference any model provider, thread store, checkpoint store or event log. The same definition SHALL be runnable under different sets of provided services without modification.
 
 #### Scenario: Same definition, two environments
 - **WHEN** one agent definition is run against a scripted model with passthrough checkpoints and again with a ledger-backed checkpoint store
@@ -97,7 +97,7 @@ The run SHALL enforce the agent's step limit on model steps. When the limit is r
 - **THEN** the run ends with a failed event whose code is `StepLimitExceeded`, after two model calls
 
 ### Requirement: Step entries
-Each step-finished event SHALL carry the conversation entries the step produced: one assistant entry whose id is the step's message id and whose message holds the text, tool calls and approval requests of the step, and one tool entry per tool result whose id is that result's message id. Step 0 SHALL carry tool entries only.
+Each step-finished event SHALL carry the thread entries the step produced: one assistant entry whose id is the step's message id and whose message holds the text, tool calls and approval requests of the step, and one tool entry per tool result whose id is that result's message id. Step 0 SHALL carry tool entries only.
 
 #### Scenario: Entries for a tool step
 - **WHEN** step 1 produces text, one tool call and its result

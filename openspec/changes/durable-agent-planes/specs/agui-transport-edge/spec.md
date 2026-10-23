@@ -18,7 +18,7 @@ The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only t
 - **THEN** decoding succeeds and the entry is available to the run
 
 ### Requirement: Runner without service requirements
-The package SHALL provide a way to capture the agent's services (language model, tool handlers, conversation store, checkpoint store) once and obtain a request-scoped runner. Each run's event stream SHALL then have no outstanding service requirements, so it can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+The package SHALL provide a way to capture the agent's services (language model, tool handlers, thread store, checkpoint store) once and obtain a request-scoped runner. Each run's event stream SHALL then have no outstanding service requirements, so it can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
 
 #### Scenario: Stream used as a response body
 - **WHEN** a caller captures the runner while its route is being set up and calls it for each request
@@ -64,11 +64,11 @@ The package SHALL provide a runner that starts a run in a scope the caller or a 
 - **THEN** it receives every event after c exactly once and the terminal event
 
 ### Requirement: Re-executing a detached run
-Starting a detached run again with the same run id SHALL NOT re-append events for steps that are replayed from the checkpoint store. Before appending any new event it SHALL close every text message and tool call left open in the log by an earlier attempt. If the log already ends with a terminal event, starting again SHALL do nothing.
+Starting a detached run again with the same run id SHALL NOT re-append events for steps that are replayed from the checkpoint store. Before appending any new event it SHALL close every text message, tool call and step left open in the log by an earlier attempt, and it SHALL NOT append a second `RUN_STARTED` to a log that already has one. If the log already ends with a terminal event, starting again SHALL do nothing.
 
 #### Scenario: Resume after a crash mid-step
 - **WHEN** an earlier attempt appended `TEXT_MESSAGE_START` and content for step 2 and stopped, and the run is started again with a ledger-backed checkpoint store
-- **THEN** the log receives `TEXT_MESSAGE_END` for that message, no repeated events for step 1, then step 2's events under a new message id, and the whole log passes the AG-UI client's checks
+- **THEN** the log receives `TEXT_MESSAGE_END` for that message and `STEP_FINISHED` for step 2, no second `RUN_STARTED` and no repeated events for step 1, then step 2's events under a new message id, and the whole log passes the AG-UI client's checks
 
 #### Scenario: Already finished
 - **WHEN** the log for the run id ends with `RUN_FINISHED`

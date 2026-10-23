@@ -1,23 +1,37 @@
 # packages/effentic
 
-The library. The public API is `src/index.ts`, which re-exports each module as a namespace (`AgUi`, `Messages`, `Agent`, `Sse`). Consumers import from `"effentic"`, which resolves straight to the `.ts` sources (there's no build step).
+The library. The public API is `src/index.ts`, which re-exports each module as a namespace (`AgUi`, `Messages`, `Agent`, `Sse`, `Thread`, `Checkpoint`, `EventLog`, `Runner`). Consumers import from `"effentic"`, which resolves straight to the `.ts` sources (there's no build step).
 
 ## Modules
 
-- `AgUi.ts`: Schemas for the subset of AG-UI `RunAgentInput` the agent reads, plus the `Event` union it emits. Decoding is deliberately lenient: unknown fields are stripped, and unknown message roles pass through so later code can ignore them.
-- `Messages.ts`: `toPrompt` converts the full AG-UI history into an Effect `Prompt` on every run. The server is stateless. Unsupported roles are dropped. AG-UI tool messages don't carry a tool name, so it's recovered from the assistant tool call with the same id.
-- `Agent.ts`: `run` / `make` drive the model step by step, resolve tool calls between steps, and map `Response` stream parts to AG-UI events.
-- `Sse.ts`: encodes AG-UI events as SSE frames, the format `@ag-ui/client`'s `HttpAgent` expects.
+- `AgUi.ts`: Schemas for the subset of AG-UI `RunAgentInput` the agent reads (including `resume` entries), the `Event` union it emits, and `fold`, which projects `Agent.Event`s onto AG-UI (step events, span bookkeeping, the approval `interrupt` outcome, closers before `RUN_ERROR`; replayed events are dropped). `closeOpen` computes the closers for spans an aborted attempt left open in a log. Decoding is deliberately lenient: unknown fields are stripped, and unknown message roles pass through so later code can ignore them.
+- `Messages.ts`: pure functions between AG-UI messages and `Thread.Entry`s. The server owns the history, so the client only contributes a delta: `delta` is the client messages after the last one whose id is stored (`HistoryMismatch` if the store is non-empty and nothing matches). `ingest` keeps user text and, only with `clientSystem: "allow"`, system/developer messages; assistant and tool turns from the client are dropped. `resume` turns AG-UI `resume` entries into approval responses (approved only for `resolved` with `payload.approved === true`; unanswered requests are denied as "not answered"). `project` builds the prompt: system prompt, then the entries verbatim, with tool results moved next to their calls and unanswered calls given a failed result, except calls with an approval request, which the run resolves.
+- `Agent.ts`: the core loop, independent of AG-UI. `define` turns a toolkit, system prompt and step limit into a plain `Agent` value that names no provider or store, so the same value runs in production and in an eval. `run(agent)({ runId, prompt })` emits `Agent.Event`s: per model step `StepStarted`, live `ModelPart`s, then `ToolResult` / `ApprovalRequested` and `StepFinished` (carrying the step's thread entries), ending with one `Finished` or `Failed`. The model is called with `disableToolCallResolution`; the loop runs each tool call itself after the model step. Every model call (`model:<step>`) and tool call (`tool:<toolCallId>`) goes through `Checkpoint.memo`, and every id is minted inside its checkpoint, so a run executed again with the same `runId` replays completed steps (marked `replayed: true`, with no `ModelPart`s) and never re-runs a tool handler. Approval responses already in the prompt are resolved first as step 0.
+- `Thread.ts`: the server-owned thread store (`load`, idempotent per-step `commit`, `runEnded`) and `layerMemory`. Compaction is the store's concern: the prompt is built from whatever `load` returns, but `delta` and `resume` read it too, so a compacted thread must keep the client's latest ids and any unanswered approval requests.
+- `Checkpoint.ts`: memoises named steps of a run (`memo`). `layerNone` (tests, evals), `layerLedger` over a caller-supplied `Ledger` (`layerMemoryLedger` for tests), `layerWorkflow` (activities; build it inside a workflow execution). Completed exits, including failures, are stored; interrupted attempts are not.
+- `EventLog.ts`: a run's AG-UI events under increasing cursors; `subscribe` yields history then live events and completes after the terminal event. `layerMemory`.
+- `Runner.ts`: the AG-UI edge. All runners share one pipeline: load the thread, take the client's delta and `resume` answers, commit them, project the prompt (memoised as `prompt`), run the agent committing each `StepFinished`, call `runEnded` (after the failure catch, so every non-interrupted run reports its end, including pre-core failures), then `AgUi.fold`. Choose a runner by whether a disconnect should cancel the run:
+  - `run` / `make` are request-scoped: the consumer stopping cancels the run.
+  - `makeDetached` forks the run into a caller-owned scope and writes it to the `EventLog`; disconnects don't reach it. Starting the same input again completes a crashed attempt: nothing happens if the log is terminal, otherwise open spans are closed, `RUN_STARTED` isn't repeated, and replayed steps publish nothing.
+  - `workflow` is the detached body as an `effect/workflow` workflow keyed by `runId`, with `Checkpoint.layerWorkflow`.
+- `Sse.ts`: encodes AG-UI events as SSE frames, the format `@ag-ui/client`'s `HttpAgent` expects. `encodeStored` sets each frame's SSE `id` to the event's cursor, for `Last-Event-ID` reconnects.
+
+## Resume rules
+
+- **Approvals.** A tool with `needsApproval` ends the run with `RUN_FINISHED` outcome `interrupt` (one interrupt per approval, `reason: "tool-approval"`). The next run on the thread answers with `resume` entries; approved calls execute as step 0 before the model is called. Unanswered approvals are denied ("not answered") so a thread never blocks.
+- **Crashes.** Re-running a `runId` with a durable `Checkpoint` replays completed model and tool steps (same ids, no repeated handlers) and re-executes only the step that was in flight, with fresh ids. A step that _failed_ is memoised too: a failed run stays failed, and the client retries with a new `runId`.
 
 ## Invariants
 
-- **The event stream never fails.** Errors (model failures, `StepLimitExceeded`, …) are emitted in-band as `RUN_ERROR`, and the stream's error type is `never`. Keep it that way.
-- **Every emitted sequence must be valid AG-UI.** That means a run lifecycle (`RUN_STARTED` … `RUN_FINISHED`/`RUN_ERROR`), and text messages and tool calls that are started, then ended, never left open.
+- **The event streams never fail.** `Agent.run` reports errors (model failures, `StepLimitExceeded`, …) as one in-band `Failed` event, and the AG-UI streams as `RUN_ERROR`; the error type is `never`. Keep it that way.
+- **Every emitted sequence must be valid AG-UI.** That means a run lifecycle (`RUN_STARTED` … `RUN_FINISHED`/`RUN_ERROR`), and text messages, tool calls and steps that are started, then ended, never left open. This includes an event log completed by a resumed attempt.
+- **Side effects go through checkpoints.** Every model call, tool call and id minted in a run happens inside one `Checkpoint.memo`, so a replay is deterministic and handlers run at most once per run.
 - New tools should normally use `failureMode: "return"`, so their failures go back to the model instead of ending the run.
 
 ## Tests
 
 - Use `@effect/vitest` (`it.effect`) for anything effectful.
-- `test/fixtures.ts` provides a `scriptedModel(steps)` fake `LanguageModel`. Each step is the stream for one `streamText` call, and it records the prompts it receives. It also provides part builders (`text`, `toolCall`, `finish`), a sample `WeatherToolkit`, deterministic ids (`counterIds`) and `verify`.
+- `test/fixtures.ts` provides a `scriptedModel(steps)` fake `LanguageModel`. Each step is the stream for one `streamText` call, and it records the prompts it receives. It also provides part builders (`text`, `toolCall`, `finish`), a sample `WeatherToolkit` with `countingWeatherLayer()`, an `ApprovalToolkit` (adds `send-email`, which needs approval) with `countingApprovalLayer()`, `evalLayers` (`Checkpoint.layerNone` + `counterIds`), `runAgUi` (several inputs through `Runner.run`), deterministic ids (`counterIds`) and `verify`.
+- To test a crash, stop consuming the run mid-step (or close a detached run's scope) and run the same `runId` again against a shared `Checkpoint.layerMemoryLedger`.
 - **Pass every event sequence a test produces through `verify`.** It runs `@ag-ui/client`'s own sequence checks, so the tests catch streams a real client would reject.
 - Don't call a real model in tests.

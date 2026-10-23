@@ -1,5 +1,5 @@
 import { Effect, Schema } from "effect";
-import { Tool, Toolkit } from "effect/ai";
+import { Tool } from "effect/ai";
 
 interface GeocodingResponse {
   results: {
@@ -41,17 +41,13 @@ export const GetWeather = Tool.make("get-weather", {
   failureMode: "return",
 });
 
-export const WeatherToolkit = Toolkit.make(GetWeather);
+export const getWeather = ({ location }: { readonly location: string }) =>
+  Effect.tryPromise({
+    try: () => fetchWeather(location),
+    catch: (error) => ({ message: error instanceof Error ? error.message : String(error) }),
+  });
 
-export const WeatherToolkitLayer = WeatherToolkit.toLayer({
-  "get-weather": ({ location }) =>
-    Effect.tryPromise({
-      try: () => getWeather(location),
-      catch: (error) => ({ message: error instanceof Error ? error.message : String(error) }),
-    }),
-});
-
-const getWeather = async (location: string) => {
+const fetchWeather = async (location: string) => {
   const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
   const geocodingResponse = await fetch(geocodingUrl);
   const geocodingData = (await geocodingResponse.json()) as GeocodingResponse;

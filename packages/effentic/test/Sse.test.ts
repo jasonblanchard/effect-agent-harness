@@ -2,12 +2,18 @@ import { HttpAgent, randomUUID } from "@ag-ui/client";
 import { EventType } from "@ag-ui/core";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Stream } from "effect";
+import * as EffectSse from "effect/encoding/Sse";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import type { Tool } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
+import * as Runner from "../src/Runner.ts";
 import * as Sse from "../src/Sse.ts";
+import * as Thread from "../src/Thread.ts";
 import {
-  counterIds,
+  ApprovalToolkit,
+  countingApprovalLayer,
+  evalLayers,
   finish,
   scriptedModel,
   type Step,
@@ -23,9 +29,14 @@ const input: AgUi.RunAgentInput = {
   messages: [{ id: "u1", role: "user", content: "hi" }],
 };
 
+const weatherAgent = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." });
+
 const services = (steps: ReadonlyArray<Step>) => {
   const model = scriptedModel(steps);
-  return { layer: Layer.mergeAll(model.layer, WeatherToolkitLayer, counterIds()), prompts: model.prompts };
+  return {
+    layer: Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers, Thread.layerMemory),
+    prompts: model.prompts,
+  };
 };
 
 const parseSse = (body: string) =>
@@ -41,21 +52,42 @@ describe("Sse.encode", () => {
   it.effect("encodes each event as one SSE data frame, in order", () =>
     Effect.gen(function* () {
       const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
-      const runAgent = yield* Agent.make({ toolkit: WeatherToolkit }).pipe(Effect.provide(layer));
+      const runAgent = yield* Runner.make(weatherAgent).pipe(Effect.provide(layer));
       const frames = yield* Stream.runCollect(Sse.encode(runAgent(input)));
       expect(parseSse(frames.join(""))).toEqual([
         { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
+        { type: EventType.STEP_STARTED, stepName: "step-1" },
         { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
         { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
         { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
+        { type: EventType.STEP_FINISHED, stepName: "step-1" },
         { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
       ]);
     }),
   );
 });
 
-describe("Agent.make", () => {
+describe("Sse.encodeStored", () => {
+  it.effect("carries each cursor as the SSE id", () =>
+    Effect.gen(function* () {
+      const events = [AgUi.runStarted(input), AgUi.stepStarted("step-1"), AgUi.runFinished(input)];
+      const frames = yield* Stream.runCollect(
+        Sse.encodeStored(Stream.fromIterable(events.map((event, i) => ({ cursor: String(i), event })))),
+      );
+      frames.forEach((frame, i) => expect(frame).toContain(`id: ${i}\n`));
+
+      const parsed: Array<EffectSse.AnyEvent> = [];
+      const parser = EffectSse.makeParser((event) => parsed.push(event));
+      parser.feed(frames.join(""));
+      expect(parsed.map((event) => (event._tag === "Event" ? [event.id, JSON.parse(event.data)] : event))).toEqual(
+        events.map((event, i) => [String(i), event]),
+      );
+    }),
+  );
+});
+
+describe("Runner.make", () => {
   it.effect("stops the run when the consumer stops reading", () =>
     Effect.gen(function* () {
       // The model stream never ends on its own, so its finalizer only runs if the
@@ -67,12 +99,12 @@ describe("Agent.make", () => {
           Stream.ensuring(Effect.sync(() => (interrupted = true))),
         ),
       ]);
-      const runAgent = yield* Agent.make({ toolkit: WeatherToolkit }).pipe(Effect.provide(layer));
+      const runAgent = yield* Runner.make(weatherAgent).pipe(Effect.provide(layer));
       const events = yield* Stream.runCollect(runAgent(input).pipe(Stream.take(3)));
       expect(events.map((e) => e.type)).toEqual([
         EventType.RUN_STARTED,
+        EventType.STEP_STARTED,
         EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
       ]);
       expect(interrupted).toBe(true);
     }),
@@ -88,11 +120,13 @@ afterEach(async () => {
   await Promise.all(disposers.splice(0).map((dispose) => dispose()));
 });
 
-const makeHandler = (steps: ReadonlyArray<Step>) => {
-  const { layer, prompts } = services(steps);
+const makeHandler = <Tools extends Record<string, Tool.Any>>(
+  agent: Agent.Agent<Tools>,
+  layer: Layer.Layer<Agent.Requirements<Tools> | Thread.Thread>,
+) => {
   const AgentRoute = HttpRouter.use((router) =>
     Effect.gen(function* () {
-      const runAgent = yield* Agent.make({ toolkit: WeatherToolkit, system: "Be helpful." });
+      const runAgent = yield* Runner.make(agent);
       yield* router.add(
         "POST",
         "/agent",
@@ -109,12 +143,12 @@ const makeHandler = (steps: ReadonlyArray<Step>) => {
   ).pipe(Layer.provide(layer));
   const { handler, dispose } = HttpRouter.toWebHandler(AgentRoute, { disableLogger: true });
   disposers.push(dispose);
-  return { handler, prompts };
+  return handler;
 };
 
 describe("HttpAgent against a caller-owned SSE route", () => {
   it("runs a multi-turn conversation with tool calls", async () => {
-    const { handler, prompts } = makeHandler([
+    const { layer, prompts } = services([
       [
         ...text("0", "Let me check."),
         ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
@@ -123,6 +157,7 @@ describe("HttpAgent against a caller-owned SSE route", () => {
       [...text("0", "It is 18°C in Paris."), finish("stop")],
       [...text("0", "Still 18°C."), finish("stop")],
     ]);
+    const handler = makeHandler(weatherAgent, layer);
     const agent = new HttpAgent({
       url: "http://localhost/agent",
       threadId: "main-conversation",
@@ -161,7 +196,7 @@ describe("HttpAgent against a caller-owned SSE route", () => {
     ]);
     expect(agent.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
 
-    // Second turn: the client resends history, and the server rebuilds it.
+    // Second turn: the client resends its history; the server takes only the new message and uses its own.
     agent.messages.push({ id: randomUUID(), role: "user", content: "And now?" });
     await agent.runAgent({}, subscriber);
 
@@ -180,5 +215,37 @@ describe("HttpAgent against a caller-owned SSE route", () => {
         { type: "tool-call", id: "toolu_1", name: "get-weather", params: { location: "Paris" } },
       ],
     });
+  });
+});
+
+describe("HttpAgent tool approval", () => {
+  it("answers an interrupt with resume and runs the approved tool", async () => {
+    const model = scriptedModel([
+      [...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }), finish("tool-calls")],
+      [...text("0", "Sent."), finish("stop")],
+    ]);
+    const handlers = countingApprovalLayer();
+    const handler = makeHandler(
+      Agent.define({ toolkit: ApprovalToolkit }),
+      Layer.mergeAll(model.layer, handlers.layer, evalLayers, Thread.layerMemory),
+    );
+    const agent = new HttpAgent({
+      url: "http://localhost/agent",
+      threadId: "approvals",
+      fetch: (url, init) => handler(new Request(url, init)),
+    });
+
+    agent.messages.push({ id: randomUUID(), role: "user", content: "Email Ada" });
+    await agent.runAgent();
+    expect(handlers.emails).toEqual([]);
+    expect(agent.pendingInterrupts).toHaveLength(1);
+    const [interrupt] = agent.pendingInterrupts;
+    expect(interrupt).toMatchObject({ reason: "tool-approval", toolCallId: "c_email" });
+
+    await agent.runAgent({ resume: [{ interruptId: interrupt!.id, status: "resolved", payload: { approved: true } }] });
+    expect(handlers.emails).toEqual(["ada@example.com"]);
+    expect(agent.pendingInterrupts).toEqual([]);
+    expect(agent.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    expect(model.prompts[1]!.content.at(-1)).toMatchObject({ role: "tool" });
   });
 });

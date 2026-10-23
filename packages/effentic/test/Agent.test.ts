@@ -1,287 +1,443 @@
-import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Stream } from "effect";
-import { AiError } from "effect/ai";
-import type * as AgUi from "../src/AgUi.ts";
+import { Effect, Layer, Schema, Stream } from "effect";
+import { Prompt, Tool, Toolkit } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
+import * as Checkpoint from "../src/Checkpoint.ts";
 import {
+  ApprovalToolkit,
   counterIds,
+  countingApprovalLayer,
+  countingWeatherLayer,
+  evalLayers,
   finish,
   scriptedModel,
   type Step,
   text,
   toolCall,
-  verify,
   WeatherToolkit,
-  WeatherToolkitLayer,
 } from "./fixtures.ts";
 
-const input: AgUi.RunAgentInput = {
-  threadId: "t1",
-  runId: "r1",
-  messages: [{ id: "u1", role: "user", content: "What is the weather in Paris?" }],
-};
+const weatherAgent = Agent.define({ toolkit: WeatherToolkit });
 
-const runScripted = (
+const userPrompt = Prompt.make([{ role: "user", content: "What is the weather in Paris?" }]);
+
+/** Runs `weatherAgent` (or `agent`) on a scripted model, counting weather handler calls. */
+const runCore = (
   steps: ReadonlyArray<Step>,
-  options?: { readonly maxSteps?: number; readonly system?: string },
-  runInput: AgUi.RunAgentInput = input,
+  options?: { readonly maxSteps?: number; readonly prompt?: Prompt.Prompt },
 ) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run({ toolkit: WeatherToolkit, ...options })(runInput).pipe(
+    const weather = countingWeatherLayer();
+    const agent =
+      options?.maxSteps === undefined ? weatherAgent : Agent.define({ toolkit: WeatherToolkit, ...options });
+    const events = yield* Agent.run(agent)({ runId: "r1", prompt: options?.prompt ?? userPrompt }).pipe(
       Stream.runCollect,
-      Effect.provide([model.layer, WeatherToolkitLayer, counterIds()]),
+      Effect.provide([model.layer, weather.layer, evalLayers]),
     );
-    // Every emitted stream must pass the AG-UI client's own sequence checks.
-    yield* Effect.promise(() => verify(events));
-    return { events: Array.from(events), prompts: model.prompts };
+    return { events: Array.from(events), prompts: model.prompts, calls: weather.calls };
   });
 
-const types = (events: ReadonlyArray<AgUi.Event>) => events.map((event) => event.type);
+const tags = (events: ReadonlyArray<Agent.Event>) => events.map((event) => event._tag);
 
-const modelFailure = AiError.make({
-  module: "Test",
-  method: "streamText",
-  reason: new AiError.UnknownError({ description: "boom" }),
-});
+const byTag = <T extends Agent.Event["_tag"]>(events: ReadonlyArray<Agent.Event>, tag: T) =>
+  events.filter((event): event is Extract<Agent.Event, { _tag: T }> => event._tag === tag);
 
-describe("verify", () => {
-  it("rejects sequences the AG-UI client would reject", async () => {
-    await expect(
-      verify([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" } as AgUi.Event,
-        { type: EventType.TEXT_MESSAGE_START, messageId: "m1", role: "assistant" } as AgUi.Event,
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" } as AgUi.Event,
-      ]),
-    ).rejects.toThrow(/text messages are still active/);
+const partTypes = (prompt: Prompt.Prompt) =>
+  prompt.content.flatMap((message) =>
+    typeof message.content === "string" ? [] : message.content.map((part: { type: string }) => part.type),
+  );
+
+const emailCall = toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" });
+
+describe("Agent.define", () => {
+  it("rejects a step limit that is not a positive integer", () => {
+    for (const maxSteps of [0, -1, 1.5, Number.NaN]) {
+      expect(() => Agent.define({ toolkit: WeatherToolkit, maxSteps })).toThrow(RangeError);
+    }
   });
+
+  it.effect("sends identical prompts with passthrough and ledger checkpoints", () =>
+    Effect.gen(function* () {
+      const script = (): ReadonlyArray<Step> => [
+        [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...text("0", "18°C"), finish("stop")],
+      ];
+      const runWith = (checkpoint: Layer.Layer<Checkpoint.Checkpoint>) =>
+        Effect.gen(function* () {
+          const model = scriptedModel(script());
+          yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+            Stream.runDrain,
+            Effect.provide([model.layer, countingWeatherLayer().layer, checkpoint, counterIds()]),
+          );
+          return model.prompts;
+        });
+      const none = yield* runWith(Checkpoint.layerNone);
+      const ledger = yield* runWith(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)));
+      expect(ledger).toEqual(none);
+    }),
+  );
 });
 
 describe("Agent.run", () => {
-  it.effect("streams a text-only reply inside the run lifecycle", () =>
+  it.effect("emits a text-only step", () =>
     Effect.gen(function* () {
-      const { events } = yield* runScripted([[...text("0", "Hel", "lo"), finish("stop")]]);
-      expect(events).toEqual([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
-        { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
-        { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
+      const { events } = yield* runCore([[...text("0", "Hel", "lo"), finish("stop")]]);
+      expect(tags(events)).toEqual([
+        "StepStarted",
+        "ModelPart",
+        "ModelPart",
+        "ModelPart",
+        "ModelPart",
+        "ModelPart",
+        "StepFinished",
+        "Finished",
+      ]);
+      expect(events[0]).toEqual({ _tag: "StepStarted", step: 1, messageId: "id-1", replayed: false });
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+      const [finished] = byTag(events, "StepFinished");
+      expect(finished!.entries).toEqual([
+        {
+          id: "id-1",
+          message: Prompt.makeMessage("assistant", { content: [Prompt.makePart("text", { text: "Hello" })] }),
+        },
       ]);
     }),
   );
 
-  it.effect("resolves tool calls and continues with a new step", () =>
+  it.effect("emits model parts while the model is still streaming", () =>
     Effect.gen(function* () {
-      const { events, prompts } = yield* runScripted([
+      const model = scriptedModel([
+        Stream.fromIterable(text("0", "first").slice(0, 2)).pipe(Stream.concat(Stream.never)),
+      ]);
+      const events = yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
+      );
+      expect(tags(events)).toEqual(["StepStarted", "ModelPart", "ModelPart"]);
+    }),
+  );
+
+  it.effect("never sends approval parts to the model", () =>
+    Effect.gen(function* () {
+      const prompt = Prompt.make([
+        { role: "user", content: "Email Ada" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool-call", id: "c1", name: "send-email", params: { to: "ada@example.com", body: "Hi" } },
+            { type: "tool-approval-request", approvalId: "a1", toolCallId: "c1" },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            { type: "tool-approval-response", approvalId: "a1", approved: true },
+            { type: "tool-result", id: "c1", name: "send-email", isFailure: false, result: { sent: true } },
+          ],
+        },
+      ]);
+      const { prompts } = yield* runCore([[...text("0", "Sent."), finish("stop")]], { prompt });
+      expect(prompts[0]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+      expect(partTypes(prompts[0]!)).toEqual(["text", "tool-call", "tool-result"]);
+    }),
+  );
+
+  it.effect("runs a tool call after the model stream has ended, once", () =>
+    Effect.gen(function* () {
+      const log: Array<string> = [];
+      const model = scriptedModel([
+        Stream.fromIterable([...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")]).pipe(
+          Stream.ensuring(Effect.sync(() => log.push("model-end"))),
+        ),
+        [...text("0", "18°C"), finish("stop")],
+      ]);
+      const handlers = WeatherToolkit.toLayer({
+        "get-weather": () => Effect.sync(() => (log.push("handler"), { temperature: 18 })),
+      });
+      const events = yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+        Stream.runCollect,
+        Effect.provide([model.layer, handlers, evalLayers]),
+      );
+      expect(log).toEqual(["model-end", "handler"]);
+      const results = byTag(Array.from(events), "ToolResult");
+      expect(results).toEqual([
+        {
+          _tag: "ToolResult",
+          step: 1,
+          messageId: "id-2",
+          toolCallId: "c1",
+          toolName: "get-weather",
+          encodedResult: { temperature: 18 },
+          isFailure: false,
+          replayed: false,
+        },
+      ]);
+      expect(tags(Array.from(events)).indexOf("ToolResult")).toBeLessThan(
+        tags(Array.from(events)).indexOf("StepFinished"),
+      );
+      expect(model.prompts[1]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+    }),
+  );
+
+  it.effect("resolves two tool calls of one step", () =>
+    Effect.gen(function* () {
+      const { events, calls } = yield* runCore([
         [
-          ...text("0", "Let me check."),
-          ...toolCall("toolu_1", "get-weather", { location: "Paris" }, ['{"location":', '"Paris"}']),
+          ...toolCall("c1", "get-weather", { location: "Paris" }),
+          ...toolCall("c2", "get-weather", { location: "Rome" }),
           finish("tool-calls"),
         ],
-        [...text("0", "It is 18°C."), finish("stop")],
+        [...text("0", "Both 18°C"), finish("stop")],
       ]);
-
-      expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.TOOL_CALL_RESULT,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.RUN_FINISHED,
-      ]);
-
-      const [, step1Start, , , toolStart, args1, args2, , result, step2Start] = events;
-      expect(toolStart).toEqual({
-        type: EventType.TOOL_CALL_START,
-        toolCallId: "toolu_1",
-        toolCallName: "get-weather",
-        parentMessageId: (step1Start as { messageId: string }).messageId,
-      });
-      expect([args1, args2].map((e) => (e as { delta: string }).delta)).toEqual(['{"location":', '"Paris"}']);
-      expect(result).toMatchObject({
-        type: EventType.TOOL_CALL_RESULT,
-        toolCallId: "toolu_1",
-        content: '{"temperature":18}',
-      });
-
-      // Anthropic-style part id "0" on both steps must not leak into AG-UI ids.
-      const messageIds = [step1Start, result, step2Start].map((e) => (e as { messageId: string }).messageId);
-      expect(new Set(messageIds).size).toBe(3);
-      expect(messageIds).not.toContain("0");
-
-      // The second model call sees the tool call and its result.
-      expect(prompts).toHaveLength(2);
-      const second = prompts[1]!.content;
-      expect(second.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
-      expect(second[2]).toMatchObject({
-        content: [{ type: "tool-result", id: "toolu_1", name: "get-weather", result: { temperature: 18 } }],
-      });
+      expect([...calls].sort()).toEqual(["Paris", "Rome"]);
+      expect(byTag(events, "ToolResult").map((r) => r.toolCallId)).toEqual(["c1", "c2"]);
     }),
   );
 
   it.effect("returns tool failures to the model", () =>
     Effect.gen(function* () {
-      const { events, prompts } = yield* runScripted([
-        [...toolCall("toolu_1", "get-weather", { location: "Nowhere" }), finish("tool-calls")],
+      const { events, prompts } = yield* runCore([
+        [...toolCall("c1", "get-weather", { location: "Nowhere" }), finish("tool-calls")],
         [...text("0", "I couldn't find that place."), finish("stop")],
       ]);
-      const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
-      expect(result).toMatchObject({ content: '{"message":"Location \'Nowhere\' not found"}' });
-      expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+      const [result] = byTag(events, "ToolResult");
+      expect(result).toMatchObject({ isFailure: true, encodedResult: { message: "Location 'Nowhere' not found" } });
       expect(prompts).toHaveLength(2);
+      expect(prompts[1]!.content[2]).toMatchObject({ content: [{ type: "tool-result", id: "c1", isFailure: true }] });
     }),
   );
 
-  it.effect("ends with RUN_ERROR when the step limit is exceeded", () =>
+  it.effect("does not run tools when the response finished incomplete", () =>
     Effect.gen(function* () {
-      const loopingStep = [...toolCall("toolu_x", "get-weather", { location: "Paris" }), finish("tool-calls")];
-      const { events, prompts } = yield* runScripted(
-        [loopingStep, loopingStep.map((p) => ("id" in p ? { ...p, id: "toolu_y" } : p)), loopingStep],
+      const { events, calls, prompts } = yield* runCore([
+        [...toolCall("c1", "get-weather", { location: "Paris" }), finish("length")],
+      ]);
+      expect(calls).toEqual([]);
+      expect(prompts).toHaveLength(1);
+      const [result] = byTag(events, "ToolResult");
+      expect(result).toMatchObject({ isFailure: true, encodedResult: { type: "execution-interrupted" } });
+      expect((result!.encodedResult as { reason: string }).reason).toContain('"length"');
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+    }),
+  );
+
+  it.effect("carries the assistant and tool entries of a step", () =>
+    Effect.gen(function* () {
+      const { events } = yield* runCore([
+        [...text("0", "Let me check."), ...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...text("0", "18°C"), finish("stop")],
+      ]);
+      const [step1, step2] = byTag(events, "StepFinished");
+      expect(step1!.entries.map((e) => [e.id, e.message.role])).toEqual([
+        ["id-1", "assistant"],
+        ["id-2", "tool"],
+      ]);
+      expect(step2!.entries.map((e) => [e.id, e.message.role])).toEqual([["id-3", "assistant"]]);
+      expect(byTag(events, "StepStarted").map((e) => [e.step, e.messageId])).toEqual([
+        [1, "id-1"],
+        [2, "id-3"],
+      ]);
+    }),
+  );
+
+  it.effect("fails with StepLimitExceeded after the last allowed step", () =>
+    Effect.gen(function* () {
+      const loopingStep = [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")];
+      const { events, prompts } = yield* runCore(
+        [loopingStep, loopingStep.map((p) => ("id" in p ? { ...p, id: "c2" } : p)), loopingStep],
         { maxSteps: 2 },
       );
       expect(prompts).toHaveLength(2);
-      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
-      expect(events.at(-1)).toMatchObject({ code: "StepLimitExceeded" });
-      expect((events.at(-1) as { message: string }).message).toContain("Step limit exceeded");
+      expect(events.at(-1)).toMatchObject({ _tag: "Failed", code: "StepLimitExceeded" });
+      expect(Agent.errorMessage((events.at(-1) as { error: unknown }).error)).toContain("Step limit exceeded");
     }),
   );
 
-  it.effect("closes an open text message before RUN_ERROR when the model fails", () =>
+  it.effect("fails with ModelStreamError on an error part and emits nothing after", () =>
     Effect.gen(function* () {
-      const { events } = yield* runScripted([
-        Stream.fromIterable(text("0", "partial").slice(0, 2)).pipe(Stream.concat(Stream.fail(modelFailure))),
+      const { events } = yield* runCore([
+        [...text("0", "par").slice(0, 2), { type: "error", error: { message: "overloaded" } }],
       ]);
-      expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.RUN_ERROR,
-      ]);
-      expect(events.at(-1)).toMatchObject({ code: "UnknownError" });
+      expect(tags(events)).toEqual(["StepStarted", "ModelPart", "ModelPart", "Failed"]);
+      expect(events.at(-1)).toMatchObject({ _tag: "Failed", code: "ModelStreamError" });
+      expect(Agent.errorMessage((events.at(-1) as { error: unknown }).error)).toBe("overloaded");
     }),
   );
+});
 
-  it.effect("closes an open tool call before RUN_ERROR on an error part", () =>
-    Effect.gen(function* () {
-      const { events } = yield* runScripted([
-        [
-          { type: "tool-params-start", id: "toolu_1", name: "get-weather" },
-          { type: "tool-params-delta", id: "toolu_1", delta: '{"loc' },
-          { type: "error", error: { message: "overloaded" } },
-        ],
-      ]);
-      expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.RUN_ERROR,
-      ]);
-      expect(events.at(-1)).toMatchObject({ message: "overloaded" });
-    }),
-  );
+describe("Agent.run approvals", () => {
+  const approvalAgent = Agent.define({ toolkit: ApprovalToolkit });
 
-  it.effect("closes a text message the model never ended", () =>
+  const runApproval = (steps: ReadonlyArray<Step>, prompt: Prompt.Prompt = userPrompt) =>
     Effect.gen(function* () {
-      const { events } = yield* runScripted([[...text("0", "hi").slice(0, 2), finish("stop")]]);
-      expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.RUN_FINISHED,
-      ]);
-    }),
-  );
+      const model = scriptedModel(steps);
+      const handlers = countingApprovalLayer();
+      const events = yield* Agent.run(approvalAgent)({ runId: "r1", prompt }).pipe(
+        Stream.runCollect,
+        Effect.provide([model.layer, handlers.layer, evalLayers]),
+      );
+      return { events: Array.from(events), prompts: model.prompts, ...handlers };
+    });
 
-  it.effect("uses one message id for every text block in a step", () =>
+  it.effect("interrupts for approval while other tools of the step still run", () =>
     Effect.gen(function* () {
-      const { events } = yield* runScripted([[...text("0", "a"), ...text("1", "b"), finish("stop")]]);
-      const starts = events.filter((e) => e.type === EventType.TEXT_MESSAGE_START);
-      expect(starts).toHaveLength(2);
-      expect(new Set(starts.map((e) => (e as { messageId: string }).messageId))).toEqual(new Set(["id-1"]));
-    }),
-  );
-
-  it.effect("emits complete tool calls from providers that do not stream parameters", () =>
-    Effect.gen(function* () {
-      const { events } = yield* runScripted([
-        [{ type: "tool-call", id: "call_1", name: "get-weather", params: { location: "Paris" } }, finish("tool-calls")],
-        [finish("stop")],
+      const { events, prompts, weatherCalls, emails } = yield* runApproval([
+        [...emailCall, ...toolCall("c_weather", "get-weather", { location: "Paris" }), finish("tool-calls")],
       ]);
-      expect(events.slice(1, 4)).toEqual([
-        { type: EventType.TOOL_CALL_START, toolCallId: "call_1", toolCallName: "get-weather", parentMessageId: "id-1" },
-        { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_1", delta: '{"location":"Paris"}' },
-        { type: EventType.TOOL_CALL_END, toolCallId: "call_1" },
-      ]);
-    }),
-  );
-
-  it.effect("sends the system prompt before the client history", () =>
-    Effect.gen(function* () {
-      const { prompts } = yield* runScripted([[finish("stop")]], { system: "Be helpful." });
-      expect(prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
-    }),
-  );
-
-  it.effect("finishes with the unanswered calls as pending instead of calling the model again", () =>
-    Effect.gen(function* () {
-      // The provider ran this call, so the toolkit does not and no result arrives.
-      const { events, prompts } = yield* runScripted([
-        [
-          {
-            type: "tool-call",
-            id: "srv_1",
-            name: "get-weather",
-            params: { location: "Paris" },
-            providerExecuted: true,
-          },
-          finish("tool-calls"),
-        ],
-      ]);
+      expect(weatherCalls).toEqual(["Paris"]);
+      expect(emails).toEqual([]);
       expect(prompts).toHaveLength(1);
+      const [requested] = byTag(events, "ApprovalRequested");
+      expect(requested).toMatchObject({ step: 1, toolCallId: "c_email", toolName: "send-email", replayed: false });
       expect(events.at(-1)).toEqual({
-        type: EventType.RUN_FINISHED,
-        threadId: "t1",
-        runId: "r1",
-        outcome: { type: "success", pendingToolCallIds: ["srv_1"] },
+        _tag: "Finished",
+        outcome: {
+          _tag: "Interrupted",
+          approvals: [{ approvalId: requested!.approvalId, toolCallId: "c_email", toolName: "send-email" }],
+        },
       });
+      const [finished] = byTag(events, "StepFinished");
+      const assistant = finished!.entries[0]!.message;
+      expect(assistant.role).toBe("assistant");
+      expect(partTypes(Prompt.fromMessages([assistant]))).toEqual(["tool-call", "tool-call", "tool-approval-request"]);
     }),
   );
 
-  it.effect("recovers a thread whose previous run stopped before the tool result", () =>
+  it.effect("treats a throwing approval predicate as not needing approval", () =>
     Effect.gen(function* () {
-      const { prompts } = yield* runScripted([[...text("0", "Sorry."), finish("stop")]], undefined, {
-        ...input,
-        messages: [
-          { id: "u1", role: "user", content: "Weather in Paris?" },
-          {
-            id: "a1",
-            role: "assistant",
-            toolCalls: [{ id: "toolu_1", function: { name: "get-weather", arguments: '{"location":"Paris"}' } }],
-          },
-          { id: "u2", role: "user", content: "Hello?" },
-        ],
+      const Risky = Tool.make("risky", {
+        parameters: Schema.Struct({}),
+        success: Schema.Boolean,
+        needsApproval: () => {
+          throw new Error("predicate failed");
+        },
       });
-      expect(prompts[0]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
-      expect(prompts[0]!.content[2]).toMatchObject({ content: [{ type: "tool-result", isFailure: true }] });
+      const toolkit = Toolkit.make(Risky);
+      let ran = 0;
+      const model = scriptedModel([[...toolCall("c1", "risky", {}), finish("tool-calls")], [finish("stop")]]);
+      const events = yield* Agent.run(Agent.define({ toolkit }))({ runId: "r1", prompt: userPrompt }).pipe(
+        Stream.runCollect,
+        Effect.provide([model.layer, toolkit.toLayer({ risky: () => Effect.sync(() => (ran++, true)) }), evalLayers]),
+      );
+      expect(ran).toBe(1);
+      expect(byTag(Array.from(events), "ApprovalRequested")).toEqual([]);
     }),
   );
 
-  it("rejects a step limit that is not a positive integer", () => {
-    for (const maxSteps of [0, -1, 1.5, Number.NaN]) {
-      expect(() => Agent.run({ toolkit: WeatherToolkit, maxSteps })).toThrow(RangeError);
-    }
-  });
+  const answered = (approved: boolean, reason?: string) =>
+    Prompt.make([
+      { role: "user", content: "Email Ada" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", id: "c_email", name: "send-email", params: { to: "ada@example.com", body: "Hi" } },
+          { type: "tool-approval-request", approvalId: "a1", toolCallId: "c_email" },
+        ],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool-approval-response", approvalId: "a1", approved, ...(reason ? { reason } : {}) }],
+      },
+    ]);
+
+  it.effect("executes an approved call as step 0 before calling the model", () =>
+    Effect.gen(function* () {
+      const { events, prompts, emails } = yield* runApproval([[...text("0", "Sent."), finish("stop")]], answered(true));
+      expect(emails).toEqual(["ada@example.com"]);
+      expect(tags(events).slice(0, 3)).toEqual(["ToolResult", "StepFinished", "StepStarted"]);
+      expect(events[0]).toMatchObject({
+        step: 0,
+        toolCallId: "c_email",
+        encodedResult: { sent: true },
+        isFailure: false,
+      });
+      expect(events[1]).toMatchObject({ _tag: "StepFinished", step: 0 });
+      expect(
+        (events[1] as { entries: ReadonlyArray<{ message: Prompt.Message }> }).entries.map((e) => e.message.role),
+      ).toEqual(["tool"]);
+      expect(partTypes(prompts[0]!)).toEqual(["text", "tool-call", "tool-result"]);
+    }),
+  );
+
+  it.effect("answers a denied call with a failed result naming the reason", () =>
+    Effect.gen(function* () {
+      const { events, prompts, emails } = yield* runApproval(
+        [[...text("0", "OK."), finish("stop")]],
+        answered(false, "no"),
+      );
+      expect(emails).toEqual([]);
+      expect(events[0]).toMatchObject({
+        _tag: "ToolResult",
+        step: 0,
+        isFailure: true,
+        encodedResult: { type: "execution-denied", reason: "no" },
+      });
+      expect(prompts[0]!.content.at(-1)).toMatchObject({
+        role: "tool",
+        content: [{ type: "tool-result", id: "c_email", isFailure: true, result: { reason: "no" } }],
+      });
+    }),
+  );
+
+  it.effect("does not count step 0 against the step limit", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Sent."), finish("stop")]]);
+      const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, maxSteps: 1 }))({
+        runId: "r1",
+        prompt: answered(true),
+      }).pipe(Stream.runCollect, Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]));
+      expect(Array.from(events).at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+    }),
+  );
+});
+
+describe("Agent.run replay", () => {
+  it.effect("replays completed steps of a run executed again", () =>
+    Effect.gen(function* () {
+      const weather = countingWeatherLayer();
+      const step1: Step = [
+        ...text("0", "Checking."),
+        ...toolCall("c1", "get-weather", { location: "Paris" }),
+        finish("tool-calls"),
+      ];
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
+        Effect.gen(function* () {
+          const model = scriptedModel(steps);
+          const events = Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt });
+          const collected = yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
+            Stream.runCollect,
+            Effect.provide([model.layer, weather.layer]),
+          );
+          return { events: Array.from(collected), prompts: model.prompts };
+        });
+
+      // Attempt 1 stops (as if the process crashed) while step 2 is streaming.
+      const first = yield* attempt(
+        [step1, Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))],
+        (event) => event._tag === "ModelPart" && event.step === 2,
+      );
+      // Attempt 2 is served step 1 from the ledger; its model is only called for step 2.
+      const second = yield* attempt([[...text("0", "18°C"), finish("stop")]]);
+
+      expect(weather.calls).toEqual(["Paris"]);
+      expect(second.prompts).toHaveLength(1);
+      expect(second.prompts[0]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+
+      const step1Of = (events: ReadonlyArray<Agent.Event>) =>
+        events.filter((e) => "step" in e && e.step === 1 && e._tag !== "ModelPart");
+      const original = step1Of(first.events);
+      const replayed = step1Of(second.events);
+      expect(replayed.map((e) => e._tag)).toEqual(["StepStarted", "ToolResult", "StepFinished"]);
+      expect(replayed.every((e) => "replayed" in e && e.replayed)).toBe(true);
+      expect(replayed.map((e) => ({ ...e, replayed: false }))).toEqual(original);
+      expect(second.events.filter((e) => e._tag === "ModelPart" && e.step === 1)).toEqual([]);
+      expect(second.events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+      ),
+    ),
+  );
 });

@@ -1,87 +1,88 @@
 import * as readline from "readline";
 import { agent } from "./agent.ts";
 import { randomUUID } from "@ag-ui/client";
+import type { AgentSubscriber, RunAgentParameters } from "@ag-ui/client";
 
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
 
+const ask = (question: string) => new Promise<string>((resolve) => rl.question(question, resolve));
+
+const subscriber: AgentSubscriber = {
+  onTextMessageStartEvent() {
+    process.stdout.write("🤖 Assistant: ");
+  },
+  onTextMessageContentEvent({ event }) {
+    process.stdout.write(event.delta);
+  },
+  onTextMessageEndEvent() {
+    console.log("\n");
+  },
+  onToolCallStartEvent({ event }) {
+    console.log("🔧 Tool call:", event.toolCallName);
+  },
+  onToolCallArgsEvent({ event }) {
+    process.stdout.write(event.delta);
+  },
+  onToolCallEndEvent() {
+    console.log("");
+  },
+  onToolCallResultEvent({ event }) {
+    if (event.content) {
+      console.log("🔍 Tool call result:", event.content);
+    }
+  },
+};
+
+// Runs the agent, then answers every approval it asks for and runs it again,
+// until it finishes without an interrupt.
+async function run(parameters: RunAgentParameters = {}) {
+  await agent.runAgent(parameters, subscriber);
+  if (agent.pendingInterrupts.length === 0) {
+    return;
+  }
+  const resume: NonNullable<RunAgentParameters["resume"]> = [];
+  for (const interrupt of agent.pendingInterrupts) {
+    const answer = await ask(`❓ ${interrupt.message ?? "Approve the tool call?"} (y/n) `);
+    resume.push({ interruptId: interrupt.id, status: "resolved", payload: { approved: answer.trim() === "y" } });
+  }
+  await run({ resume });
+}
+
 async function chatLoop() {
   console.log("🤖 AG-UI Assistant started!");
   console.log("Type your messages and press Enter. Press Ctrl+D to quit.\n");
 
-  return new Promise<void>((resolve) => {
-    const promptUser = () => {
-      rl.question("> ", async (input) => {
-        if (input.trim() === "") {
-          promptUser();
-          return;
-        }
-        console.log("");
+  for (;;) {
+    const input = await ask("> ").catch(() => undefined);
+    if (input === undefined) {
+      return;
+    }
+    if (input.trim() === "") {
+      continue;
+    }
+    console.log("");
 
-        // Pause input while processing
-        rl.pause();
-
-        // Add user message to conversation
-        agent.messages.push({
-          id: randomUUID(),
-          role: "user",
-          content: input.trim(),
-        });
-
-        try {
-          // Run the agent with event handlers
-          await agent.runAgent(
-            {}, // No additional configuration needed
-            {
-              onTextMessageStartEvent() {
-                process.stdout.write("🤖 Assistant: ");
-              },
-              onTextMessageContentEvent({ event }) {
-                process.stdout.write(event.delta);
-              },
-              onTextMessageEndEvent() {
-                console.log("\n");
-              },
-              onToolCallStartEvent({ event }) {
-                console.log("🔧 Tool call:", event.toolCallName);
-              },
-              onToolCallArgsEvent({ event }) {
-                process.stdout.write(event.delta);
-              },
-              onToolCallEndEvent() {
-                console.log("");
-              },
-              onToolCallResultEvent({ event }) {
-                if (event.content) {
-                  console.log("🔍 Tool call result:", event.content);
-                }
-              },
-            },
-          );
-        } catch (error) {
-          console.error("❌ Error:", error);
-        }
-
-        // Resume input
-        rl.resume();
-        promptUser();
-      });
-    };
-
-    // Handle Ctrl+D to quit
-    rl.on("close", () => {
-      console.log("\n👋 Thanks for using AG-UI Assistant!");
-      resolve();
+    agent.messages.push({
+      id: randomUUID(),
+      role: "user",
+      content: input.trim(),
     });
 
-    promptUser();
-  });
+    try {
+      await run();
+    } catch (error) {
+      console.error("❌ Error:", error);
+    }
+  }
 }
 
-async function main() {
-  await chatLoop();
-}
+// Handle Ctrl+D to quit
+rl.on("close", () => {
+  console.log("\n👋 Thanks for using AG-UI Assistant!");
+  process.exit(0);
+});
 
-main().catch(console.error);
+chatLoop().catch(console.error);

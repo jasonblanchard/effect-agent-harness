@@ -2,10 +2,23 @@
 
 A runnable example: a terminal chat client (`src/index.ts`) using `@ag-ui/client`'s `HttpAgent`, talking to an effentic agent backed by Anthropic.
 
-- `src/server.ts`: builds `POST /agent` with `HttpRouter` and exposes it as an in-process web handler (`HttpRouter.toWebHandler`).
+- `src/server.ts`: defines the agent with `Agent.define` (weather + email tools), and builds the routes with `HttpRouter`, exposed as an in-process web handler (`HttpRouter.toWebHandler`). Stores are in-memory: `Thread.layerMemory`, `Checkpoint.layerNone`, `EventLog.layerMemory`.
+  - `POST /agent`: request-scoped run (`Runner.make`), streamed back as SSE. A disconnect cancels the run. The server owns the thread; the client's resent history is reduced to its delta.
+  - `POST /runs`: starts a detached run (`Runner.makeDetached`) and answers `202` at once.
+  - `GET /runs/:runId/events`: follows a run from the event log as SSE with cursors as SSE ids, resuming after the request's `Last-Event-ID`.
 - `src/agent.ts`: an `HttpAgent` whose `fetch` calls that handler directly. No network server runs, and the `effentic.local` host is never resolved.
+- `src/index.ts`: the chat loop. When a run ends with an interrupt, it asks `(y/n)` for each pending approval and runs again with `resume`.
 - `src/tools/weather.tool.ts`: an example tool (Open-Meteo) with `failureMode: "return"`.
+- `src/tools/email.tool.ts`: a `send-email` tool with `needsApproval: true`. It only prints; nothing is sent.
 
 Run it with `pnpm --filter ag-ui dev`. It needs `ANTHROPIC_API_KEY` in the repo-root `.env`, which is gitignored. Never print, log or commit its value.
 
-This package exists to show how to use the library, so keep it idiomatic and minimal. Changes to library behaviour belong in `packages/effentic`, with tests there. This package has no tests; `pnpm tsc` and `pnpm lint` are its checks.
+## Manual checks
+
+This package has no tests; `pnpm tsc` and `pnpm lint` are its checks. After changing the runner or the thread handling, also run the example and check:
+
+1. **Server-owned history:** ask "What's the weather in Paris?", then "Which city did I just ask about?". The second answer must name Paris, which the model only knows from the stored first turn.
+2. **Approval, approved:** ask "Email ada@example.com saying hello". The run stops at `❓ Approve call to send-email? (y/n)`. Answer `y`: the tool prints `📧 (not really) sending ...`, its result is `{"sent":true}`, and the assistant confirms.
+3. **Approval, denied:** repeat and answer `n`: the tool does not print, its result is `{"type":"execution-denied","reason":"denied"}`, and the assistant says it could not send.
+
+This package exists to show how to use the library, so keep it idiomatic and minimal. Changes to library behaviour belong in `packages/effentic`, with tests there.

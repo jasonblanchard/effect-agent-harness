@@ -1,8 +1,21 @@
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { Config, Effect, Layer, Stream } from "effect";
+import { Config, Effect, Layer, Schema, Stream } from "effect";
+import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Sse } from "effentic";
-import { WeatherToolkit, WeatherToolkitLayer } from "./tools/weather.tool.ts";
+import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
+import { SendEmail, sendEmail } from "./tools/email.tool.ts";
+import { GetWeather, getWeather } from "./tools/weather.tool.ts";
+
+// The agent's behaviour, independent of the model provider and of any store.
+const AssistantToolkit = Toolkit.make(GetWeather, SendEmail);
+
+const assistant = Agent.define({
+  toolkit: AssistantToolkit,
+  system: `
+    You are a helpful AI assistant. Be friendly, conversational, and helpful.
+    Answer questions to the best of your ability and engage in natural conversation.
+  `,
+});
 
 const ModelLayer = AnthropicLanguageModel.layer({
   model: "claude-haiku-5-5",
@@ -15,43 +28,68 @@ const ModelLayer = AnthropicLanguageModel.layer({
   Layer.provide(FetchHttpClient.layer),
 );
 
-// POST /agent: decode the AG-UI run input and stream the run back as SSE.
-const AgentRoute = HttpRouter.use((router) =>
-  Effect.gen(function* () {
-    const runAgent = yield* Agent.make({
-      toolkit: WeatherToolkit,
-      system: `
-        You are a helpful AI assistant. Be friendly, conversational, and helpful.
-        Answer questions to the best of your ability and engage in natural conversation.
-      `,
-    });
+const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-email": sendEmail });
 
+// In-memory stores: each thread is kept for the life of the process.
+// Swap these for durable implementations in production.
+const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
+
+const sse = (frames: Stream.Stream<string, unknown>) =>
+  HttpServerResponse.stream(frames.pipe(Stream.encodeText), {
+    contentType: Sse.contentType,
+    headers: { "cache-control": "no-cache" },
+  });
+
+const invalidInput = (error: { readonly message: string }) =>
+  Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 }));
+
+const AgentRoutes = HttpRouter.use((router) =>
+  Effect.gen(function* () {
+    const runAgent = yield* Runner.make(assistant);
+
+    // POST /agent: the run streams back as SSE, and ends if the client disconnects.
     yield* router.add(
       "POST",
       "/agent",
       HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.map((input) =>
-          HttpServerResponse.stream(Sse.encode(runAgent(input)).pipe(Stream.encodeText), {
-            contentType: Sse.contentType,
-            headers: { "cache-control": "no-cache" },
-          }),
-        ),
-        Effect.catch((error) =>
-          Effect.succeed(
-            HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, {
-              status: 400,
-            }),
-          ),
-        ),
+        Effect.map((input) => sse(Sse.encode(runAgent(input)))),
+        Effect.catch(invalidInput),
       ),
     );
+
+    // POST /runs starts a run that outlives the request; GET /runs/:runId/events
+    // follows it, resuming after the client's `Last-Event-ID`.
+    const detached = yield* Runner.makeDetached(assistant);
+    const log = yield* EventLog.EventLog;
+
+    yield* router.add(
+      "POST",
+      "/runs",
+      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
+        Effect.flatMap((input) => Effect.as(detached.start(input), HttpServerResponse.empty({ status: 202 }))),
+        Effect.catch(invalidInput),
+      ),
+    );
+
+    yield* router.add(
+      "GET",
+      "/runs/:runId/events",
+      Effect.gen(function* () {
+        const { runId } = yield* HttpRouter.schemaPathParams(Schema.Struct({ runId: Schema.String }));
+        const { "last-event-id": lastEventId } = yield* HttpServerRequest.schemaHeaders(
+          Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
+        );
+
+        return sse(Sse.encodeStored(log.subscribe(runId, lastEventId)));
+      }).pipe(Effect.orElseSucceed(() => HttpServerResponse.text("Invalid request", { status: 400 }))),
+    );
   }),
-).pipe(Layer.provide(Layer.mergeAll(ModelLayer, WeatherToolkitLayer)));
+).pipe(Layer.provide(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
 
 /**
- * The AG-UI endpoint as an in-process web handler (`Request => Promise<Response>`).
- * Swap for `HttpRouter.serve` + `NodeHttpServer` to expose it over the network.
+ * The AG-UI endpoints as an in-process web handler (`Request => Promise<Response>`).
+ * Swap for `HttpRouter.serve` + `NodeHttpServer` to expose them over the network.
  */
-export const { handler, dispose } = HttpRouter.toWebHandler(AgentRoute, {
+export const { handler, dispose } = HttpRouter.toWebHandler(AgentRoutes, {
   disableLogger: true,
 });

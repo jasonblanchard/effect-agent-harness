@@ -3,7 +3,11 @@ import type { BaseEvent } from "@ag-ui/client";
 import { Effect, Layer, Schema, Stream } from "effect";
 import { AiError, IdGenerator, LanguageModel, Tool, Toolkit } from "effect/ai";
 import type { Prompt, Response } from "effect/ai";
+import type * as Agent from "../src/Agent.ts";
+import type * as AgUi from "../src/AgUi.ts";
+import * as Runner from "../src/Runner.ts";
 import { from, lastValueFrom, toArray } from "rxjs";
+import * as Checkpoint from "../src/Checkpoint.ts";
 
 // -----------------------------------------------------------------------------
 // Scripted language model
@@ -64,16 +68,21 @@ export const finish = (reason: Response.FinishReason): Response.StreamPartEncode
 // Deterministic ids
 // -----------------------------------------------------------------------------
 
-export const counterIds = (prefix = "id") => {
-  let n = 0;
-  return Layer.succeed(IdGenerator.IdGenerator)({
-    generateId: () => Effect.sync(() => `${prefix}-${++n}`),
+/** Ids `${prefix}-1`, `${prefix}-2`, ..., counting from 1 again each time the layer is built. */
+export const counterIds = (prefix = "id") =>
+  Layer.sync(IdGenerator.IdGenerator, () => {
+    let n = 0;
+    return { generateId: () => Effect.sync(() => `${prefix}-${++n}`) };
   });
-};
 
 // -----------------------------------------------------------------------------
 // Weather tool
 // -----------------------------------------------------------------------------
+
+const weather = (location: string) =>
+  location === "Nowhere"
+    ? Effect.fail({ message: `Location '${location}' not found` })
+    : Effect.succeed({ temperature: 18 });
 
 export const GetWeather = Tool.make("get-weather", {
   description: "Get current weather for a location",
@@ -86,11 +95,50 @@ export const GetWeather = Tool.make("get-weather", {
 export const WeatherToolkit = Toolkit.make(GetWeather);
 
 export const WeatherToolkitLayer = WeatherToolkit.toLayer({
-  "get-weather": ({ location }) =>
-    location === "Nowhere"
-      ? Effect.fail({ message: `Location '${location}' not found` })
-      : Effect.succeed({ temperature: 18 }),
+  "get-weather": ({ location }) => weather(location),
 });
+
+/** The weather handlers, recording the location of every call in `calls`. */
+export const countingWeatherLayer = () => {
+  const calls: Array<string> = [];
+  const layer = WeatherToolkit.toLayer({
+    "get-weather": ({ location }) => Effect.suspend(() => (calls.push(location), weather(location))),
+  });
+  return { layer, calls };
+};
+
+// -----------------------------------------------------------------------------
+// Approval tool
+// -----------------------------------------------------------------------------
+
+export const SendEmail = Tool.make("send-email", {
+  description: "Send an email",
+  parameters: Schema.Struct({ to: Schema.String, body: Schema.String }),
+  success: Schema.Struct({ sent: Schema.Boolean }),
+  failure: Schema.Struct({ message: Schema.String }),
+  failureMode: "return",
+  needsApproval: true,
+});
+
+export const ApprovalToolkit = Toolkit.make(GetWeather, SendEmail);
+
+/** Handlers for {@link ApprovalToolkit}, recording every weather location and email recipient. */
+export const countingApprovalLayer = () => {
+  const weatherCalls: Array<string> = [];
+  const emails: Array<string> = [];
+  const layer = ApprovalToolkit.toLayer({
+    "get-weather": ({ location }) => Effect.suspend(() => (weatherCalls.push(location), weather(location))),
+    "send-email": ({ to }) => Effect.sync(() => (emails.push(to), { sent: true })),
+  });
+  return { layer, weatherCalls, emails };
+};
+
+// -----------------------------------------------------------------------------
+// Evals
+// -----------------------------------------------------------------------------
+
+/** What an eval or unit test provides besides the model and tool handlers: no durability, deterministic ids. */
+export const evalLayers = Layer.mergeAll(Checkpoint.layerNone, counterIds());
 
 // -----------------------------------------------------------------------------
 // AG-UI client verification
@@ -99,3 +147,21 @@ export const WeatherToolkitLayer = WeatherToolkit.toLayer({
 /** Runs events through `@ag-ui/client`'s verifier; rejects if the sequence is invalid. */
 export const verify = (events: ReadonlyArray<BaseEvent>): Promise<Array<BaseEvent>> =>
   lastValueFrom(from(events).pipe(verifyEvents(), toArray()));
+
+/**
+ * Runs each input through `Runner.run`, one after another, and returns each
+ * run's AG-UI events, already verified. Provide one `Thread` layer
+ * around it so the runs share a thread store.
+ */
+export const runAgUi = <Tools extends Record<string, Tool.Any>>(
+  agent: Agent.Agent<Tools>,
+  inputs: ReadonlyArray<AgUi.RunAgentInput>,
+  options?: Runner.Options,
+) =>
+  Effect.forEach(inputs, (input) =>
+    Effect.gen(function* () {
+      const events = Array.from(yield* Stream.runCollect(Runner.run(agent, options)(input)));
+      yield* Effect.promise(() => verify(events));
+      return events;
+    }),
+  );

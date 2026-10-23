@@ -1,5 +1,10 @@
 # Spec Delta
 
+## RENAMED Requirements
+
+- FROM: `### Requirement: Conversation history from the client`
+- TO: `### Requirement: Thread history from the server store`
+
 ## MODIFIED Requirements
 
 ### Requirement: Run lifecycle
@@ -16,8 +21,8 @@ The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end
 - **AND** no events follow it
 
 #### Scenario: Failure before the model is called
-- **WHEN** loading the conversation fails
-- **THEN** the run emits `RUN_STARTED` followed by `RUN_ERROR` whose `code` is `ConversationError`
+- **WHEN** loading the thread fails
+- **THEN** the run emits `RUN_STARTED` followed by `RUN_ERROR` whose `code` is `ThreadError`
 
 ### Requirement: Server-side tool execution and multi-step loop
 The agent SHALL run each tool call the model makes against its configured tools, outside the model call and at most once per run and tool call id, and emit a `TOOL_CALL_RESULT` with the result serialized as JSON in `content`. If the model's step ends by requesting tool calls and none of them requires approval, the agent SHALL send the tool results back to the model and continue with a new step. Otherwise it SHALL finish the run.
@@ -37,8 +42,8 @@ The agent SHALL run each tool call the model makes against its configured tools,
 - **WHEN** the model calls "get-weather"
 - **THEN** `TOOL_CALL_END` for that call precedes its `TOOL_CALL_RESULT`, and the handler ran after the model stream ended
 
-### Requirement: Conversation history from the client
-The agent SHALL keep the conversation per `threadId` in the conversation store and SHALL rebuild the model prompt on every run from the store, not from the client's full history. The prompt SHALL be: the configured system prompt, then the stored entries' messages in order, then the ingested client delta. Every tool call sent to the model SHALL have a result: a stored tool call with no result and no approval request SHALL be sent with a failed result.
+### Requirement: Thread history from the server store
+The agent SHALL keep the history of each `threadId` in the thread store and SHALL rebuild the model prompt on every run from the store, not from the client's full history. The prompt SHALL be: the configured system prompt, then the stored entries' messages in order, then the approval responses recorded for this run, then the ingested client delta, with every tool result placed directly after the assistant message holding its tool call. Every tool call sent to the model SHALL have a result: a stored tool call with no result and no approval request SHALL be sent with a failed result.
 
 #### Scenario: Follow-up question uses earlier context
 - **WHEN** a second run on the same thread arrives after a first run that made a tool call
@@ -96,11 +101,19 @@ After each model step completes, the agent SHALL commit that step's assistant en
 - **THEN** the store holds step 1's entries and nothing from step 2
 
 ### Requirement: Run-ended notification
-The agent SHALL notify the conversation store once when a run ends, after its last commit, with the outcome kind: success, interrupted or failed.
+The agent SHALL notify the thread store once when a run ends, after its last commit, with the outcome kind: success, interrupted or failed. Failures anywhere in the run SHALL be notified, including failures before the model is called and a failing commit. If the notification itself fails, a run that succeeded or was interrupted SHALL end with `RUN_ERROR` whose `code` is `ThreadError`, and a run that already failed SHALL keep its own error code.
 
 #### Scenario: Interrupted run
 - **WHEN** a run ends with an approval interrupt
 - **THEN** the store is notified with the interrupted outcome after the step's entries were committed
+
+#### Scenario: Commit fails mid-run
+- **WHEN** committing step 1's entries fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError`, and the store is notified once with the failed outcome and that code
+
+#### Scenario: Notification fails after success
+- **WHEN** a run finishes successfully and the run-ended notification fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` instead of `RUN_FINISHED`
 
 ### Requirement: Tool approval interrupts the run
 When the model calls a tool that requires approval, the agent SHALL NOT run it. It SHALL record an approval request on the assistant entry and end the run with `RUN_FINISHED` whose outcome is `interrupt`, listing one interrupt per pending approval with `id` set to the approval id, `reason` `tool-approval` and `toolCallId` set to the tool call. The tool call's `TOOL_CALL_START`/`ARGS`/`END` events SHALL still be streamed.
@@ -141,6 +154,10 @@ A pending approval request that the next run on the thread does not answer SHALL
 #### Scenario: Client ignores the interrupt
 - **WHEN** a run follows an interrupted run with no `resume` entries
 - **THEN** the pending call receives a failed result with reason "not answered" and the run proceeds
+
+#### Scenario: Interrupt ignored with a new user message
+- **WHEN** a run follows an interrupted run with no `resume` entries and its delta holds a new user message
+- **THEN** the model receives the pending tool call, directly followed by its failed "not answered" result, then the new user message
 
 ### Requirement: Step events
 The agent SHALL emit `STEP_STARTED` before the first content event of each model step and `STEP_FINISHED` after its last, with `stepName` `step-<n>` where `<n>` is the 1-based step number. Results of approvals resolved before the first model step SHALL be emitted without step events.
