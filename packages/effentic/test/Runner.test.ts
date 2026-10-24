@@ -1,7 +1,7 @@
 import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Layer, Scope, Stream } from "effect";
-import { Prompt } from "effect/ai";
+import { Deferred, Effect, Exit, Layer, Schema, Scope, Stream } from "effect";
+import { Prompt, Tool, Toolkit } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
@@ -580,11 +580,11 @@ describe("Runner.workflow", () => {
       const weather = countingWeatherLayer();
       const { workflow, layer } = Runner.workflow(weatherAgent);
       const events = yield* Effect.gen(function* () {
-        yield* workflow.execute(run1, { discard: true });
+        yield* workflow.execute({ input: run1 }, { discard: true });
         const log = yield* EventLog.EventLog;
         const first = (yield* Stream.runCollect(log.subscribe("r1"))).map((s) => s.event);
         // Executing the same run id again joins the finished execution.
-        yield* workflow.execute(run1);
+        yield* workflow.execute({ input: run1 });
         expect((yield* log.read("r1")).map((s) => s.event)).toEqual(first);
         return first;
       }).pipe(
@@ -609,5 +609,180 @@ describe("Runner.workflow", () => {
       expect(weather.calls).toEqual(["Paris"]);
       expect(model.prompts).toHaveLength(2);
     }),
+  );
+});
+
+// -----------------------------------------------------------------------------
+// Run info
+// -----------------------------------------------------------------------------
+
+describe("Runner run info", () => {
+  const WhoAmI = Tool.make("who-am-i", {
+    parameters: Schema.Struct({}),
+    success: Schema.Boolean,
+    dependencies: [Agent.CurrentRun],
+  });
+  const WhoAmIToolkit = Toolkit.make(WhoAmI);
+
+  /** An agent whose system prompt and only tool both record the run info they see. */
+  const recordingAgent = () => {
+    const bySystem: Array<Agent.RunInfo> = [];
+    const byTool: Array<Agent.RunInfo> = [];
+    const agent = Agent.define({
+      toolkit: WhoAmIToolkit,
+      system: Effect.gen(function* () {
+        bySystem.push(yield* Agent.CurrentRun);
+        return "Be helpful.";
+      }),
+    });
+    const handlers = WhoAmIToolkit.toLayer({
+      "who-am-i": () =>
+        Effect.gen(function* () {
+          byTool.push(yield* Agent.CurrentRun);
+          return true;
+        }),
+    });
+    return { agent, handlers, bySystem, byTool };
+  };
+
+  const whoAmITurn = (): ReadonlyArray<Step> => [
+    [...toolCall("c1", "who-am-i", {}), finish("tool-calls")],
+    [...text("0", "Done."), finish("stop")],
+  ];
+
+  const runOnce = <Tools extends Record<string, Tool.Any>, R>(
+    agent: Agent.Agent<Tools, R>,
+    runInput: AgUi.RunAgentInput,
+    runOptions?: Runner.RunOptions,
+  ) =>
+    Effect.gen(function* () {
+      const events = Array.from(yield* Stream.runCollect(Runner.run(agent)(runInput, runOptions)));
+      yield* Effect.promise(() => verify(events));
+      return events;
+    });
+
+  it.effect("passes forwardedProps to the system prompt as props, with the input's ids", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, bySystem } = recordingAgent();
+      yield* runOnce(agent, { ...input("r1", [userMessage("u1", "hi")]), forwardedProps: { locale: "fr" } }).pipe(
+        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]),
+      );
+      expect(bySystem).toEqual([{ runId: "r1", threadId: "t1", props: { locale: "fr" } }]);
+    }),
+  );
+
+  it.effect("runs without props when the input has no forwardedProps", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, bySystem } = recordingAgent();
+      yield* runOnce(agent, input("r1", [userMessage("u1", "hi")])).pipe(
+        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]),
+      );
+      expect(bySystem).toHaveLength(1);
+      expect(bySystem[0]!.props).toBeUndefined();
+    }),
+  );
+
+  it.effect("takes the context only from the caller, never from the client", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, bySystem, byTool } = recordingAgent();
+      const forwardedProps = { context: { userId: "u2" }, userId: "u2" };
+      yield* runOnce(
+        agent,
+        { ...input("r1", [userMessage("u1", "hi")]), forwardedProps },
+        {
+          context: { userId: "u1" },
+        },
+      ).pipe(Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]));
+      const expected = { runId: "r1", threadId: "t1", props: forwardedProps, context: { userId: "u1" } };
+      expect(bySystem).toEqual([expected]);
+      expect(byTool).toEqual([expected]);
+    }),
+  );
+
+  it.effect("gives each run of one captured runner its own context", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, byTool } = recordingAgent();
+      const runAgent = yield* Runner.make(agent).pipe(
+        Effect.provide([
+          scriptedModel([...whoAmITurn(), ...whoAmITurn()]).layer,
+          handlers,
+          evalLayers,
+          Thread.layerMemory,
+        ]),
+      );
+      for (const [threadId, userId] of [
+        ["t1", "u1"],
+        ["t2", "u2"],
+      ] as const) {
+        const events = Array.from(
+          yield* Stream.runCollect(
+            runAgent(
+              { threadId, runId: `r-${userId}`, messages: [userMessage(`m-${userId}`, "hi")] },
+              {
+                context: { userId },
+              },
+            ),
+          ),
+        );
+        yield* Effect.promise(() => verify(events));
+      }
+      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }, { userId: "u2" }]);
+    }),
+  );
+
+  it.effect("gives a detached run the context passed to start", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, byTool } = recordingAgent();
+      const runner = yield* Runner.makeDetached(agent).pipe(
+        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers]),
+      );
+      yield* runner.start(input("r1", [userMessage("u1", "hi")]), { context: { userId: "u1" } });
+      const log = yield* EventLog.EventLog;
+      const events = (yield* Stream.runCollect(log.subscribe("r1"))).map((stored) => stored.event);
+      yield* Effect.promise(() => verify(events));
+      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory, EventLog.layerMemory))),
+  );
+
+  it.effect("gives a workflow run the context from its payload, once per run id", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, byTool } = recordingAgent();
+      const { workflow, layer } = Runner.workflow(agent);
+      const payload = { input: input("r1", [userMessage("u1", "hi")]), context: { userId: "u1" } };
+      yield* Effect.gen(function* () {
+        yield* workflow.execute(payload, { discard: true });
+        const log = yield* EventLog.EventLog;
+        const events = (yield* Stream.runCollect(log.subscribe("r1"))).map((stored) => stored.event);
+        yield* Effect.promise(() => verify(events));
+        // Executing the same run id again joins the finished execution.
+        yield* workflow.execute(payload);
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                scriptedModel(whoAmITurn()).layer,
+                handlers,
+                counterIds(),
+                Thread.layerMemory,
+                EventLog.layerMemory,
+                WorkflowEngine.layerMemory,
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
+    }),
+  );
+
+  it.effect("never stores the system prompt in the thread", () =>
+    Effect.gen(function* () {
+      yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+      const stored = yield* loadThread;
+      expect(stored.map((entry) => entry.message.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    }).pipe(
+      Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]),
+    ),
   );
 });

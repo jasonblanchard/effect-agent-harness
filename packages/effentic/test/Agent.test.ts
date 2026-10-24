@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Schema, Stream } from "effect";
+import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -31,7 +32,7 @@ const runCore = (
     const weather = countingWeatherLayer();
     const agent =
       options?.maxSteps === undefined ? weatherAgent : Agent.define({ toolkit: WeatherToolkit, ...options });
-    const events = yield* Agent.run(agent)({ runId: "r1", prompt: options?.prompt ?? userPrompt }).pipe(
+    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: options?.prompt ?? userPrompt }).pipe(
       Stream.runCollect,
       Effect.provide([model.layer, weather.layer, evalLayers]),
     );
@@ -66,7 +67,7 @@ describe("Agent.define", () => {
       const runWith = (checkpoint: Layer.Layer<Checkpoint.Checkpoint>) =>
         Effect.gen(function* () {
           const model = scriptedModel(script());
-          yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+          yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, checkpoint, counterIds()]),
           );
@@ -110,7 +111,7 @@ describe("Agent.run", () => {
       const model = scriptedModel([
         Stream.fromIterable(text("0", "first").slice(0, 2)).pipe(Stream.concat(Stream.never)),
       ]);
-      const events = yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+      const events = yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
         Stream.take(3),
         Stream.runCollect,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
@@ -156,7 +157,7 @@ describe("Agent.run", () => {
       const handlers = WeatherToolkit.toLayer({
         "get-weather": () => Effect.sync(() => (log.push("handler"), { temperature: 18 })),
       });
-      const events = yield* Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt }).pipe(
+      const events = yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
         Stream.runCollect,
         Effect.provide([model.layer, handlers, evalLayers]),
       );
@@ -274,7 +275,7 @@ describe("Agent.run approvals", () => {
     Effect.gen(function* () {
       const model = scriptedModel(steps);
       const handlers = countingApprovalLayer();
-      const events = yield* Agent.run(approvalAgent)({ runId: "r1", prompt }).pipe(
+      const events = yield* Agent.run(approvalAgent)({ runId: "r1", threadId: "t1", prompt }).pipe(
         Stream.runCollect,
         Effect.provide([model.layer, handlers.layer, evalLayers]),
       );
@@ -317,7 +318,11 @@ describe("Agent.run approvals", () => {
       const toolkit = Toolkit.make(Risky);
       let ran = 0;
       const model = scriptedModel([[...toolCall("c1", "risky", {}), finish("tool-calls")], [finish("stop")]]);
-      const events = yield* Agent.run(Agent.define({ toolkit }))({ runId: "r1", prompt: userPrompt }).pipe(
+      const events = yield* Agent.run(Agent.define({ toolkit }))({
+        runId: "r1",
+        threadId: "t1",
+        prompt: userPrompt,
+      }).pipe(
         Stream.runCollect,
         Effect.provide([model.layer, toolkit.toLayer({ risky: () => Effect.sync(() => (ran++, true)) }), evalLayers]),
       );
@@ -386,6 +391,7 @@ describe("Agent.run approvals", () => {
       const model = scriptedModel([[...text("0", "Sent."), finish("stop")]]);
       const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, maxSteps: 1 }))({
         runId: "r1",
+        threadId: "t1",
         prompt: answered(true),
       }).pipe(Stream.runCollect, Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]));
       expect(Array.from(events).at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
@@ -405,7 +411,7 @@ describe("Agent.run replay", () => {
       const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Agent.run(weatherAgent)({ runId: "r1", prompt: userPrompt });
+          const events = Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt });
           const collected = yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runCollect,
             Effect.provide([model.layer, weather.layer]),
@@ -434,6 +440,274 @@ describe("Agent.run replay", () => {
       expect(replayed.map((e) => ({ ...e, replayed: false }))).toEqual(original);
       expect(second.events.filter((e) => e._tag === "ModelPart" && e.step === 1)).toEqual([]);
       expect(second.events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+      ),
+    ),
+  );
+});
+
+// -----------------------------------------------------------------------------
+// Run info and the system prompt
+// -----------------------------------------------------------------------------
+
+class UserDirectory extends Context.Service<UserDirectory, { readonly name: Effect.Effect<string> }>()(
+  "test/UserDirectory",
+) {}
+
+/** A directory answering `name`, counting lookups in `lookups`. */
+const directory = (name: string) => {
+  const lookups = { count: 0 };
+  const layer = Layer.succeed(UserDirectory)({ name: Effect.sync(() => (lookups.count++, name)) });
+  return { layer, lookups };
+};
+
+const greeting = Effect.gen(function* () {
+  const name = yield* (yield* UserDirectory).name;
+  return `You are helping ${name}.`;
+});
+
+const WhoAmI = Tool.make("who-am-i", {
+  parameters: Schema.Struct({}),
+  success: Schema.Boolean,
+  dependencies: [Agent.CurrentRun],
+});
+const ConfirmedWhoAmI = Tool.make("confirmed-who-am-i", {
+  parameters: Schema.Struct({}),
+  success: Schema.Boolean,
+  needsApproval: true,
+  dependencies: [Agent.CurrentRun],
+});
+const RunInfoToolkit = Toolkit.make(WhoAmI, ConfirmedWhoAmI);
+
+/** Handlers recording the run info each call sees. */
+const runInfoLayer = () => {
+  const seen: Array<Agent.RunInfo> = [];
+  const record = () =>
+    Effect.gen(function* () {
+      seen.push(yield* Agent.CurrentRun);
+      return true;
+    });
+  return { layer: RunInfoToolkit.toLayer({ "who-am-i": record, "confirmed-who-am-i": record }), seen };
+};
+
+const systemOf = (prompt: Prompt.Prompt) => {
+  const first = prompt.content[0];
+  return first?.role === "system" ? first.content : undefined;
+};
+
+describe("Agent.CurrentRun", () => {
+  it.effect("gives tool handlers the run info, with nothing extra to provide", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...toolCall("c1", "who-am-i", {}), finish("tool-calls")], [finish("stop")]]);
+      const handlers = runInfoLayer();
+      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }))({
+        runId: "r1",
+        threadId: "t1",
+        props: { locale: "fr" },
+        context: { userId: "u1" },
+        prompt: userPrompt,
+      }).pipe(Stream.runDrain, Effect.provide([model.layer, handlers.layer, evalLayers]));
+      expect(handlers.seen).toEqual([
+        { runId: "r1", threadId: "t1", props: { locale: "fr" }, context: { userId: "u1" } },
+      ]);
+    }),
+  );
+
+  it.effect("gives a call approved in step 0 the run info", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Done."), finish("stop")]]);
+      const handlers = runInfoLayer();
+      const prompt = Prompt.make([
+        { role: "user", content: "Who am I?" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool-call", id: "c1", name: "confirmed-who-am-i", params: {} },
+            { type: "tool-approval-request", approvalId: "a1", toolCallId: "c1" },
+          ],
+        },
+        { role: "tool", content: [{ type: "tool-approval-response", approvalId: "a1", approved: true }] },
+      ]);
+      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }))({
+        runId: "r1",
+        threadId: "t1",
+        context: { userId: "u1" },
+        prompt,
+      }).pipe(Stream.runDrain, Effect.provide([model.layer, handlers.layer, evalLayers]));
+      expect(handlers.seen).toEqual([{ runId: "r1", threadId: "t1", context: { userId: "u1" } }]);
+    }),
+  );
+});
+
+describe("Agent system prompt", () => {
+  it("adds what the system effect needs to the requirements, except CurrentRun", () => {
+    type RequirementsOf<A> = A extends Agent.Agent<infer Tools, infer R> ? Agent.Requirements<Tools, R> : never;
+    const fixed = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." });
+    const computed = Agent.define({
+      toolkit: WeatherToolkit,
+      system: Effect.gen(function* () {
+        const run = yield* Agent.CurrentRun;
+        return `${yield* greeting} Run ${run.runId}.`;
+      }),
+    });
+    expectTypeOf<RequirementsOf<typeof fixed>>().toEqualTypeOf<RequirementsOf<typeof weatherAgent>>();
+    expectTypeOf<RequirementsOf<typeof computed>>().toEqualTypeOf<
+      RequirementsOf<typeof weatherAgent> | UserDirectory
+    >();
+  });
+
+  it.effect("starts every model call with a fixed system prompt", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([
+        [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...text("0", "18°C"), finish("stop")],
+      ]);
+      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }))({
+        runId: "r1",
+        threadId: "t1",
+        prompt: userPrompt,
+      }).pipe(Stream.runDrain, Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
+      expect(model.prompts.map(systemOf)).toEqual(["Be helpful.", "Be helpful."]);
+      expect(model.prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
+    }),
+  );
+
+  it.effect("sends the prompt unchanged when the agent has no system prompt", () =>
+    Effect.gen(function* () {
+      const { prompts } = yield* runCore([[...text("0", "Hi"), finish("stop")]]);
+      expect(prompts[0]!.content.map((m) => m.role)).toEqual(["user"]);
+    }),
+  );
+
+  it.effect("resolves the same definition differently under different services, once per run", () =>
+    Effect.gen(function* () {
+      const agent = Agent.define({ toolkit: WeatherToolkit, system: greeting });
+      const runAs = (name: string) =>
+        Effect.gen(function* () {
+          const users = directory(name);
+          const model = scriptedModel([
+            [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+            [...text("0", "18°C"), finish("stop")],
+          ]);
+          yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+            Stream.runDrain,
+            Effect.provide([model.layer, countingWeatherLayer().layer, users.layer, evalLayers]),
+          );
+          return { systems: model.prompts.map(systemOf), lookups: users.lookups.count };
+        });
+      expect(yield* runAs("Ada")).toEqual({ systems: ["You are helping Ada.", "You are helping Ada."], lookups: 1 });
+      expect(yield* runAs("Grace")).toEqual({
+        systems: ["You are helping Grace.", "You are helping Grace."],
+        lookups: 1,
+      });
+    }),
+  );
+
+  it.effect("lets the system effect read the run's props", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Bonjour"), finish("stop")]]);
+      const agent = Agent.define({
+        toolkit: WeatherToolkit,
+        system: Effect.gen(function* () {
+          const run = yield* Agent.CurrentRun;
+          // Props come from the client: pick between known prompts, never interpolate them.
+          return Schema.is(Schema.Struct({ locale: Schema.Literals(["fr"]) }))(run.props)
+            ? "Réponds en français."
+            : "Reply in English.";
+        }),
+      });
+      yield* Agent.run(agent)({ runId: "r1", threadId: "t1", props: { locale: "fr" }, prompt: userPrompt }).pipe(
+        Stream.runDrain,
+        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
+      );
+      expect(systemOf(model.prompts[0]!)).toBe("Réponds en français.");
+    }),
+  );
+
+  it.effect("puts the agent's system prompt before a summary at the start of the prompt", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Hi"), finish("stop")]]);
+      const prompt = Prompt.make([
+        { role: "system", content: "Summary: they asked about Paris." },
+        { role: "user", content: "And now?" },
+      ]);
+      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }))({
+        runId: "r1",
+        threadId: "t1",
+        prompt,
+      }).pipe(Stream.runDrain, Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
+      expect(model.prompts[0]!.content.map((m) => (m.role === "system" ? m.content : m.role))).toEqual([
+        "Be helpful.",
+        "Summary: they asked about Paris.",
+        "user",
+      ]);
+    }),
+  );
+
+  it.effect("fails the run before any tool or model call when the system effect dies", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Sent."), finish("stop")]]);
+      const handlers = countingApprovalLayer();
+      const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, system: Effect.die("directory down") }))(
+        {
+          runId: "r1",
+          threadId: "t1",
+          prompt: Prompt.make([
+            { role: "user", content: "Email Ada" },
+            {
+              role: "assistant",
+              content: [
+                { type: "tool-call", id: "c_email", name: "send-email", params: { to: "ada@example.com", body: "Hi" } },
+                { type: "tool-approval-request", approvalId: "a1", toolCallId: "c_email" },
+              ],
+            },
+            { role: "tool", content: [{ type: "tool-approval-response", approvalId: "a1", approved: true }] },
+          ]),
+        },
+      ).pipe(Stream.runCollect, Effect.provide([model.layer, handlers.layer, evalLayers]));
+      expect(tags(Array.from(events))).toEqual(["Failed"]);
+      expect(model.prompts).toEqual([]);
+      expect(handlers.emails).toEqual([]);
+    }),
+  );
+
+  it.effect("reuses the resolved system prompt when the run is executed again", () =>
+    Effect.gen(function* () {
+      class WallClock extends Context.Service<WallClock, { readonly now: Effect.Effect<string> }>()("test/WallClock") {}
+      let now = "09:00";
+      const clock = Layer.succeed(WallClock)({ now: Effect.sync(() => now) });
+      const agent = Agent.define({
+        toolkit: WeatherToolkit,
+        system: Effect.gen(function* () {
+          return `It is ${yield* (yield* WallClock).now}.`;
+        }),
+      });
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
+        Effect.gen(function* () {
+          const model = scriptedModel(steps);
+          const events = Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt });
+          yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
+            Stream.runDrain,
+            Effect.provide([model.layer, countingWeatherLayer().layer, clock]),
+          );
+          return model.prompts;
+        });
+
+      // Attempt 1 stops (as if the process crashed) while step 1 is streaming.
+      const first = yield* attempt(
+        [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))],
+        (event) => event._tag === "ModelPart" && event.step === 1,
+      );
+      now = "10:00";
+      const second = yield* attempt([
+        [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...text("0", "18°C"), finish("stop")],
+      ]);
+
+      expect(first.map(systemOf)).toEqual(["It is 09:00."]);
+      expect(second.map(systemOf)).toEqual(["It is 09:00.", "It is 09:00."]);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),

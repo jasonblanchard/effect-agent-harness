@@ -1,8 +1,9 @@
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { Config, Effect, Layer, Schema, Stream } from "effect";
+import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
+import { authenticate, currentPrincipal } from "./auth.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
 import { GetWeather, getWeather } from "./tools/weather.tool.ts";
 
@@ -11,10 +12,16 @@ const AssistantToolkit = Toolkit.make(GetWeather, SendEmail);
 
 const assistant = Agent.define({
   toolkit: AssistantToolkit,
-  system: `
-    You are a helpful AI assistant. Be friendly, conversational, and helpful.
-    Answer questions to the best of your ability and engage in natural conversation.
-  `,
+  // Resolved once per run, from the run's principal and the clock.
+  system: Effect.gen(function* () {
+    const principal = yield* currentPrincipal;
+    const today = DateTime.formatIsoDateUtc(yield* DateTime.now);
+    return `
+      You are a helpful AI assistant. Be friendly, conversational, and helpful.
+      Answer questions to the best of your ability and engage in natural conversation.
+      You are talking to ${principal.name}. Today is ${today}.
+    `;
+  }),
 });
 
 const ModelLayer = AnthropicLanguageModel.layer({
@@ -43,6 +50,12 @@ const sse = (frames: Stream.Stream<string, unknown>) =>
 const invalidInput = (error: { readonly message: string }) =>
   Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 }));
 
+const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401 }));
+
+// The routes authenticate the request and pass the principal, never the token,
+// as the run's context. A real server would also check here that the principal
+// owns `input.threadId`: the thread store does no access control.
+
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const runAgent = yield* Runner.make(assistant);
@@ -51,10 +64,11 @@ const AgentRoutes = HttpRouter.use((router) =>
     yield* router.add(
       "POST",
       "/agent",
-      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.map((input) => sse(Sse.encode(runAgent(input)))),
-        Effect.catch(invalidInput),
-      ),
+      Effect.gen(function* () {
+        const principal = yield* authenticate;
+        const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
+        return sse(Sse.encode(runAgent(input, { context: { principal } })));
+      }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
     // POST /runs starts a run that outlives the request; GET /runs/:runId/events
@@ -65,10 +79,12 @@ const AgentRoutes = HttpRouter.use((router) =>
     yield* router.add(
       "POST",
       "/runs",
-      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.flatMap((input) => Effect.as(detached.start(input), HttpServerResponse.empty({ status: 202 }))),
-        Effect.catch(invalidInput),
-      ),
+      Effect.gen(function* () {
+        const principal = yield* authenticate;
+        const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
+        yield* detached.start(input, { context: { principal } });
+        return HttpServerResponse.empty({ status: 202 });
+      }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
     yield* router.add(

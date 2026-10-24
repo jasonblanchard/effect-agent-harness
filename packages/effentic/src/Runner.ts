@@ -16,6 +16,16 @@ export interface Options {
   readonly clientSystem?: Messages.IngestOptions["clientSystem"];
 }
 
+/** Per-run options, set by whoever starts the run. */
+export interface RunOptions {
+  /**
+   * The run's {@link Agent.RunInfo} `context`: trusted data such as the
+   * verified principal (never the raw token). Nothing in the AG-UI input can
+   * set it. Must be JSON-encodable for {@link workflow}.
+   */
+  readonly context?: unknown;
+}
+
 const failed = (cause: Cause.Cause<unknown>): Agent.Event => {
   const error = Cause.squash(cause);
   return { _tag: "Failed", error, code: Agent.errorCode(error) };
@@ -52,9 +62,10 @@ const reportEnd = (
  *
  * 1. load the thread, take the client's delta and its `resume` answers, and
  *    commit them;
- * 2. project the prompt, memoised as the `prompt` checkpoint so a resumed run
- *    uses the prompt the crashed attempt used;
- * 3. run the agent, committing each step's entries as it finishes;
+ * 2. project the thread, memoised as the `prompt` checkpoint so a resumed run
+ *    uses the projection the crashed attempt used;
+ * 3. run the agent with the run's info (the input's ids and `forwardedProps`,
+ *    and the caller's context), committing each step's entries as it finishes;
  * 4. tell the store the run ended, however it ended;
  * 5. project the events onto AG-UI.
  *
@@ -64,8 +75,11 @@ const reportEnd = (
  * store, since it has not ended: running it again finishes it.
  */
 const pipeline =
-  <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>, options?: Options) =>
-  (input: AgUi.RunAgentInput): Stream.Stream<AgUi.Event, never, Agent.Requirements<Tools> | Thread.Thread> => {
+  <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) =>
+  (
+    input: AgUi.RunAgentInput,
+    runOptions?: RunOptions,
+  ): Stream.Stream<AgUi.Event, never, Agent.Requirements<Tools, R> | Thread.Thread> => {
     const { threadId, runId } = input;
     const events = Stream.unwrap(
       Effect.gen(function* () {
@@ -81,10 +95,16 @@ const pipeline =
         yield* thread.commit(threadId, runId, added);
         const prompt = yield* checkpoint.memo(
           { runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
-          Effect.sync(() => Messages.project(agent.system, [...stored, ...added])),
+          Effect.sync(() => Messages.project([...stored, ...added])),
         );
 
-        return Agent.run(agent)({ runId, prompt: prompt.value }).pipe(
+        return Agent.run(agent)({
+          runId,
+          threadId,
+          props: input.forwardedProps,
+          context: runOptions?.context,
+          prompt: prompt.value,
+        }).pipe(
           Stream.tap((event) =>
             event._tag === "StepFinished" ? thread.commit(threadId, runId, event.entries) : Effect.void,
           ),
@@ -112,7 +132,7 @@ const pipeline =
  * consumer stops reading (a client disconnects, `abortRun()`), the run is
  * cancelled, including any model request or tool call in progress.
  */
-export const run = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>, options?: Options) =>
+export const run = <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) =>
   pipeline(agent, options);
 
 /**
@@ -121,17 +141,17 @@ export const run = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<T
  * WebSocket, ...) where the stream is consumed after the surrounding effect has
  * returned.
  */
-export const make = <Tools extends Record<string, Tool.Any>>(
-  agent: Agent.Agent<Tools>,
+export const make = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent.Agent<Tools, R>,
   options?: Options,
 ): Effect.Effect<
-  (input: AgUi.RunAgentInput) => Stream.Stream<AgUi.Event>,
+  (input: AgUi.RunAgentInput, runOptions?: RunOptions) => Stream.Stream<AgUi.Event>,
   never,
-  Agent.Requirements<Tools> | Thread.Thread
+  Agent.Requirements<Tools, R> | Thread.Thread
 > =>
-  Effect.map(Effect.context<Agent.Requirements<Tools> | Thread.Thread>(), (context) => {
+  Effect.map(Effect.context<Agent.Requirements<Tools, R> | Thread.Thread>(), (context) => {
     const runWith = pipeline(agent, options);
-    return (input) => runWith(input).pipe(Stream.provideContext(context));
+    return (input, runOptions) => runWith(input, runOptions).pipe(Stream.provideContext(context));
   });
 
 /**
@@ -142,10 +162,11 @@ export const make = <Tools extends Record<string, Tool.Any>>(
  * replayed from the checkpoint store and publish nothing.
  */
 const detached =
-  <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>, options?: Options) =>
+  <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) =>
   (
     input: AgUi.RunAgentInput,
-  ): Effect.Effect<void, EventLog.EventLogError, Agent.Requirements<Tools> | Thread.Thread | EventLog.EventLog> => {
+    runOptions?: RunOptions,
+  ): Effect.Effect<void, EventLog.EventLogError, Agent.Requirements<Tools, R> | Thread.Thread | EventLog.EventLog> => {
     const runWith = pipeline(agent, options);
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
@@ -156,7 +177,7 @@ const detached =
         return;
       }
       yield* Effect.forEach(AgUi.closeOpen(history), append, { discard: true });
-      const events = history.length === 0 ? runWith(input) : Stream.drop(runWith(input), 1);
+      const events = history.length === 0 ? runWith(input, runOptions) : Stream.drop(runWith(input, runOptions), 1);
       yield* Stream.runForEach(events, append);
     });
   };
@@ -169,33 +190,34 @@ const detached =
  * scope interrupts it.
  *
  * `start` does nothing for a run whose log already ends with a terminal event.
- * Calling it again with the same input after a crash completes the run.
+ * Calling it again with the same input and context after a crash completes
+ * the run; the context is not stored, so pass the one the first call had.
  * With a durable `Checkpoint` (e.g. `Checkpoint.layerLedger`) completed steps
  * are replayed rather than executed again. Do not start the same run twice
  * concurrently: supervising runs is the caller's concern here, or use
  * {@link workflow}.
  */
-export const makeDetached = <Tools extends Record<string, Tool.Any>>(
-  agent: Agent.Agent<Tools>,
+export const makeDetached = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent.Agent<Tools, R>,
   options?: Options,
 ): Effect.Effect<
-  { readonly start: (input: AgUi.RunAgentInput) => Effect.Effect<void> },
+  { readonly start: (input: AgUi.RunAgentInput, runOptions?: RunOptions) => Effect.Effect<void> },
   never,
-  Agent.Requirements<Tools> | Thread.Thread | EventLog.EventLog | Scope.Scope
+  Agent.Requirements<Tools, R> | Thread.Thread | EventLog.EventLog | Scope.Scope
 > =>
   Effect.gen(function* () {
-    const context = yield* Effect.context<Agent.Requirements<Tools> | Thread.Thread | EventLog.EventLog>();
+    const context = yield* Effect.context<Agent.Requirements<Tools, R> | Thread.Thread | EventLog.EventLog>();
     const scope = yield* Scope.Scope;
     const log = yield* EventLog.EventLog;
     const body = detached(agent, options);
     return {
-      start: (input) =>
+      start: (input, runOptions) =>
         Effect.gen(function* () {
           const last = (yield* Effect.orDie(log.read(input.runId))).at(-1);
           if (last !== undefined && AgUi.isTerminal(last.event)) {
             return;
           }
-          yield* body(input).pipe(
+          yield* body(input, runOptions).pipe(
             Effect.tapCause((cause) =>
               Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("effentic: detached run failed", cause),
             ),
@@ -206,29 +228,42 @@ export const makeDetached = <Tools extends Record<string, Tool.Any>>(
     };
   });
 
+/** What {@link workflow} persists per run: the AG-UI input and the caller's context. */
+export const WorkflowPayload = Schema.Struct({
+  input: AgUi.RunAgentInput,
+  context: Schema.optional(Schema.Unknown),
+});
+
 /**
  * The run as an `effect/workflow` workflow, keyed by run id, with workflow
  * activities as checkpoints, so a durable engine (e.g. `ClusterWorkflowEngine`)
  * persists the run and replays it after a crash or deploy. Register `layer`
  * with the engine and start a run with
- * `workflow.execute(input, { discard: true })`; observe it through the
- * {@link EventLog.EventLog}. Executing the same run id again joins the existing
- * execution. Resuming an execution the engine has suspended is the engine's
- * concern (`workflow.resume(yield* workflow.executionId(input))`).
+ * `workflow.execute({ input, context }, { discard: true })`; observe it
+ * through the {@link EventLog.EventLog}. The payload, context included, is what
+ * the engine persists, so a resumed execution sees the original context.
+ * Executing the same run id again joins the existing execution. Resuming an
+ * execution the engine has suspended is the engine's concern
+ * (`workflow.resume(yield* workflow.executionId(payload))`).
  */
-export const workflow = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>, options?: Options) => {
+export const workflow = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent.Agent<Tools, R>,
+  options?: Options,
+) => {
   const run = Workflow.make("effentic/Run", {
-    payload: AgUi.RunAgentInput,
-    idempotencyKey: (input) => input.runId,
+    payload: WorkflowPayload,
+    idempotencyKey: (payload) => payload.input.runId,
   });
   const body = detached(agent, options);
   const layer: Layer.Layer<
     never,
     never,
-    | Exclude<Agent.Requirements<Tools>, Checkpoint.Checkpoint>
+    | Exclude<Agent.Requirements<Tools, R>, Checkpoint.Checkpoint>
     | Thread.Thread
     | EventLog.EventLog
     | WorkflowEngine.WorkflowEngine
-  > = run.toLayer((input) => body(input).pipe(Effect.orDie, Effect.provide(Checkpoint.layerWorkflow)));
+  > = run.toLayer((payload) =>
+    body(payload.input, { context: payload.context }).pipe(Effect.orDie, Effect.provide(Checkpoint.layerWorkflow)),
+  );
   return { workflow: run, layer };
 };

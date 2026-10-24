@@ -22,6 +22,7 @@ The same agent runs in a unit test with none of these (in-memory or passthrough 
 - [Defining an agent](#defining-an-agent)
 - [Running over AG-UI](#running-over-ag-ui)
 - [Threads](#threads)
+- [Authentication and run context](#authentication-and-run-context)
 - [Tool approvals](#tool-approvals)
 - [Durable runs](#durable-runs)
 - [Reconnecting to a run](#reconnecting-to-a-run)
@@ -104,12 +105,53 @@ await agent.runAgent({}, { onTextMessageContentEvent: ({ event }) => process.std
 ```ts
 const agent = Agent.define({
   toolkit: Tools, // an effect/ai Toolkit
-  system: "…", // optional system prompt
+  system: "…", // optional system prompt: text, or an effect (below)
   maxSteps: 10, // optional, a positive integer; default 10
 });
 ```
 
 `define` throws a `RangeError` if `maxSteps` is not a positive integer. The result is a plain value: it names no model provider and no store.
+
+### A system prompt computed per run
+
+`system` can be an effect. It runs once per run, before anything else, and its result is memoised (as the `system` checkpoint), so a resumed run sends the same text. It can read the run it's in through `Agent.CurrentRun`, and any services it uses become part of what the agent requires:
+
+```ts
+const agent = Agent.define({
+  toolkit: Tools,
+  system: Effect.gen(function* () {
+    const run = yield* Agent.CurrentRun; // { runId, threadId, props, context }
+    const { principal } = yield* Schema.decodeUnknownEffect(AppContext)(run.context);
+    const user = yield* (yield* UserDirectory).get(principal.userId);
+    return `You are helping ${user.displayName}. Today is ${new Date().toDateString()}.`;
+  }).pipe(Effect.orDie),
+}); // requires UserDirectory; never CurrentRun, which Agent.run provides
+```
+
+The effect's error type is `never`: handle failures inside it (fall back to a default) or let it die, which fails the run before any tool or model call.
+
+The system prompt is the first thing in every model call, so text that changes on every run defeats prefix prompt caching across a long thread. Keep the parts that change small.
+
+### Tools that need the run
+
+A tool handler can read the run too. Declare `Agent.CurrentRun` as a dependency:
+
+```ts
+const ListMyOrders = Tool.make("list-my-orders", {
+  parameters: Schema.Struct({}),
+  success: Schema.Array(Order),
+  dependencies: [Agent.CurrentRun],
+});
+
+const handler = () =>
+  Effect.gen(function* () {
+    const run = yield* Agent.CurrentRun;
+    const { principal } = yield* Schema.decodeUnknownEffect(AppContext)(run.context);
+    return yield* orders.recent(principal.userId);
+  }).pipe(Effect.orDie);
+```
+
+Services that are the same for every run (a database, an HTTP client) are better captured when the handlers' layer is built.
 
 A run is a sequence of **steps**. Each step makes one model call. If the model asks for tools, the loop runs them (after the model call has finished) and starts the next step with their results. The run ends when one of these happens:
 
@@ -128,7 +170,7 @@ Tool tips:
 
 1. Load the thread from the `Thread` store.
 2. Take the new messages from the client, plus its answers to the previous run's interrupts.
-3. Run the agent, committing each finished step to the thread.
+3. Run the agent with the run's info (below), committing each finished step to the thread.
 4. Emit AG-UI events.
 
 Pick a runner by what should happen when the client goes away:
@@ -171,6 +213,25 @@ Runner.make(agent, { clientSystem: "allow" }); // default "drop"
 
 `clientSystem` controls `system` / `developer` messages sent by the client. By default they are dropped, so only your `system` prompt instructs the model.
 
+### Run info
+
+Every run gets an `Agent.RunInfo`, which the system prompt and tools read through `Agent.CurrentRun`:
+
+| Field      | From                                            | Trust     |
+| ---------- | ----------------------------------------------- | --------- |
+| `runId`    | the AG-UI input                                 |           |
+| `threadId` | the AG-UI input                                 |           |
+| `props`    | the input's `forwardedProps`, unchanged         | untrusted |
+| `context`  | whoever starts the run, via `Runner.RunOptions` | trusted   |
+
+```ts
+runAgent(input, { context: { principal } }); // the function Runner.make returns; Runner.run(agent)(input, …) alike
+detached.start(input, { context: { principal } });
+workflow.execute({ input, context: { principal } }, { discard: true });
+```
+
+Nothing in the AG-UI input can set `context`. See [Authentication and run context](#authentication-and-run-context).
+
 ## Threads
 
 The server owns the history. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one whose id the store already has, and from it accepts only:
@@ -197,6 +258,32 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 In practice: summarise older history, and keep the tail from the last user message on.
 
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
+
+The system prompt is never stored in the thread: the agent adds it to every model call.
+
+## Authentication and run context
+
+effentic never sees the request's credentials. The route authenticates, and passes the result to the runner as `context`:
+
+```ts
+yield *
+  router.add(
+    "POST",
+    "/agent",
+    Effect.gen(function* () {
+      const principal = yield* authenticate; // verify the bearer token: signature, expiry, audience
+      const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
+      yield* threadOwners.authorize(input.threadId, principal); // see below
+      return sse(Sse.encode(runAgent(input, { context: { principal } })));
+    }).pipe(/* Unauthorized → 401, Forbidden → 403, decode errors → 400 */),
+  );
+```
+
+Three rules:
+
+- **Put the verified principal in `context`, not the raw token.** `context` is persisted by `Runner.workflow` (and may end up in logs), and a token can expire before a resumed run reaches a tool. A tool that calls another API as the user should get credentials from a service keyed by the principal.
+- **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else.
+- **Treat `props` as untrusted.** They are whatever the client sent. Use them to choose between values you know (a locale, a display mode), and don't paste them into the system prompt.
 
 ## Tool approvals
 
@@ -265,7 +352,7 @@ Every model call and every tool call in a run goes through `Checkpoint.memo`, un
 
 A step that _failed_ is stored too, so re-running a failed run fails again the same way; retry with a new `runId`. Only work that was interrupted (a crash, a deploy, a cancelled fiber) is executed again.
 
-The projected prompt is memoised as well (as `prompt`). A resumed run therefore sees the same history as the attempt that crashed, even if the thread was compacted in between.
+The projected thread is memoised as well (as `prompt`), and so is a computed system prompt (as `system`). A resumed run therefore sees the same history and the same system prompt as the attempt that crashed, even if the thread was compacted or the system prompt's services changed in between.
 
 ### Detached runs
 
@@ -275,19 +362,22 @@ The projected prompt is memoised as well (as `prompt`). A resumed run therefore 
 const Routes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     // HttpRouter.use provides the layer's Scope; runs live as long as the router.
+    // `principal` comes from authenticating the request, as in Authentication and run context.
     const runner = yield* Runner.makeDetached(agent);
     yield* router.add(
       "POST",
       "/runs",
       HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.flatMap((input) => Effect.as(runner.start(input), HttpServerResponse.empty({ status: 202 }))),
+        Effect.flatMap((input) =>
+          Effect.as(runner.start(input, { context: { principal } }), HttpServerResponse.empty({ status: 202 })),
+        ),
       ),
     );
   }),
 );
 ```
 
-Calling `start` again with the same input completes a crashed attempt:
+Calling `start` again with the same input and context completes a crashed attempt (the context isn't stored, so pass the one the first call had):
 
 - if the log already ends with `RUN_FINISHED` / `RUN_ERROR`, it does nothing;
 - otherwise it closes whatever the earlier attempt left open in the log and continues;
@@ -304,10 +394,10 @@ const { workflow, layer } = Runner.workflow(agent);
 
 // Register `layer` with your engine (WorkflowEngine.layerMemory in tests,
 // ClusterWorkflowEngine in production), then start runs:
-yield * workflow.execute(input, { discard: true });
+yield * workflow.execute({ input, context: { principal } }, { discard: true });
 ```
 
-Executing the same `runId` again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* workflow.executionId(input))`.
+The payload (`Runner.WorkflowPayload`: the input and the context) is what the engine persists, so a resumed execution sees the original context; the context must be JSON-encodable. Executing the same `runId` again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* workflow.executionId(payload))`.
 
 ## Reconnecting to a run
 
@@ -336,7 +426,7 @@ yield *
 
 ## Testing and evals
 
-The core loop doesn't depend on AG-UI or any store. `Agent.run(agent)({ runId, prompt })` takes an effect/ai `Prompt` and emits `Agent.Event`s:
+The core loop doesn't depend on AG-UI or any store. `Agent.run(agent)({ runId, threadId, props?, context?, prompt })` takes the run info and an effect/ai `Prompt` (without the system prompt, which the agent adds) and emits `Agent.Event`s:
 
 | Event               | When                                                                   |
 | ------------------- | ---------------------------------------------------------------------- |
@@ -360,11 +450,31 @@ const events =
   yield *
   Agent.run(agent)({
     runId: "eval-1",
+    threadId: "eval",
     prompt: Prompt.make([{ role: "user", content: "Weather in Paris?" }]),
   }).pipe(Stream.runCollect, Effect.provide([ModelLayer, ToolsLayer, Checkpoint.layerNone]));
 ```
 
 Provide an `IdGenerator` (from `effect/ai`) to make message ids deterministic.
+
+To check how the agent behaves for different users or settings, pass the run info as literals and provide mock services. The same definition is used, and no HTTP, token or runner is involved:
+
+```ts
+Agent.run(agent)({
+  runId: "eval-2",
+  threadId: "eval",
+  context: { principal: { userId: "u1", tenantId: "acme" } },
+  prompt,
+}).pipe(
+  Stream.runCollect,
+  Effect.provide([
+    ModelLayer,
+    ToolsLayer,
+    Layer.succeed(UserDirectory)({ get: () => Effect.succeed({ displayName: "Grace" }) }),
+    Checkpoint.layerNone,
+  ]),
+);
+```
 
 To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`. To check that a sequence is valid AG-UI in tests, run it through `@ag-ui/client`'s `verifyEvents`.
 
@@ -409,13 +519,13 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError`   |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors |
-| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`                                                    |
-| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `layerMemory`                                           |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow` |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                    |
-| `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`: the building blocks the runners use          |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                  |
+| Module       | Main exports                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                                    |
+| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowPayload`                                                      |
+| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `layerMemory`                                                                              |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |
+| `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`: the building blocks the runners use                                             |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                     |

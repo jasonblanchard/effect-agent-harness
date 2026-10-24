@@ -39,7 +39,7 @@ describe("AgUi.RunAgentInput", () => {
         state: {},
         tools: [{ name: "x", description: "y" }],
         context: [],
-        forwardedProps: {},
+        forwardedProps: { locale: "fr" },
         messages: [
           { id: "m1", role: "activity", activityType: "x", content: {} },
           {
@@ -49,8 +49,20 @@ describe("AgUi.RunAgentInput", () => {
           },
         ],
       });
-      expect(Object.keys(input).sort()).toEqual(["messages", "runId", "threadId"]);
+      expect(Object.keys(input).sort()).toEqual(["forwardedProps", "messages", "runId", "threadId"]);
+      expect(input.forwardedProps).toEqual({ locale: "fr" });
       expect(input.messages.map((m) => m.role)).toEqual(["activity", "assistant"]);
+    }),
+  );
+
+  it.effect("keeps forwarded properties of any shape unchanged", () =>
+    Effect.gen(function* () {
+      for (const forwardedProps of ["fr", [1, "two"], { user: { prefs: { locale: "fr" } } }]) {
+        const input = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], forwardedProps });
+        expect(input.forwardedProps).toEqual(forwardedProps);
+      }
+      const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
+      expect("forwardedProps" in without).toBe(false);
     }),
   );
 
@@ -106,7 +118,7 @@ const prompt = Prompt.make([{ role: "user", content: "What is the weather in Par
 const foldRun = (steps: ReadonlyArray<Step>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run(agent)({ runId: "r1", prompt }).pipe(
+    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt }).pipe(
       AgUi.fold({ threadId: "t1", runId: "r1" }),
       Stream.runCollect,
       Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),

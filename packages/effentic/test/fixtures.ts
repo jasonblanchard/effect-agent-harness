@@ -153,8 +153,8 @@ export const verify = (events: ReadonlyArray<BaseEvent>): Promise<Array<BaseEven
  * run's AG-UI events, already verified. Provide one `Thread` layer
  * around it so the runs share a thread store.
  */
-export const runAgUi = <Tools extends Record<string, Tool.Any>>(
-  agent: Agent.Agent<Tools>,
+export const runAgUi = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent.Agent<Tools, R>,
   inputs: ReadonlyArray<AgUi.RunAgentInput>,
   options?: Runner.Options,
 ) =>

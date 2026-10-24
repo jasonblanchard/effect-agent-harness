@@ -51,7 +51,7 @@ export interface RunInput extends RunInfo {
 export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effentic/Agent/CurrentRun") {}
 ```
 
-`Agent.run` provides `CurrentRun` around two things only: resolving the system prompt, and each `toolkit.handle` call (step 0 and every step). Model calls don't need it. A tool opts in:
+`Agent.run` provides `CurrentRun` around the whole run, so the system prompt effect, every `toolkit.handle` call (step 0 and every step) and `needsApproval` predicates can all read it. Providing it once, at the outside of the run, also keeps the `Exclude` from `Requirements` (decision 3) in one place. A tool opts in:
 
 ```ts
 const SendEmail = Tool.make("send-email", { parameters, success, dependencies: [Agent.CurrentRun], needsApproval: true });

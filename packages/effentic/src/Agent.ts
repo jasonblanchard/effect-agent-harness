@@ -1,4 +1,4 @@
-import { Cause, Effect, Option, Predicate, Queue, Schema, Stream } from "effect";
+import { Cause, Context, Effect, Option, Predicate, Queue, Schema, Stream } from "effect";
 import { IdGenerator, LanguageModel, Prompt } from "effect/ai";
 import type { Response, Tool, Toolkit } from "effect/ai";
 import * as Checkpoint from "./Checkpoint.ts";
@@ -11,27 +11,32 @@ import type * as Thread from "./Thread.ts";
 /**
  * An agent's behaviour: what it can do and how far it may go. It names no
  * model provider and no durability mechanism, so the same value runs in
- * production and in an eval by providing different services.
+ * production and in an eval by providing different services. `R` is what its
+ * system prompt needs.
  */
-export interface Agent<Tools extends Record<string, Tool.Any>> {
+export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
   /**
    * Server-side tools, run by the loop between model steps. Use
    * `failureMode: "return"` on tools whose failures should go back to the
    * model, and `needsApproval` on tools that must not run without the user.
    */
   readonly toolkit: Toolkit.Toolkit<Tools>;
-  /** System prompt placed before the conversation. */
-  readonly system: string | undefined;
+  /**
+   * System prompt placed before the conversation: fixed text, or an effect
+   * resolved once per run (memoised as the `system` checkpoint). The effect
+   * may read {@link CurrentRun} and the services `R`.
+   */
+  readonly system: string | Effect.Effect<string, never, R> | undefined;
   /** Maximum number of model steps per run. */
   readonly maxSteps: number;
 }
 
 /** Defines an agent. Throws a `RangeError` if `maxSteps` (default 10) is not a positive integer. */
-export const define = <Tools extends Record<string, Tool.Any>>(options: {
+export const define = <Tools extends Record<string, Tool.Any>, R = never>(options: {
   readonly toolkit: Toolkit.Toolkit<Tools>;
-  readonly system?: string | undefined;
+  readonly system?: string | Effect.Effect<string, never, R> | undefined;
   readonly maxSteps?: number | undefined;
-}): Agent<Tools> => {
+}): Agent<Tools, R> => {
   const maxSteps = options.maxSteps ?? 10;
   if (!Number.isInteger(maxSteps) || maxSteps < 1) {
     throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
@@ -43,10 +48,27 @@ export const define = <Tools extends Record<string, Tool.Any>>(options: {
 // Run
 // -----------------------------------------------------------------------------
 
-export interface RunInput {
+/** Which run is executing, as the system prompt and tool handlers see it through {@link CurrentRun}. */
+export interface RunInfo {
   readonly runId: string;
+  readonly threadId: string;
+  /** Set by the client (AG-UI `forwardedProps`), so untrusted: choose between known values, don't interpolate. */
+  readonly props?: unknown;
+  /** Set by whoever started the run, never by the client: e.g. the verified principal. Must be JSON-encodable. */
+  readonly context?: unknown;
+}
+
+export interface RunInput extends RunInfo {
+  /** The conversation, without the agent's system prompt: the run adds it. */
   readonly prompt: Prompt.Prompt;
 }
+
+/**
+ * The run in progress. `run` provides it, so a system prompt effect can read
+ * it, and so can a tool handler whose tool declares
+ * `dependencies: [Agent.CurrentRun]`. Never provide it yourself.
+ */
+export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effentic/Agent/CurrentRun") {}
 
 /**
  * What a run emits. Events derived from a checkpoint served from the store
@@ -123,13 +145,21 @@ export class ModelStreamError extends Schema.TaggedError<ModelStreamError, { rea
   }
 }
 
-export type Requirements<Tools extends Record<string, Tool.Any>> =
+/** Everything a run touches, including what `run` provides itself. */
+type RunServices<Tools extends Record<string, Tool.Any>, R> =
   | LanguageModel.LanguageModel
   | Checkpoint.Checkpoint
   | Tool.HandlersFor<Tools>
   | Tool.HandlerServices<Tools[keyof Tools]>
   | Tool.ParametersEncodingServices<Tools[keyof Tools]>
-  | Tool.ResultDecodingServices<Tools[keyof Tools]>;
+  | Tool.ResultDecodingServices<Tools[keyof Tools]>
+  | R;
+
+/** What a caller provides to run an agent whose system prompt needs `R`. */
+export type Requirements<Tools extends Record<string, Tool.Any>, R = never> = Exclude<
+  RunServices<Tools, R>,
+  CurrentRun
+>;
 
 /** What a model step stores in its checkpoint. */
 const ModelStep = Schema.Struct({
@@ -163,7 +193,9 @@ interface Decision {
 /**
  * Runs the agent on a prompt: model steps, with the tool calls of each step
  * executed after the model call, until the model stops calling tools, a tool
- * needs approval, or the step limit is reached.
+ * needs approval, or the step limit is reached. Every model call starts with
+ * the agent's system prompt, resolved once before anything else runs. The
+ * run's info is available as {@link CurrentRun} throughout.
  *
  * Every model call and every tool call is memoised through the
  * {@link Checkpoint.Checkpoint} in context, under `model:<step>` and
@@ -175,10 +207,11 @@ interface Decision {
  * nothing more is emitted.
  */
 export const run =
-  <Tools extends Record<string, Tool.Any>>(agent: Agent<Tools>) =>
-  (input: RunInput): Stream.Stream<Event, never, Requirements<Tools>> =>
-    Stream.callback<Event, never, Requirements<Tools>>((queue) => {
+  <Tools extends Record<string, Tool.Any>, R>(agent: Agent<Tools, R>) =>
+  (input: RunInput): Stream.Stream<Event, never, Requirements<Tools, R>> =>
+    Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
       const emit = (event: Event) => Queue.offer(queue, event);
+      const { prompt: _, ...info } = input;
       return Effect.gen(function* () {
         const checkpoint = yield* Checkpoint.Checkpoint;
         const toolkit = yield* agent.toolkit;
@@ -186,7 +219,7 @@ export const run =
           Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
         );
         // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
-        const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, Requirements<Tools>>) =>
+        const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
           checkpoint.memo({ runId: input.runId, name, success: ToolStep, error: Schema.Never }, Effect.orDie(body));
 
         const result = (encodedResult: unknown, isFailure: boolean) =>
@@ -255,7 +288,7 @@ export const run =
               yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
               const parts: Array<Response.AnyPart> = [];
               yield* LanguageModel.streamText({
-                prompt: stripApprovals(prompt),
+                prompt: withSystem(stripApprovals(prompt)),
                 toolkit: agent.toolkit,
                 disableToolCallResolution: true,
               }).pipe(
@@ -282,6 +315,19 @@ export const run =
               } satisfies ModelStep;
             }).pipe(Effect.orDie),
           );
+
+        // Resolved before step 0, so a system prompt that fails runs no tool.
+        const system =
+          agent.system === undefined || typeof agent.system === "string"
+            ? agent.system
+            : (yield* checkpoint.memo(
+                { runId: input.runId, name: "system", success: Schema.String, error: Schema.Never },
+                agent.system,
+              )).value;
+        const withSystem = (prompt: Prompt.Prompt) =>
+          system === undefined || system.length === 0
+            ? prompt
+            : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
 
         // Step 0: approval answers carried by the prompt are resolved before the model is called.
         let prompt = input.prompt;
@@ -384,7 +430,8 @@ export const run =
           return emit({ _tag: "Failed", error, code: errorCode(error) });
         }),
         Effect.andThen(Queue.end(queue)),
-        Effect.withSpan("effentic/Agent.run", { attributes: { runId: input.runId } }),
+        Effect.provideService(CurrentRun, info),
+        Effect.withSpan("effentic/Agent.run", { attributes: { runId: input.runId, threadId: input.threadId } }),
       );
     });
 

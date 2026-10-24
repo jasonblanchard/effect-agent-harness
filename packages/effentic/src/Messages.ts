@@ -137,9 +137,9 @@ export const resume = (
 export const INCOMPLETE_TOOL_CALL_RESULT = "Tool call did not complete";
 
 /**
- * The model prompt for a thread: the agent's system prompt, then the entries'
- * messages as given. Compaction is the store's concern; nothing is dropped or
- * summarised here.
+ * The model prompt for a thread: the entries' messages as given. The agent's
+ * system prompt is not included; `Agent.run` adds it. Compaction is the
+ * store's concern; nothing is dropped or summarised here.
  *
  * Tool results are moved next to their calls (see `Agent.orderToolResults`).
  * Providers reject a tool call that has no result, and a run that fails or is
@@ -147,7 +147,7 @@ export const INCOMPLETE_TOOL_CALL_RESULT = "Tool call did not complete";
  * answered with a failed result, so one broken run does not break the thread.
  * Calls waiting for approval are left alone: the run resolves them first.
  */
-export const project = (system: string | undefined, entries: ReadonlyArray<Thread.Entry>): Prompt.Prompt => {
+export const project = (entries: ReadonlyArray<Thread.Entry>): Prompt.Prompt => {
   const ordered = Agent.orderToolResults(Prompt.fromMessages(entries.map((entry) => entry.message)));
   const awaiting = new Set<string>();
   for (const message of ordered.content) {
@@ -161,9 +161,6 @@ export const project = (system: string | undefined, entries: ReadonlyArray<Threa
   }
 
   const messages: Array<Prompt.Message> = [];
-  if (system !== undefined && system.length > 0) {
-    messages.push(Prompt.makeMessage("system", { content: system }));
-  }
   // Calls made by the latest assistant message that have no result yet.
   const pending = new Map<string, string>();
   const flush = () => {

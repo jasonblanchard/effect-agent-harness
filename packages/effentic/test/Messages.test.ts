@@ -170,22 +170,16 @@ describe("Messages.resume", () => {
 });
 
 describe("Messages.project", () => {
-  it("places the system prompt before the entries, verbatim", () => {
+  it("keeps the entries verbatim and adds no system prompt", () => {
     const summary: Thread.Entry = { id: "s", message: Prompt.makeMessage("system", { content: "Summary: ..." }) };
-    expect(simplify(Messages.project("Be helpful.", [summary, user("u9", "next")]))).toEqual([
-      { role: "system", parts: "Be helpful." },
+    expect(simplify(Messages.project([summary, user("u9", "next")]))).toEqual([
       { role: "system", parts: "Summary: ..." },
       { role: "user", parts: [{ type: "text", text: "next" }] },
     ]);
-    expect(Messages.project("", [user("u1", "hi")]).content.map((m) => m.role)).toEqual(["user"]);
   });
 
   it("answers a stored tool call that never got a result with a failure", () => {
-    const prompt = Messages.project(undefined, [
-      user("u1", "Weather?"),
-      assistantCall("m1", "c1"),
-      user("u2", "Hello?"),
-    ]);
+    const prompt = Messages.project([user("u1", "Weather?"), assistantCall("m1", "c1"), user("u2", "Hello?")]);
     expect(simplify(prompt)).toEqual([
       { role: "user", parts: [{ type: "text", text: "Weather?" }] },
       { role: "assistant", parts: [{ type: "tool-call", id: "c1" }] },
@@ -198,12 +192,12 @@ describe("Messages.project", () => {
   });
 
   it("leaves a call awaiting approval to the run", () => {
-    const prompt = Messages.project(undefined, [user("u1", "Email Ada"), assistantCall("m1", "c1", "a1")]);
+    const prompt = Messages.project([user("u1", "Email Ada"), assistantCall("m1", "c1", "a1")]);
     expect(simplify(prompt).map((m) => m.role)).toEqual(["user", "assistant"]);
   });
 
   it("moves a result committed after later messages next to its call", () => {
-    const prompt = Messages.project(undefined, [
+    const prompt = Messages.project([
       assistantCall("m1", "c1", "a1"),
       user("u2", "Hello?"),
       ...Messages.resume([assistantCall("m1", "c1", "a1")], []),

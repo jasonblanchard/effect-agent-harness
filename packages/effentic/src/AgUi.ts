@@ -65,6 +65,8 @@ export const RunAgentInput = Schema.Struct({
   runId: Schema.String,
   messages: Schema.Array(Message),
   resume: Schema.optional(Schema.Array(ResumeEntry)),
+  /** Passed through unchecked as the run's `props`. Set by the client, so untrusted. */
+  forwardedProps: Schema.optional(Schema.Unknown),
 });
 export type RunAgentInput = typeof RunAgentInput.Type;
 
