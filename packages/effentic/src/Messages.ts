@@ -83,17 +83,31 @@ const ApprovalPayload = Schema.Struct({
 const decodeApprovalPayload = Schema.decodeUnknownOption(ApprovalPayload);
 
 /**
+ * The run leaves open an interrupt of the previous run. AG-UI does not let a
+ * producer read an omitted answer as a decision, so the run is rejected
+ * instead; to give up on an interrupt, the client answers it `cancelled`.
+ */
+export class UnansweredInterrupt extends Schema.TaggedError<UnansweredInterrupt, { readonly brand: unique symbol }>()(
+  "UnansweredInterrupt",
+  { interruptIds: Schema.Array(Schema.String) },
+) {
+  override get message(): string {
+    return `The run does not answer the open interrupts: ${this.interruptIds.join(", ")}`;
+  }
+}
+
+/**
  * Approval responses for every approval request in `stored` that has none
- * yet. A request answered by a resume entry is approved only when the entry is
- * `resolved` with `payload.approved === true`; otherwise it is denied with
- * `payload.reason`, or "cancelled" / "denied". A request with no resume entry
- * is denied as "not answered", so an ignored interrupt does not block the
- * thread. Resume entries that match no pending request are ignored.
+ * yet. A request is approved only when its resume entry is `resolved` with
+ * `payload.approved === true`; otherwise it is denied with `payload.reason`,
+ * or "cancelled" / "denied". If any pending request has no resume entry, the
+ * result is `UnansweredInterrupt` naming each of them. Resume entries that
+ * match no pending request are ignored.
  */
 export const resume = (
   stored: ReadonlyArray<Thread.Entry>,
   entries: ReadonlyArray<AgUi.ResumeEntry>,
-): ReadonlyArray<Thread.Entry> => {
+): Result.Result<ReadonlyArray<Thread.Entry>, UnansweredInterrupt> => {
   const requested: Array<string> = [];
   const responded = new Set<string>();
   for (const { message } of stored) {
@@ -112,16 +126,17 @@ export const resume = (
     }
   }
   const answers = new Map(entries.map((entry) => [entry.interruptId, entry]));
-  return requested
-    .filter((approvalId) => !responded.has(approvalId))
-    .map((approvalId) => {
-      const answer = answers.get(approvalId);
-      const payload = Option.getOrUndefined(decodeApprovalPayload(answer?.payload));
-      const approved = answer?.status === "resolved" && payload?.approved === true;
-      const reason =
-        answer === undefined
-          ? "not answered"
-          : (payload?.reason ?? (answer.status === "cancelled" ? "cancelled" : "denied"));
+  const pending = requested.filter((approvalId) => !responded.has(approvalId));
+  const unanswered = pending.filter((approvalId) => !answers.has(approvalId));
+  if (unanswered.length > 0) {
+    return Result.fail(new UnansweredInterrupt({ interruptIds: unanswered }));
+  }
+  return Result.succeed(
+    pending.map((approvalId) => {
+      const answer = answers.get(approvalId)!;
+      const payload = Option.getOrUndefined(decodeApprovalPayload(answer.payload));
+      const approved = answer.status === "resolved" && payload?.approved === true;
+      const reason = payload?.reason ?? (answer.status === "cancelled" ? "cancelled" : "denied");
       return {
         id: `${approvalId}:response`,
         message: Prompt.makeMessage("tool", {
@@ -130,7 +145,8 @@ export const resume = (
           ],
         }),
       };
-    });
+    }),
+  );
 };
 
 /** Result sent to the model for a tool call the history never answered. */

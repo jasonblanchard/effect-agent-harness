@@ -90,7 +90,7 @@ const reportEnd = (
  * id the client reuses on another thread replays nothing.
  *
  * Failures, including those before the model is called (`ThreadError`,
- * `HistoryMismatch`, `RunInputMismatch`), end the stream with `RUN_ERROR`, so it never fails.
+ * `HistoryMismatch`, `UnansweredInterrupt`, `RunInputMismatch`), end the stream with `RUN_ERROR`, so it never fails.
  * Only an interrupted run (e.g. a cancelled request) is not reported to the
  * store, since it has not ended: running it again finishes it.
  */
@@ -115,11 +115,9 @@ const pipeline =
         }
         const stored = yield* thread.load(threadId);
         const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
+        const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
         // Answers to the previous run come before anything new the client says.
-        const added = [
-          ...Messages.resume(stored, input.resume ?? []),
-          ...Messages.ingest(delta, { clientSystem: options?.clientSystem }),
-        ];
+        const added = [...responses, ...Messages.ingest(delta, { clientSystem: options?.clientSystem })];
         yield* thread.commit(threadId, runId, added);
         const prompt = yield* checkpoint.memo(
           { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },

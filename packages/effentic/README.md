@@ -327,7 +327,7 @@ The answered call is executed (or denied) before the model is called again, and 
 
 - **Approved** only when `status` is `"resolved"` and `payload.approved === true`. Anything else is a denial. `payload.reason` is passed to the model as the reason.
 - `status: "cancelled"` is denied with reason `"cancelled"`.
-- A pending approval the next run does not answer is denied with reason `"not answered"`, so the thread never gets stuck.
+- **Every open interrupt must be answered.** A run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredInterrupt`, and nothing it sent is committed. AG-UI 1.0 forbids treating a missing answer as a decision, and `HttpAgent` already refuses to send such a run. To move on without approving, for example when the user types a new message instead, answer each open interrupt with `status: "cancelled"` in the same run as the new message.
 - Resume entries for unknown interrupt ids are ignored.
 
 A denied call gets the failed result `{ "type": "execution-denied", "reason": "…" }`.
@@ -533,5 +533,5 @@ Everything is exported from `"effentic"` as namespaces.
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `layerMemory`                                                                              |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |
-| `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`: the building blocks the runners use                                             |
+| `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use                      |
 | `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                     |

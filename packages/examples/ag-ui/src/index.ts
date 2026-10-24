@@ -71,8 +71,15 @@ async function chatLoop() {
       content: input.trim(),
     });
 
+    // Interrupts can still be open if answering them failed. A run must answer
+    // every open interrupt, so typing something new gives up on them.
+    const cancelled = agent.pendingInterrupts.map((interrupt) => ({
+      interruptId: interrupt.id,
+      status: "cancelled" as const,
+    }));
+
     try {
-      await run();
+      await run(cancelled.length === 0 ? {} : { resume: cancelled });
     } catch (error) {
       console.error("❌ Error:", error);
     }

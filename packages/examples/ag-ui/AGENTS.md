@@ -9,7 +9,7 @@ A runnable example: a terminal chat client (`src/index.ts`) using `@ag-ui/client
   - `GET /threads/:threadId/runs/:runId/events`: follows a run from the event log as SSE with cursors as SSE ids, resuming after the request's `Last-Event-ID`.
 - `src/auth.ts`: the placeholder `authenticate` (accepts only `Authorization: Bearer demo-token`), the `AppContext` schema, and `currentPrincipal`, which reads the principal back from `Agent.CurrentRun`. A real server verifies a real token and also checks that the principal owns the thread.
 - `src/agent.ts`: an `HttpAgent` that sends the demo token and whose `fetch` calls that handler directly. No network server runs, and the `effentic.local` host is never resolved.
-- `src/index.ts`: the chat loop. When a run ends with an interrupt, it asks `(y/n)` for each pending approval and runs again with `resume`.
+- `src/index.ts`: the chat loop. When a run ends with an interrupt, it asks `(y/n)` for each pending approval and runs again with `resume`. A new message sent while interrupts are still open (because answering them failed) cancels them in the same run, since the server rejects a run that leaves one unanswered.
 - `src/tools/weather.tool.ts`: an example tool (Open-Meteo) with `failureMode: "return"`.
 - `src/tools/email.tool.ts`: a `send-email` tool with `needsApproval: true` and `dependencies: [Agent.CurrentRun]`. It only prints, naming the run's principal as the sender; nothing is sent.
 

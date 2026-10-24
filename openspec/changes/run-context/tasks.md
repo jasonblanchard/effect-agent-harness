@@ -70,3 +70,12 @@ Conventions for every task: run from the repo root; `pnpm --filter effentic test
   - run id "r1" reused on "t1" with an added message ends `RUN_STARTED`, `RUN_ERROR` (`RunInputMismatch`), calls no model and commits nothing new;
   - the prompt-memo test (same input re-executed) still passes.
 - [x] 6.5 Docs and example: the README's authentication rules say the thread check covers its runs, and the checkpoint, workflow, event-log and custom-store sections show the new keys; `packages/effentic/AGENTS.md` gets the invariant; the example's events route becomes `GET /threads/:threadId/runs/:runId/events` and authenticates.
+
+## 7. Unanswered interrupts
+
+- [x] 7.1 Add `Messages.UnansweredInterrupt` (TaggedError with brand, `interruptIds`) and make `resume` return `Result<entries, UnansweredInterrupt>`, failing when any pending approval has no resume entry (10). Verify in `Messages.test.ts`: no entries fails naming "a1"; answering one of two fails naming the other; only an unknown id fails naming both; `cancelled` still gives a "cancelled" denial; an already answered request needs no entry.
+- [x] 7.2 Fail the pipeline with the error before committing (10). Verify in `Runner.test.ts`:
+  - a run with a new message and no `resume` after an interrupt ends `RUN_STARTED`, `RUN_ERROR` (`UnansweredInterrupt`), leaves the thread unchanged and calls no model; a later run approving the interrupt sends the email once and finishes `success`;
+  - `cancelled` with a new user message gives the model the call, its "cancelled" result, then the message;
+  - an unknown interrupt id next to a real answer is ignored.
+- [x] 7.3 Docs and example: the README approval rules (with the AG-UI rule and the `cancelled` pattern) and module reference, both `AGENTS.md` files, and `src/index.ts` cancels interrupts still open when the user sends a new message.

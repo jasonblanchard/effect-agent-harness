@@ -141,6 +141,16 @@ Within a thread, a reused run id is still the owner's own data, but replaying it
 - *Alternative rejected:* documenting that callers must validate `runId`. A caller can only do that with its own persistent `runId → owner` table, and minting run ids on the server conflicts with AG-UI, where the client sends them.
 - *Alternative rejected:* binding `runId → (threadId, principal)` on first use. It needs a new store, and the library would have to know about principals.
 
+### 10. An unanswered interrupt rejects the run
+
+This replaces `durable-agent-planes` design §6's rule that a pending approval with no resume entry is denied as "not answered" "so one lost answer does not block the thread for ever". AG-UI 1.0 (Interrupts and Resume) says a producer "MUST NOT … treat the omission as abandonment", and that a run "MUST NOT end as success while an interrupt the producer knows to be open stands unanswered". The old rule did both: a client that lost an answer, or a user who typed instead of answering, had the tool refused on their behalf, and the model was told the user said no.
+
+`Messages.resume` now returns `Result<entries, UnansweredInterrupt>`, and the error names every pending approval that has no resume entry. The pipeline checks it next to `HistoryMismatch`, before committing, so a rejected run leaves the thread unchanged and the approvals open. It ends `RUN_STARTED`, `RUN_ERROR` (`UnansweredInterrupt`), and `runEnded` is reported as `Failed`, like other failures before the model is called.
+
+The thread still can't get stuck: `status: "cancelled"` is the explicit way to give up, and it is still recorded as a denial. `HttpAgent` already refuses to send a run that leaves a pending interrupt unaddressed, so a well-behaved client never sees the error. The example cancels the interrupts still open when the user types a new message, which happens only if answering them failed.
+
+- *Alternative rejected:* resolve the answered approvals and end `Interrupted` again with the rest. AG-UI allows it, but it raises questions the rejection avoids: whether a new user message in the same run is committed after a call with no result, how to emit the still-open interrupts again with their original ids, and how a partial step 0 counts against the step limit. A missing answer is a client defect, and the clearest response to it is a specific error.
+
 ## Risks / Trade-offs
 
 - [A system prompt that changes every run defeats prefix prompt caching on long threads, because it is the first thing in the prompt] → Document it, recommend keeping changing values small and few, and leave the stable/changing split as the follow-up named in the proposal.

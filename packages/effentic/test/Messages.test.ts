@@ -126,6 +126,10 @@ describe("Messages.ingest", () => {
 describe("Messages.resume", () => {
   const stored = [user("u1", "Email Ada"), assistantCall("m1", "c1", "a1")];
 
+  /** The responses for an input that answers every pending request. */
+  const answer = (entries: ReadonlyArray<Thread.Entry>, resume: ReadonlyArray<AgUi.ResumeEntry>) =>
+    Result.getOrThrow(Messages.resume(entries, resume));
+
   const response = (entries: ReadonlyArray<Thread.Entry>) =>
     entries.map((entry) => {
       const part = (entry.message as Prompt.ToolMessage).content[0] as Prompt.ToolApprovalResponsePart;
@@ -133,39 +137,43 @@ describe("Messages.resume", () => {
     });
 
   it("approves only a resolved entry with payload.approved === true", () => {
-    expect(
-      response(Messages.resume(stored, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }])),
-    ).toEqual([{ id: "a1:response", approvalId: "a1", approved: true, reason: undefined }]);
-    expect(response(Messages.resume(stored, [{ interruptId: "a1", status: "resolved" }]))).toEqual([
+    expect(response(answer(stored, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }]))).toEqual([
+      { id: "a1:response", approvalId: "a1", approved: true, reason: undefined },
+    ]);
+    expect(response(answer(stored, [{ interruptId: "a1", status: "resolved" }]))).toEqual([
       { id: "a1:response", approvalId: "a1", approved: false, reason: "denied" },
     ]);
+    expect(response(answer(stored, [{ interruptId: "a1", status: "resolved", payload: { approved: "yes" } }]))).toEqual(
+      [{ id: "a1:response", approvalId: "a1", approved: false, reason: "denied" }],
+    );
     expect(
-      response(Messages.resume(stored, [{ interruptId: "a1", status: "resolved", payload: { approved: "yes" } }])),
-    ).toEqual([{ id: "a1:response", approvalId: "a1", approved: false, reason: "denied" }]);
-    expect(
-      response(
-        Messages.resume(stored, [
-          { interruptId: "a1", status: "resolved", payload: { approved: false, reason: "no" } },
-        ]),
-      ),
+      response(answer(stored, [{ interruptId: "a1", status: "resolved", payload: { approved: false, reason: "no" } }])),
     ).toEqual([{ id: "a1:response", approvalId: "a1", approved: false, reason: "no" }]);
   });
 
-  it("denies a cancelled entry and an unanswered request", () => {
-    expect(response(Messages.resume(stored, [{ interruptId: "a1", status: "cancelled" }]))).toEqual([
+  it("denies a cancelled entry", () => {
+    expect(response(answer(stored, [{ interruptId: "a1", status: "cancelled" }]))).toEqual([
       { id: "a1:response", approvalId: "a1", approved: false, reason: "cancelled" },
-    ]);
-    expect(response(Messages.resume(stored, []))).toEqual([
-      { id: "a1:response", approvalId: "a1", approved: false, reason: "not answered" },
     ]);
   });
 
-  it("ignores unknown interrupt ids and already answered requests", () => {
-    expect(response(Messages.resume([user("u1", "hi")], [{ interruptId: "zz", status: "resolved" }]))).toEqual([]);
-    const answered = [...stored, ...Messages.resume(stored, [])];
-    expect(Messages.resume(answered, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }])).toEqual(
-      [],
+  it("rejects input that leaves a pending request unanswered, naming every open one", () => {
+    const two = [...stored, assistantCall("m2", "c2", "a2")];
+    expect(Messages.resume(stored, [])).toEqual(
+      Result.fail(new Messages.UnansweredInterrupt({ interruptIds: ["a1"] })),
     );
+    const partial = Messages.resume(two, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }]);
+    expect(partial).toEqual(Result.fail(new Messages.UnansweredInterrupt({ interruptIds: ["a2"] })));
+    expect(Messages.resume(two, [{ interruptId: "zz", status: "resolved", payload: { approved: true } }])).toEqual(
+      Result.fail(new Messages.UnansweredInterrupt({ interruptIds: ["a1", "a2"] })),
+    );
+  });
+
+  it("ignores unknown interrupt ids and already answered requests", () => {
+    expect(response(answer([user("u1", "hi")], [{ interruptId: "zz", status: "resolved" }]))).toEqual([]);
+    const answered = [...stored, ...answer(stored, [{ interruptId: "a1", status: "cancelled" }])];
+    expect(answer(answered, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }])).toEqual([]);
+    expect(answer(answered, [])).toEqual([]);
   });
 });
 
@@ -200,8 +208,10 @@ describe("Messages.project", () => {
     const prompt = Messages.project([
       assistantCall("m1", "c1", "a1"),
       user("u2", "Hello?"),
-      ...Messages.resume([assistantCall("m1", "c1", "a1")], []),
-      toolResult("t1", "c1", { type: "execution-denied", reason: "not answered" }),
+      ...Result.getOrThrow(
+        Messages.resume([assistantCall("m1", "c1", "a1")], [{ interruptId: "a1", status: "cancelled" }]),
+      ),
+      toolResult("t1", "c1", { type: "execution-denied", reason: "cancelled" }),
     ]);
     expect(simplify(prompt)).toEqual([
       { role: "assistant", parts: [{ type: "tool-call", id: "c1" }, { type: "tool-approval-request" }] },
@@ -212,7 +222,7 @@ describe("Messages.project", () => {
           {
             type: "tool-result",
             id: "c1",
-            result: { type: "execution-denied", reason: "not answered" },
+            result: { type: "execution-denied", reason: "cancelled" },
             isFailure: false,
           },
         ],

@@ -389,21 +389,53 @@ describe("Runner.run approvals", () => {
     }),
   );
 
-  it.effect("denies an interrupt the next run does not answer, and keeps the call next to its result", () =>
+  it.effect("denies an interrupt cancelled alongside a new message, and keeps the call next to its result", () =>
     Effect.gen(function* () {
-      const { emails, result, prompts } = yield* roundTrip(() => undefined, [userMessage("u2", "Never mind.")]);
+      const { emails, result, prompts } = yield* roundTrip(
+        (id) => [{ interruptId: id, status: "cancelled" }],
+        [userMessage("u2", "Never mind.")],
+      );
       expect(emails).toEqual([]);
-      expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"not answered"}' });
+      expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"cancelled"}' });
       expect(prompts[1]!.content.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
+    }),
+  );
+
+  it.effect("rejects a run that leaves an interrupt open, and accepts the answer in a later run", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([emailStep, [...text("0", "Done."), finish("stop")]]);
+      const handlers = countingApprovalLayer();
+      yield* Effect.gen(function* () {
+        const [first] = yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Email Ada")])]);
+        const before = yield* loadThread;
+        const outcome = (first!.at(-1) as { outcome: { interrupts: ReadonlyArray<{ id: string }> } }).outcome;
+
+        const [rejected] = yield* runAgUi(approvalAgent, [
+          input("r2", [...clientAfterEmailTurn, userMessage("u2", "Never mind.")]),
+        ]);
+        expect(types(rejected!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(rejected![1]).toMatchObject({ code: "UnansweredInterrupt" });
+        expect(yield* loadThread).toEqual(before);
+
+        const [answered] = yield* runAgUi(approvalAgent, [
+          input("r3", clientAfterEmailTurn, [
+            { interruptId: outcome.interrupts[0]!.id, status: "resolved", payload: { approved: true } },
+          ]),
+        ]);
+        expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
+      expect(model.prompts).toHaveLength(2);
+      expect(handlers.emails).toEqual(["ada@example.com"]);
     }),
   );
 
   it.effect("ignores a resume entry for an unknown interrupt", () =>
     Effect.gen(function* () {
-      const { second, result } = yield* roundTrip(() => [
+      const { second, result } = yield* roundTrip((id) => [
         { interruptId: "unknown", status: "resolved", payload: { approved: true } },
+        { interruptId: id, status: "cancelled" },
       ]);
-      expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"not answered"}' });
+      expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"cancelled"}' });
       expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
     }),
   );

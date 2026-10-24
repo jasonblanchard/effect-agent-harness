@@ -1,6 +1,34 @@
 # Spec Delta
 
+## RENAMED Requirements
+
+- FROM: `### Requirement: Unanswered approvals are denied`
+- TO: `### Requirement: Every open approval must be answered`
+
 ## MODIFIED Requirements
+
+### Requirement: Every open approval must be answered
+A run on a thread with pending approval requests SHALL carry a resume entry for each of them. If any pending request has no resume entry, the run SHALL end with `RUN_ERROR` code `UnansweredInterrupt` without committing anything it sent, calling the model or running a tool, so the thread is unchanged and the requests stay open. A missing answer SHALL NOT be treated as a denial: AG-UI 1.0 forbids a producer to read an omission as abandonment. A client gives up on a request by answering it `cancelled`. Resume entries that match no pending request SHALL be ignored.
+
+#### Scenario: Client ignores the interrupt
+- **WHEN** a run follows an interrupted run with no `resume` entries
+- **THEN** the events are `RUN_STARTED` then `RUN_ERROR` with code `UnansweredInterrupt`, the email handler does not run, the model is not called and the thread is unchanged
+
+#### Scenario: Interrupt ignored with a new user message
+- **WHEN** a run follows an interrupted run with no `resume` entries and its delta holds a new user message
+- **THEN** the run is rejected the same way and the new user message is not committed
+
+#### Scenario: Answered after a rejected run
+- **WHEN** that rejected run is followed by a run that approves the pending email approval
+- **THEN** the email handler runs once and the run finishes with outcome `success`
+
+#### Scenario: Cancelled with a new user message
+- **WHEN** a run follows an interrupted run with `resume: [{ interruptId, status: "cancelled" }]` and its delta holds a new user message
+- **THEN** the model receives the pending tool call, directly followed by its failed "cancelled" result, then the new user message
+
+#### Scenario: Only some interrupts answered
+- **WHEN** the previous run ended with two approval interrupts and the next run answers only one
+- **THEN** the run is rejected with `UnansweredInterrupt` naming the other one, and neither answer is committed
 
 ### Requirement: Thread history from the server store
 The agent SHALL keep the history of each `threadId` in the thread store and SHALL rebuild the model prompt on every run from the store, not from the client's full history. The prompt SHALL be: the agent's system prompt as resolved for this run, then the stored entries' messages in order, then the approval responses recorded for this run, then the ingested client delta, with every tool result placed directly after the assistant message holding its tool call. Every tool call sent to the model SHALL have a result: a stored tool call with no result and no approval request SHALL be sent with a failed result.
