@@ -451,6 +451,46 @@ describe("Runner.run prompt memo", () => {
   });
 });
 
+describe("Runner.run run ids", () => {
+  const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+
+  it.effect("replays nothing from a run id reused on another thread", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([...weatherTurn, [...text("0", "Hello."), finish("stop")]]);
+      const weather = countingWeatherLayer();
+      const [, other] = yield* runAgUi(weatherAgent, [
+        input("r1", [userMessage("u1", "Weather in Paris?")]),
+        { threadId: "t2", runId: "r1", messages: [userMessage("u9", "Hi")] },
+      ]).pipe(Effect.provide([model.layer, weather.layer]));
+
+      expect(weather.calls).toEqual(["Paris"]);
+      expect(model.prompts).toHaveLength(3);
+      expect(model.prompts[2]!.content.map((m) => m.role)).toEqual(["system", "user"]);
+      expect(JSON.stringify(model.prompts[2])).not.toContain("Paris");
+      expect(other!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      const t2 = yield* Effect.flatMap(Thread.Thread, (thread) => thread.load("t2"));
+      expect(t2.map((entry) => entry.message.role)).toEqual(["user", "assistant"]);
+    }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), Thread.layerMemory))),
+  );
+
+  it.effect("rejects a run id reused on the same thread with a different input, before committing", () => {
+    const spy = spyThread();
+    return Effect.gen(function* () {
+      const model = scriptedModel([...weatherTurn]);
+      const [, again] = yield* runAgUi(weatherAgent, [
+        input("r1", [userMessage("u1", "Weather in Paris?")]),
+        input("r1", [...clientHistoryAfterWeatherTurn, userMessage("u2", "And now?")]),
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+
+      expect(model.prompts).toHaveLength(2);
+      expect(types(again!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(again![1]).toMatchObject({ code: "RunInputMismatch" });
+      expect((yield* loadThread).map((entry) => entry.id)).not.toContain("u2");
+      expect(spy.log.filter((line) => line.startsWith("commit")).at(-1)).not.toContain("u2");
+    }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), spy.layer)));
+  });
+});
+
 describe("Runner.makeDetached", () => {
   const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
   const shared = () => Layer.mergeAll(ledger, counterIds(), Thread.layerMemory, EventLog.layerMemory);
@@ -470,7 +510,7 @@ describe("Runner.makeDetached", () => {
     });
 
   const subscribe = (after?: string) =>
-    Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("r1", after)));
+    Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("t1", "r1", after)));
 
   it.effect("makes the run observable through the event log", () =>
     Effect.gen(function* () {
@@ -500,7 +540,7 @@ describe("Runner.makeDetached", () => {
         ),
       ]);
       const log = yield* EventLog.EventLog;
-      const firstThree = yield* Stream.runCollect(log.subscribe("r1").pipe(Stream.take(3)));
+      const firstThree = yield* Stream.runCollect(log.subscribe("t1", "r1").pipe(Stream.take(3)));
       expect(firstThree).toHaveLength(3);
       yield* Deferred.succeed(release, undefined);
       const all = (yield* subscribe()).map((s) => s.event);
@@ -518,12 +558,12 @@ describe("Runner.makeDetached", () => {
         weatherTurn[0]!,
         Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never)),
       ]);
-      yield* log.subscribe("r1").pipe(
+      yield* log.subscribe("t1", "r1").pipe(
         Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT && s.event.messageId === "id-3"),
         Stream.runDrain,
       );
       yield* Scope.close(crashed, Exit.void);
-      const before = yield* log.read("r1");
+      const before = yield* log.read("t1", "r1");
 
       const second = yield* start(yield* Scope.make(), [[...text("0", "18°C"), finish("stop")]]);
       const after = (yield* subscribe(before.at(-1)!.cursor)).map((s) => s.event);
@@ -553,9 +593,9 @@ describe("Runner.makeDetached", () => {
       const log = yield* EventLog.EventLog;
       yield* start(yield* Scope.make(), weatherTurn);
       yield* subscribe();
-      const before = yield* log.read("r1");
+      const before = yield* log.read("t1", "r1");
       const again = yield* start(yield* Scope.make(), []);
-      expect(yield* log.read("r1")).toEqual(before);
+      expect(yield* log.read("t1", "r1")).toEqual(before);
       expect(again.prompts).toEqual([]);
     }).pipe(Effect.provide(shared())),
   );
@@ -582,10 +622,10 @@ describe("Runner.workflow", () => {
       const events = yield* Effect.gen(function* () {
         yield* workflow.execute({ input: run1 }, { discard: true });
         const log = yield* EventLog.EventLog;
-        const first = (yield* Stream.runCollect(log.subscribe("r1"))).map((s) => s.event);
+        const first = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((s) => s.event);
         // Executing the same run id again joins the finished execution.
         yield* workflow.execute({ input: run1 });
-        expect((yield* log.read("r1")).map((s) => s.event)).toEqual(first);
+        expect((yield* log.read("t1", "r1")).map((s) => s.event)).toEqual(first);
         return first;
       }).pipe(
         Effect.provide(
@@ -608,6 +648,38 @@ describe("Runner.workflow", () => {
       expect(events).toEqual(reference[0]);
       expect(weather.calls).toEqual(["Paris"]);
       expect(model.prompts).toHaveLength(2);
+    }),
+  );
+  it.effect("runs a run id reused on another thread as its own execution", () =>
+    Effect.gen(function* () {
+      const weather = countingWeatherLayer();
+      const { workflow, layer } = Runner.workflow(weatherAgent);
+      yield* Effect.gen(function* () {
+        const log = yield* EventLog.EventLog;
+        yield* workflow.execute({ input: run1 });
+        yield* workflow.execute({ input: { ...run1, threadId: "t2" } });
+        for (const threadId of ["t1", "t2"]) {
+          const events = (yield* Stream.runCollect(log.subscribe(threadId, "r1"))).map((s) => s.event);
+          yield* Effect.promise(() => verify(events));
+          expect(events[0]).toMatchObject({ type: EventType.RUN_STARTED, threadId, runId: "r1" });
+        }
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                scriptedModel([...weatherTurn, ...weatherTurn]).layer,
+                weather.layer,
+                counterIds(),
+                Thread.layerMemory,
+                EventLog.layerMemory,
+                WorkflowEngine.layerMemory,
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(weather.calls).toEqual(["Paris", "Paris"]);
     }),
   );
 });
@@ -738,7 +810,7 @@ describe("Runner run info", () => {
       );
       yield* runner.start(input("r1", [userMessage("u1", "hi")]), { context: { userId: "u1" } });
       const log = yield* EventLog.EventLog;
-      const events = (yield* Stream.runCollect(log.subscribe("r1"))).map((stored) => stored.event);
+      const events = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((stored) => stored.event);
       yield* Effect.promise(() => verify(events));
       expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory, EventLog.layerMemory))),
@@ -752,7 +824,7 @@ describe("Runner run info", () => {
       yield* Effect.gen(function* () {
         yield* workflow.execute(payload, { discard: true });
         const log = yield* EventLog.EventLog;
-        const events = (yield* Stream.runCollect(log.subscribe("r1"))).map((stored) => stored.event);
+        const events = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((stored) => stored.event);
         yield* Effect.promise(() => verify(events));
         // Executing the same run id again joins the finished execution.
         yield* workflow.execute(payload);

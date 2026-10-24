@@ -26,6 +26,22 @@ export interface RunOptions {
   readonly context?: unknown;
 }
 
+/**
+ * The run id was already used on this thread with a different input. A run id
+ * names one input: executing a run again replays its stored steps, which were
+ * produced from the first input.
+ */
+export class RunInputMismatch extends Schema.TaggedError<RunInputMismatch, { readonly brand: unique symbol }>()(
+  "RunInputMismatch",
+  {},
+) {
+  override get message(): string {
+    return "The run id was already used on this thread with a different input";
+  }
+}
+
+const InputJson = Schema.toCodecJson(AgUi.RunAgentInput);
+
 const failed = (cause: Cause.Cause<unknown>): Agent.Event => {
   const error = Cause.squash(cause);
   return { _tag: "Failed", error, code: Agent.errorCode(error) };
@@ -60,7 +76,8 @@ const reportEnd = (
 /**
  * One AG-UI run over the server-owned thread:
  *
- * 1. load the thread, take the client's delta and its `resume` answers, and
+ * 1. check that the input is the one the run id was first used with
+ *    (memoised as the `input` checkpoint), then load the thread, take the client's delta and its `resume` answers, and
  *    commit them;
  * 2. project the thread, memoised as the `prompt` checkpoint so a resumed run
  *    uses the projection the crashed attempt used;
@@ -69,8 +86,11 @@ const reportEnd = (
  * 4. tell the store the run ended, however it ended;
  * 5. project the events onto AG-UI.
  *
+ * Every checkpoint is scoped by the thread id as well as the run id, so a run
+ * id the client reuses on another thread replays nothing.
+ *
  * Failures, including those before the model is called (`ThreadError`,
- * `HistoryMismatch`), end the stream with `RUN_ERROR`, so it never fails.
+ * `HistoryMismatch`, `RunInputMismatch`), end the stream with `RUN_ERROR`, so it never fails.
  * Only an interrupted run (e.g. a cancelled request) is not reported to the
  * store, since it has not ended: running it again finishes it.
  */
@@ -85,6 +105,14 @@ const pipeline =
       Effect.gen(function* () {
         const thread = yield* Thread.Thread;
         const checkpoint = yield* Checkpoint.Checkpoint;
+        const fingerprint = JSON.stringify(yield* Effect.orDie(Schema.encodeEffect(InputJson)(input)));
+        const first = yield* checkpoint.memo(
+          { threadId, runId, name: "input", success: Schema.String, error: Schema.Never },
+          Effect.succeed(fingerprint),
+        );
+        if (first.value !== fingerprint) {
+          return yield* new RunInputMismatch();
+        }
         const stored = yield* thread.load(threadId);
         const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
         // Answers to the previous run come before anything new the client says.
@@ -94,7 +122,7 @@ const pipeline =
         ];
         yield* thread.commit(threadId, runId, added);
         const prompt = yield* checkpoint.memo(
-          { runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
+          { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
           Effect.sync(() => Messages.project([...stored, ...added])),
         );
 
@@ -170,8 +198,8 @@ const detached =
     const runWith = pipeline(agent, options);
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      const append = (event: AgUi.Event) => log.append(input.runId, event);
-      const history = (yield* log.read(input.runId)).map((stored) => stored.event);
+      const append = (event: AgUi.Event) => log.append(input.threadId, input.runId, event);
+      const history = (yield* log.read(input.threadId, input.runId)).map((stored) => stored.event);
       const last = history.at(-1);
       if (last !== undefined && AgUi.isTerminal(last)) {
         return;
@@ -213,7 +241,7 @@ export const makeDetached = <Tools extends Record<string, Tool.Any>, R>(
     return {
       start: (input, runOptions) =>
         Effect.gen(function* () {
-          const last = (yield* Effect.orDie(log.read(input.runId))).at(-1);
+          const last = (yield* Effect.orDie(log.read(input.threadId, input.runId))).at(-1);
           if (last !== undefined && AgUi.isTerminal(last.event)) {
             return;
           }
@@ -235,14 +263,15 @@ export const WorkflowPayload = Schema.Struct({
 });
 
 /**
- * The run as an `effect/workflow` workflow, keyed by run id, with workflow
+ * The run as an `effect/workflow` workflow, keyed by thread id and run id, with workflow
  * activities as checkpoints, so a durable engine (e.g. `ClusterWorkflowEngine`)
  * persists the run and replays it after a crash or deploy. Register `layer`
  * with the engine and start a run with
  * `workflow.execute({ input, context }, { discard: true })`; observe it
  * through the {@link EventLog.EventLog}. The payload, context included, is what
  * the engine persists, so a resumed execution sees the original context.
- * Executing the same run id again joins the existing execution. Resuming an
+ * Executing the same run on the same thread again joins the existing
+ * execution; the same run id on another thread is a different execution. Resuming an
  * execution the engine has suspended is the engine's concern
  * (`workflow.resume(yield* workflow.executionId(payload))`).
  */
@@ -252,7 +281,8 @@ export const workflow = <Tools extends Record<string, Tool.Any>, R>(
 ) => {
   const run = Workflow.make("effentic/Run", {
     payload: WorkflowPayload,
-    idempotencyKey: (payload) => payload.input.runId,
+    // JSON, so no choice of ids can make two keys collide.
+    idempotencyKey: (payload) => JSON.stringify([payload.input.threadId, payload.input.runId]),
   });
   const body = detached(agent, options);
   const layer: Layer.Layer<

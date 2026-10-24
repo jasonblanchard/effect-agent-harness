@@ -199,7 +199,7 @@ interface Decision {
  *
  * Every model call and every tool call is memoised through the
  * {@link Checkpoint.Checkpoint} in context, under `model:<step>` and
- * `tool:<toolCallId>`, so a run executed again with the same `runId` against a
+ * `tool:<toolCallId>`, so a run executed again with the same `threadId` and `runId` against a
  * durable store replays completed work instead of repeating it.
  *
  * The stream never fails. It ends with exactly one `Finished` or `Failed`
@@ -220,7 +220,10 @@ export const run =
         );
         // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
         const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
-          checkpoint.memo({ runId: input.runId, name, success: ToolStep, error: Schema.Never }, Effect.orDie(body));
+          checkpoint.memo(
+            { threadId: input.threadId, runId: input.runId, name, success: ToolStep, error: Schema.Never },
+            Effect.orDie(body),
+          );
 
         const result = (encodedResult: unknown, isFailure: boolean) =>
           Effect.map(ids.generateId(), (messageId): ToolStep => ({
@@ -282,7 +285,13 @@ export const run =
 
         const modelStep = (step: number, prompt: Prompt.Prompt) =>
           checkpoint.memo(
-            { runId: input.runId, name: `model:${step}`, success: ModelStep, error: Schema.Never },
+            {
+              threadId: input.threadId,
+              runId: input.runId,
+              name: `model:${step}`,
+              success: ModelStep,
+              error: Schema.Never,
+            },
             Effect.gen(function* () {
               const messageId = yield* ids.generateId();
               yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
@@ -321,7 +330,13 @@ export const run =
           agent.system === undefined || typeof agent.system === "string"
             ? agent.system
             : (yield* checkpoint.memo(
-                { runId: input.runId, name: "system", success: Schema.String, error: Schema.Never },
+                {
+                  threadId: input.threadId,
+                  runId: input.runId,
+                  name: "system",
+                  success: Schema.String,
+                  error: Schema.Never,
+                },
                 agent.system,
               )).value;
         const withSystem = (prompt: Prompt.Prompt) =>

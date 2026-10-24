@@ -6,10 +6,10 @@ import * as EventLog from "../src/EventLog.ts";
 const input = { threadId: "t1", runId: "r1" };
 
 const append = (...events: ReadonlyArray<AgUi.Event>) =>
-  Effect.flatMap(EventLog.EventLog, (log) => Effect.forEach(events, (event) => log.append("r1", event)));
+  Effect.flatMap(EventLog.EventLog, (log) => Effect.forEach(events, (event) => log.append("t1", "r1", event)));
 
 const subscribe = (after?: string) =>
-  Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("r1", after)));
+  Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("t1", "r1", after)));
 
 describe("EventLog.layerMemory", () => {
   it.effect("assigns increasing cursors and reads in append order", () =>
@@ -17,7 +17,7 @@ describe("EventLog.layerMemory", () => {
       const log = yield* EventLog.EventLog;
       const events = [AgUi.runStarted(input), AgUi.textMessageStart("m1"), AgUi.textMessageEnd("m1")];
       yield* append(...events);
-      const stored = yield* log.read("r1");
+      const stored = yield* log.read("t1", "r1");
       expect(stored.map((s) => s.event)).toEqual(events);
       const cursors = stored.map((s) => Number(s.cursor));
       expect(cursors).toEqual([...cursors].sort((a, b) => a - b));
@@ -33,8 +33,19 @@ describe("EventLog.layerMemory", () => {
         AgUi.textMessageStart("m1"),
         AgUi.textMessageEnd("m1"),
       );
-      expect(yield* log.read("r1", second!.cursor)).toEqual([third]);
-      expect(yield* log.read("unknown")).toEqual([]);
+      expect(yield* log.read("t1", "r1", second!.cursor)).toEqual([third]);
+      expect(yield* log.read("t1", "unknown")).toEqual([]);
+    }).pipe(Effect.provide(EventLog.layerMemory)),
+  );
+
+  it.effect("keeps runs with the same run id on different threads apart", () =>
+    Effect.gen(function* () {
+      const log = yield* EventLog.EventLog;
+      yield* append(AgUi.runStarted(input), AgUi.runFinished(input));
+      expect(yield* log.read("t2", "r1")).toEqual([]);
+      yield* log.append("t2", "r1", AgUi.runStarted({ threadId: "t2", runId: "r1" }));
+      expect((yield* log.read("t2", "r1")).map((s) => s.cursor)).toEqual(["0"]);
+      expect(yield* log.read("t1", "r1")).toHaveLength(2);
     }).pipe(Effect.provide(EventLog.layerMemory)),
   );
 
@@ -66,7 +77,7 @@ describe("EventLog.layerMemory", () => {
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const first = yield* Deferred.make<void>();
-      const fiber = yield* log.subscribe("r1").pipe(
+      const fiber = yield* log.subscribe("t1", "r1").pipe(
         Stream.tap(() => Deferred.succeed(first, undefined)),
         Stream.runCollect,
         Effect.forkChild,

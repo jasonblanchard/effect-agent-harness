@@ -59,3 +59,14 @@ Conventions for every task: run from the repo root; `pnpm --filter effentic test
   - `src/agent.ts` sends the demo token.
 
   Verify `pnpm --filter ag-ui tsc` and lint pass, run the example's manual checks from its `AGENTS.md`, and add a check that the email shows the demo principal as the sender.
+
+## 6. Run keys scoped by thread
+
+- [x] 6.1 Add `threadId` to `Checkpoint.MemoOptions` and to `Ledger.get`/`set`, key `layerMemoryLedger` by `JSON.stringify([threadId, runId, name])`, and pass `input.threadId` from every memo in `Agent.run` and the runner (9). Verify in `Checkpoint.test.ts` that the same run id and name under two thread ids execute once each and the first replays.
+- [x] 6.2 Add `threadId` to every `EventLog` operation and key `layerMemory` by both ids (9). Verify in `EventLog.test.ts` that the same run id on two threads has separate events and cursors.
+- [x] 6.3 Make `Runner.workflow`'s idempotency key `JSON.stringify([threadId, runId])` (9). Verify in `Runner.test.ts` that run id "r1" on threads "t1" and "t2" gives two complete executions, with the weather handler running once per thread.
+- [x] 6.4 Memoise the encoded input as the `input` checkpoint before loading the thread, and fail with `RunInputMismatch` when it differs (9). Verify in `Runner.test.ts` with a ledger:
+  - run id "r1" reused on "t2" with another message calls the model with only "t2"'s history, runs no tool again, and "t2" holds only its own entries;
+  - run id "r1" reused on "t1" with an added message ends `RUN_STARTED`, `RUN_ERROR` (`RunInputMismatch`), calls no model and commits nothing new;
+  - the prompt-memo test (same input re-executed) still passes.
+- [x] 6.5 Docs and example: the README's authentication rules say the thread check covers its runs, and the checkpoint, workflow, event-log and custom-store sections show the new keys; `packages/effentic/AGENTS.md` gets the invariant; the example's events route becomes `GET /threads/:threadId/runs/:runId/events` and authenticates.

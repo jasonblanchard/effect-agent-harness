@@ -282,7 +282,7 @@ yield *
 Three rules:
 
 - **Put the verified principal in `context`, not the raw token.** `context` is persisted by `Runner.workflow` (and may end up in logs), and a token can expire before a resumed run reaches a tool. A tool that calls another API as the user should get credentials from a service keyed by the principal.
-- **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else.
+- **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else. This is also the only check runs need. The client picks `runId` too, but effentic keys everything it stores for a run (checkpoints, the workflow execution, the event log) by thread id _and_ run id, so a run id reused on another thread finds nothing. Routes that read a run, such as an event stream, take the thread id as well and check it the same way.
 - **Treat `props` as untrusted.** They are whatever the client sent. Use them to choose between values you know (a locale, a display mode), and don't paste them into the system prompt.
 
 ## Tool approvals
@@ -352,6 +352,8 @@ Every model call and every tool call in a run goes through `Checkpoint.memo`, un
 
 A step that _failed_ is stored too, so re-running a failed run fails again the same way; retry with a new `runId`. Only work that was interrupted (a crash, a deploy, a cancelled fiber) is executed again.
 
+Checkpoints are keyed by thread id and run id, so the same `runId` on another thread is a different run. A run id names one input: the input is memoised (as `input`), and running the same `runId` on the same thread with a different input fails with `RunInputMismatch` before anything is committed or replayed.
+
 The projected thread is memoised as well (as `prompt`), and so is a computed system prompt (as `system`). A resumed run therefore sees the same history and the same system prompt as the attempt that crashed, even if the thread was compacted or the system prompt's services changed in between.
 
 ### Detached runs
@@ -387,7 +389,7 @@ Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision i
 
 ### Workflow runs
 
-To have `effect/workflow` own runs (persisted, resumed after restarts, deduplicated by `runId`), use `Runner.workflow`:
+To have `effect/workflow` own runs (persisted, resumed after restarts, deduplicated by thread id and run id), use `Runner.workflow`:
 
 ```ts
 const { workflow, layer } = Runner.workflow(agent);
@@ -397,25 +399,29 @@ const { workflow, layer } = Runner.workflow(agent);
 yield * workflow.execute({ input, context: { principal } }, { discard: true });
 ```
 
-The payload (`Runner.WorkflowPayload`: the input and the context) is what the engine persists, so a resumed execution sees the original context; the context must be JSON-encodable. Executing the same `runId` again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* workflow.executionId(payload))`.
+The payload (`Runner.WorkflowPayload`: the input and the context) is what the engine persists, so a resumed execution sees the original context; the context must be JSON-encodable. Executing the same run (same `threadId` and `runId`) again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* workflow.executionId(payload))`.
 
 ## Reconnecting to a run
 
-The `EventLog` stores each run's AG-UI events under increasing cursors. `subscribe(runId, after?)` returns the stored events after `after`, then live events, and completes after the terminal event. `Sse.encodeStored` turns cursors into SSE `id`s, so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
+The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` returns the stored events after `after`, then live events, and completes after the terminal event. `Sse.encodeStored` turns cursors into SSE `id`s, so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
 
 ```ts
 yield *
   router.add(
     "GET",
-    "/runs/:runId/events",
+    "/threads/:threadId/runs/:runId/events",
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      const { runId } = yield* HttpRouter.schemaPathParams(Schema.Struct({ runId: Schema.String }));
+      const { threadId, runId } = yield* HttpRouter.schemaPathParams(
+        Schema.Struct({ threadId: Schema.String, runId: Schema.String }),
+      );
+      const principal = yield* authenticate;
+      yield* threadOwners.authorize(threadId, principal); // as for POST /agent
       const headers = yield* HttpServerRequest.schemaHeaders(
         Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
       );
       return HttpServerResponse.stream(
-        Sse.encodeStored(log.subscribe(runId, headers["last-event-id"])).pipe(Stream.encodeText),
+        Sse.encodeStored(log.subscribe(threadId, runId, headers["last-event-id"])).pipe(Stream.encodeText),
         { contentType: Sse.contentType },
       );
     }),
@@ -503,17 +509,17 @@ const ThreadLive = Layer.effect(
 
 Entries are `{ id, message }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Thread.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
 
-**Checkpoint ledger:** a get/set store keyed by `(runId, name)`. The values are JSON-encoded `Exit`s.
+**Checkpoint ledger:** a get/set store keyed by `(threadId, runId, name)`. The values are JSON-encoded `Exit`s. Keep all three in the key: the client picks `runId`, so it is only unique within a thread.
 
 ```ts
 const LedgerLive = Layer.succeed(Checkpoint.Ledger)({
-  get: (runId, name) => kv.get(`${runId}/${name}`), // Effect<Option<unknown>, LedgerError>
-  set: (runId, name, exit) => kv.set(`${runId}/${name}`, exit),
+  get: (threadId, runId, name) => kv.get(JSON.stringify([threadId, runId, name])), // Effect<Option<unknown>, LedgerError>
+  set: (threadId, runId, name, exit) => kv.set(JSON.stringify([threadId, runId, name]), exit),
 });
 const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 ```
 
-**Event log:** `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
+**Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
 
 ## Module reference
 
@@ -523,7 +529,7 @@ Everything is exported from `"effentic"` as namespaces.
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
 | `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                                    |
-| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowPayload`                                                      |
+| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowPayload`, `RunInputMismatch`                                  |
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `layerMemory`                                                                              |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |

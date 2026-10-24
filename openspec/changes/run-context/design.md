@@ -100,7 +100,7 @@ workflow.execute({ input, context }, { discard: true }) // payload: Schema.Struc
 ```
 
 - **Two fields, not one.** A route could put a verified principal in `forwardedProps`, but then safety depends on every route overwriting, never merging, the client's value. One route that forgets lets a client claim to be anyone, and nothing downstream can tell. With separate fields, nothing the client sends can become `context`.
-- **The workflow payload carries the context,** because the engine resumes executions from the payload alone. The idempotency key stays the run id (`payload.input.runId`). The context must be JSON-encodable, because `Schema.Unknown` stores it as is.
+- **The workflow payload carries the context,** because the engine resumes executions from the payload alone. The idempotency key is built from the input's thread and run ids (decision 9). The context must be JSON-encodable, because `Schema.Unknown` stores it as is.
 - **A detached run doesn't store its context.** Restarting it after a crash means calling `start` again with the same input and context. The caller already holds both, because it holds the input.
 - *Alternative deferred:* a context schema (`Runner.workflow(agent, { context: Principal })`), which would type it and validate it on decode. That can be added without breaking this API.
 
@@ -124,6 +124,23 @@ Two rules go in the docs:
 
 The pipeline builds `RunInfo` from the input and the run options (`runId`, `threadId`, `props: input.forwardedProps`, `context: runOptions?.context`) and calls `Agent.run(agent)({ ...info, prompt })`. Every runner's type gains the agent's `R`: `run`/`make`/`makeDetached` require `Agent.Requirements<Tools, R>`, and `workflow` requires `Exclude<Agent.Requirements<Tools, R>, Checkpoint>`. `AgUi.RunAgentInput` gains `forwardedProps: Schema.optional(Schema.Unknown)`. The decoder stays lenient, and the value is passed through untouched.
 
+### 9. Run keys include the thread id
+
+The client chooses `runId` (`HttpAgent` mints one per request), and before this change it was the only key for the checkpoint ledger, the workflow idempotency key and the event log. The caller authorises `threadId` (decision 6), and nothing authorises `runId`. A signed-in user who sent another user's run id under their own thread would replay that run's `prompt` and `system` checkpoints and tool results into their own thread, join its workflow execution, or read its event log. That breaks decision 5's invariant from the other side: server-trusted data from one principal reaches another.
+
+Every key for a run is now `(threadId, runId)`:
+
+- `MemoOptions` and `Ledger.get`/`set` take a `threadId`;
+- `EventLog` operations take one;
+- the workflow idempotency key is `JSON.stringify([threadId, runId])`.
+
+The in-memory stores build their keys with `JSON.stringify` too, so no choice of ids makes two keys collide. Authorising the thread then authorises its runs, so the caller has one check to make.
+
+Within a thread, a reused run id is still the owner's own data, but replaying it with a different input would commit the new messages while replaying the old prompt. So the pipeline memoises the encoded input as the `input` checkpoint before it loads or commits anything, and fails with `RunInputMismatch` if a re-execution's input differs. With `layerNone` the check never fires. Under `layerWorkflow` the payload is fixed, so it always passes.
+
+- *Alternative rejected:* documenting that callers must validate `runId`. A caller can only do that with its own persistent `runId → owner` table, and minting run ids on the server conflicts with AG-UI, where the client sends them.
+- *Alternative rejected:* binding `runId → (threadId, principal)` on first use. It needs a new store, and the library would have to know about principals.
+
 ## Risks / Trade-offs
 
 - [A system prompt that changes every run defeats prefix prompt caching on long threads, because it is the first thing in the prompt] → Document it, recommend keeping changing values small and few, and leave the stable/changing split as the follow-up named in the proposal.
@@ -136,6 +153,7 @@ The pipeline builds `RunInfo` from the input and the run options (`runId`, `thre
 ## Migration Plan
 
 1. Archive `durable-agent-planes` first, because this change modifies requirements it introduces.
-2. Callers of `Agent.run` add `threadId` (and `props`/`context` if wanted) and drop the system message from their prompt. Callers of `Messages.project` drop the first argument.
-3. Callers of `Runner.workflow` execute with `{ input, context }` instead of `input`. Executions already persisted with the old payload shape won't decode, so let them finish before deploying.
-4. Before deploying over durable checkpoint ledgers, let in-flight runs finish, or give the runs started after the deploy new run ids. Old `prompt` checkpoints must not be resumed by the new code.
+2. Custom `Checkpoint.Ledger` and `EventLog` implementations take the thread id as a new first argument and include it in their keys.
+3. Callers of `Agent.run` add `threadId` (and `props`/`context` if wanted) and drop the system message from their prompt. Callers of `Messages.project` drop the first argument.
+4. Callers of `Runner.workflow` execute with `{ input, context }` instead of `input`. Executions already persisted with the old payload shape won't decode, so let them finish before deploying.
+5. Before deploying over durable checkpoint ledgers, event logs or workflow engines, let in-flight runs finish, or give the runs started after the deploy new run ids. Old `prompt` checkpoints must not be resumed by the new code, and old keys lack the thread id, so the new code wouldn't find them anyway.

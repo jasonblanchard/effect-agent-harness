@@ -9,6 +9,12 @@ export interface Memoized<A> {
 }
 
 export interface MemoOptions<A, I, E, EI> {
+  /**
+   * With `runId`, the run the step belongs to. Steps are scoped by thread as
+   * well as run because the client picks the run id: a run id reused on
+   * another thread must not reach this run's steps.
+   */
+  readonly threadId: string;
   readonly runId: string;
   /** Unique within the run, e.g. `model:2` or `tool:<toolCallId>`. */
   readonly name: string;
@@ -17,7 +23,7 @@ export interface MemoOptions<A, I, E, EI> {
 }
 
 /**
- * Memoises the named steps of a run. The first execution of `(runId, name)`
+ * Memoises the named steps of a run. The first execution of `(threadId, runId, name)`
  * runs the effect and stores its completed exit, success or failure; later
  * executions replay it without running the effect. An interrupted attempt
  * stores nothing, so a resumed run executes that step again.
@@ -46,14 +52,15 @@ export class LedgerError extends Schema.TaggedError<LedgerError, { readonly bran
 }) {}
 
 /**
- * A store for completed step exits, keyed by run id and step name. The value
- * is the step's `Exit` encoded as JSON, so any key-value store can hold it.
+ * A store for completed step exits, keyed by thread id, run id and step name.
+ * The value is the step's `Exit` encoded as JSON, so any key-value store can
+ * hold it.
  */
 export class Ledger extends Context.Service<
   Ledger,
   {
-    readonly get: (runId: string, name: string) => Effect.Effect<Option.Option<unknown>, LedgerError>;
-    readonly set: (runId: string, name: string, exit: unknown) => Effect.Effect<void, LedgerError>;
+    readonly get: (threadId: string, runId: string, name: string) => Effect.Effect<Option.Option<unknown>, LedgerError>;
+    readonly set: (threadId: string, runId: string, name: string, exit: unknown) => Effect.Effect<void, LedgerError>;
   }
 >()("effentic/Checkpoint/Ledger") {}
 
@@ -69,7 +76,7 @@ export const layerLedger: Layer.Layer<Checkpoint, never, Ledger> = Layer.effect(
       memo: <A, I, E, EI, R>(options: MemoOptions<A, I, E, EI>, effect: Effect.Effect<A, E, R>) =>
         Effect.gen(function* () {
           const codec = Schema.toCodecJson(Schema.Exit(options.success, options.error, Schema.Defect()));
-          const stored = yield* Effect.orDie(ledger.get(options.runId, options.name));
+          const stored = yield* Effect.orDie(ledger.get(options.threadId, options.runId, options.name));
           if (Option.isSome(stored)) {
             const exit = yield* Effect.orDie(Schema.decodeUnknownEffect(codec)(stored.value));
             const value = yield* exit;
@@ -78,7 +85,7 @@ export const layerLedger: Layer.Layer<Checkpoint, never, Ledger> = Layer.effect(
           const exit = yield* Effect.exit(effect);
           if (Exit.isSuccess(exit) || !Cause.hasInterrupts(exit.cause)) {
             const encoded = yield* Effect.orDie(Schema.encodeEffect(codec)(exit));
-            yield* Effect.orDie(ledger.set(options.runId, options.name, encoded));
+            yield* Effect.orDie(ledger.set(options.threadId, options.runId, options.name, encoded));
           }
           const value = yield* exit;
           return { value, replayed: false };
@@ -90,12 +97,13 @@ export const layerLedger: Layer.Layer<Checkpoint, never, Ledger> = Layer.effect(
 /** A {@link Ledger} over an in-process map. For tests and local development. */
 export const layerMemoryLedger: Layer.Layer<Ledger> = Layer.sync(Ledger, () => {
   const entries = new Map<string, unknown>();
-  const key = (runId: string, name: string) => `${runId}\u0000${name}`;
+  // JSON, so no choice of ids can make two keys collide.
+  const key = (threadId: string, runId: string, name: string) => JSON.stringify([threadId, runId, name]);
   return Ledger.of({
-    get: (runId, name) => Effect.sync(() => Option.fromUndefinedOr(entries.get(key(runId, name)))),
-    set: (runId, name, exit) =>
+    get: (threadId, runId, name) => Effect.sync(() => Option.fromUndefinedOr(entries.get(key(threadId, runId, name)))),
+    set: (threadId, runId, name, exit) =>
       Effect.sync(() => {
-        entries.set(key(runId, name), exit);
+        entries.set(key(threadId, runId, name), exit);
       }),
   });
 });
@@ -106,8 +114,8 @@ export const layerMemoryLedger: Layer.Layer<Ledger> = Layer.sync(Ledger, () => {
 
 /**
  * Runs each step as an `effect/workflow` activity named after the step, so the
- * workflow engine stores and replays it. The run id is not used: the workflow
- * execution already scopes activity names. Build this layer inside a workflow
+ * workflow engine stores and replays it. The thread and run ids are not used:
+ * the workflow execution, keyed by both, already scopes activity names. Build this layer inside a workflow
  * execution, e.g. by providing it in `Workflow.toLayer`'s body.
  */
 export const layerWorkflow: Layer.Layer<

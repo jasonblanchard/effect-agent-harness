@@ -3,10 +3,10 @@
 A runnable example: a terminal chat client (`src/index.ts`) using `@ag-ui/client`'s `HttpAgent`, talking to an effentic agent backed by Anthropic.
 
 - `src/server.ts`: defines the agent with `Agent.define` (weather + email tools; the system prompt is an effect naming the run's principal and today's date), and builds the routes with `HttpRouter`, exposed as an in-process web handler (`HttpRouter.toWebHandler`). Stores are in-memory: `Thread.layerMemory`, `Checkpoint.layerNone`, `EventLog.layerMemory`.
-  - `POST /agent` and `POST /runs` authenticate the request first (`401` without the demo token) and pass `{ context: { principal } }` to the runner.
+  - Every route authenticates the request first (`401` without the demo token). `POST /agent` and `POST /runs` pass `{ context: { principal } }` to the runner.
   - `POST /agent`: request-scoped run (`Runner.make`), streamed back as SSE. A disconnect cancels the run. The server owns the thread; the client's resent history is reduced to its delta.
   - `POST /runs`: starts a detached run (`Runner.makeDetached`) and answers `202` at once.
-  - `GET /runs/:runId/events`: follows a run from the event log as SSE with cursors as SSE ids, resuming after the request's `Last-Event-ID`.
+  - `GET /threads/:threadId/runs/:runId/events`: follows a run from the event log as SSE with cursors as SSE ids, resuming after the request's `Last-Event-ID`.
 - `src/auth.ts`: the placeholder `authenticate` (accepts only `Authorization: Bearer demo-token`), the `AppContext` schema, and `currentPrincipal`, which reads the principal back from `Agent.CurrentRun`. A real server verifies a real token and also checks that the principal owns the thread.
 - `src/agent.ts`: an `HttpAgent` that sends the demo token and whose `fetch` calls that handler directly. No network server runs, and the `effentic.local` host is never resolved.
 - `src/index.ts`: the chat loop. When a run ends with an interrupt, it asks `(y/n)` for each pending approval and runs again with `resume`.

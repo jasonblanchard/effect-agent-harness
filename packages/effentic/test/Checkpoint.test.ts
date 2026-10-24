@@ -20,7 +20,7 @@ const counter = () => {
 
 const memo = <A, I>(runId: string, name: string, success: Schema.Codec<A, I>, effect: Effect.Effect<A>) =>
   Effect.flatMap(Checkpoint.Checkpoint, (checkpoint) =>
-    checkpoint.memo({ runId, name, success, error: Schema.Never }, effect),
+    checkpoint.memo({ threadId: "t1", runId, name, success, error: Schema.Never }, effect),
   );
 
 const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
@@ -59,7 +59,7 @@ describe("Checkpoint.layerLedger", () => {
       const checkpoint = yield* Checkpoint.Checkpoint;
       const c = counter();
       const failing = Effect.flatMap(c.next, () => Effect.fail(new Boom({ detail: "x" })));
-      const options = { runId: "r1", name: "step", success: Schema.Finite, error: Boom };
+      const options = { threadId: "t1", runId: "r1", name: "step", success: Schema.Finite, error: Boom };
       const first = yield* Effect.exit(checkpoint.memo(options, failing));
       const second = yield* Effect.exit(checkpoint.memo(options, failing));
       expect(c.count).toBe(1);
@@ -74,6 +74,20 @@ describe("Checkpoint.layerLedger", () => {
       yield* memo("r1", "step", Schema.Finite, c.next);
       yield* memo("r2", "step", Schema.Finite, c.next);
       expect(c.count).toBe(2);
+    }).pipe(Effect.provide(ledger)),
+  );
+
+  it.effect("does not share a run id between threads", () =>
+    Effect.gen(function* () {
+      const checkpoint = yield* Checkpoint.Checkpoint;
+      const c = counter();
+      const on = (threadId: string) =>
+        checkpoint.memo({ threadId, runId: "r1", name: "step", success: Schema.Finite, error: Schema.Never }, c.next);
+      const first = yield* on("t1");
+      const second = yield* on("t2");
+      expect(c.count).toBe(2);
+      expect(second).toEqual({ value: 2, replayed: false });
+      expect(yield* on("t1")).toEqual({ ...first, replayed: true });
     }).pipe(Effect.provide(ledger)),
   );
 

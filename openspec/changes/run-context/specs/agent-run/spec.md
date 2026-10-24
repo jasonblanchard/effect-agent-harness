@@ -28,6 +28,17 @@ Given a run's info and a prompt, the run SHALL produce an event stream that neve
 - **WHEN** the model stream emits an error part during step 1
 - **THEN** the stream ends with one failed event whose code is `ModelStreamError` and no event follows it
 
+### Requirement: Each tool call executes at most once per run
+A tool handler SHALL run at most once for a given thread id, run id and tool call id, including when the run is executed again after an interruption and the earlier attempt had already completed that tool call. A run with the same run id on another thread SHALL NOT replay that tool call's result.
+
+#### Scenario: Resume after a crash following a tool call
+- **WHEN** a run with a ledger-backed checkpoint store completes the `get-weather` call in step 1 and then fails before step 2 completes, and the same run id is executed again on the same thread against the same ledger
+- **THEN** the weather handler has run exactly once in total and the second execution continues from step 2
+
+#### Scenario: Parallel tool calls
+- **WHEN** the model makes two tool calls in one step
+- **THEN** both handlers run and both results are emitted, each once
+
 ## ADDED Requirements
 
 ### Requirement: The current run is available to the system prompt and tool handlers
@@ -61,7 +72,7 @@ The run SHALL send the agent's system prompt as the first message of every model
 - **THEN** the model receives the agent's system prompt first and the summary second
 
 ### Requirement: A computed system prompt is resolved once per run
-A computed system prompt SHALL be resolved once per run, before the first model call and before approvals carried by the prompt are resolved, and SHALL be memoised under the run id, so a run executed again after an interruption uses the same text even if the services it reads now return different values. If resolving it fails, the run SHALL end with a failed event without calling the model or running any tool.
+A computed system prompt SHALL be resolved once per run, before the first model call and before approvals carried by the prompt are resolved, and SHALL be memoised under the thread id and run id, so a run executed again after an interruption uses the same text even if the services it reads now return different values. If resolving it fails, the run SHALL end with a failed event without calling the model or running any tool.
 
 #### Scenario: Several steps
 - **WHEN** a run with a computed system prompt takes two model steps

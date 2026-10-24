@@ -54,7 +54,9 @@ const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401
 
 // The routes authenticate the request and pass the principal, never the token,
 // as the run's context. A real server would also check here that the principal
-// owns `input.threadId`: the thread store does no access control.
+// owns the thread id: the stores do no access control. That one check also
+// covers the thread's runs, because the library keys every run by thread id
+// and run id, and the client picks the run id.
 
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
@@ -71,8 +73,9 @@ const AgentRoutes = HttpRouter.use((router) =>
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
-    // POST /runs starts a run that outlives the request; GET /runs/:runId/events
-    // follows it, resuming after the client's `Last-Event-ID`.
+    // POST /runs starts a run that outlives the request;
+    // GET /threads/:threadId/runs/:runId/events follows it, resuming after the
+    // client's `Last-Event-ID`.
     const detached = yield* Runner.makeDetached(assistant);
     const log = yield* EventLog.EventLog;
 
@@ -89,15 +92,21 @@ const AgentRoutes = HttpRouter.use((router) =>
 
     yield* router.add(
       "GET",
-      "/runs/:runId/events",
+      "/threads/:threadId/runs/:runId/events",
       Effect.gen(function* () {
-        const { runId } = yield* HttpRouter.schemaPathParams(Schema.Struct({ runId: Schema.String }));
+        yield* authenticate;
+        const { threadId, runId } = yield* HttpRouter.schemaPathParams(
+          Schema.Struct({ threadId: Schema.String, runId: Schema.String }),
+        );
         const { "last-event-id": lastEventId } = yield* HttpServerRequest.schemaHeaders(
           Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
         );
 
-        return sse(Sse.encodeStored(log.subscribe(runId, lastEventId)));
-      }).pipe(Effect.orElseSucceed(() => HttpServerResponse.text("Invalid request", { status: 400 }))),
+        return sse(Sse.encodeStored(log.subscribe(threadId, runId, lastEventId)));
+      }).pipe(
+        Effect.catchTag("Unauthorized", unauthorized),
+        Effect.orElseSucceed(() => HttpServerResponse.text("Invalid request", { status: 400 })),
+      ),
     );
   }),
 ).pipe(Layer.provide(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));

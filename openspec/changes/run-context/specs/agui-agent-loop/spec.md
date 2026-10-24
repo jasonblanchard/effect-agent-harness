@@ -30,7 +30,7 @@ The agent SHALL keep the history of each `threadId` in the thread store and SHAL
 - **THEN** the thread's stored entries do not include the agent's system prompt
 
 ### Requirement: Projected prompt is stable across a resumed run
-The projection of the thread taken at the start of a run SHALL be memoised under the run id, so a run executed again after an interruption uses the same projection even if the store changed in between. The projection SHALL NOT include the agent's system prompt, which the agent run memoises separately.
+The projection of the thread taken at the start of a run SHALL be memoised under the thread id and run id, so a run executed again after an interruption uses the same projection even if the store changed in between. The projection SHALL NOT include the agent's system prompt, which the agent run memoises separately.
 
 #### Scenario: Store compacted between attempts
 - **WHEN** a run is re-executed with a ledger-backed checkpoint store after the thread was rewritten
@@ -56,3 +56,18 @@ The agent SHALL run each AG-UI run with run info taken from its input and from t
 #### Scenario: The client cannot set the context
 - **WHEN** a caller starts a run with the context `{ userId: "u1" }` and the input's `forwardedProps` is `{ context: { userId: "u2" }, userId: "u2" }`
 - **THEN** the run's context is `{ userId: "u1" }`, and the client's values appear only in the run's properties
+
+### Requirement: A run id names one input on its thread
+Everything the runner stores for a run SHALL be scoped by the input's thread id as well as its run id, because the client chooses both and the caller authorises only the thread. Before loading or committing anything, the runner SHALL memoise the input under the thread id and run id. If a run is executed again on the same thread with the same run id and a different input, it SHALL end with `RUN_ERROR` code `RunInputMismatch` without committing anything, calling the model or running a tool.
+
+#### Scenario: Run id reused on another thread
+- **WHEN** run "r1" on thread "t1" calls `get-weather`, and then a run with run id "r1" and a different message is started on thread "t2" with the same ledger-backed checkpoint store
+- **THEN** the second run calls the model with only thread "t2"'s history, the weather handler does not run again, and thread "t2" holds only its own user message and reply
+
+#### Scenario: Run id reused on the same thread with a different input
+- **WHEN** run "r1" on thread "t1" finished, and a run with run id "r1" on thread "t1" is started with an added user message
+- **THEN** the events are `RUN_STARTED` then `RUN_ERROR` with code `RunInputMismatch`, the model is not called, and the added message is not committed
+
+#### Scenario: Same input executed again
+- **WHEN** a run is interrupted and executed again on the same thread with the same input
+- **THEN** it continues from its stored steps
