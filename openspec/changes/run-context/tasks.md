@@ -79,3 +79,15 @@ Conventions for every task: run from the repo root; `pnpm --filter effentic test
   - `cancelled` with a new user message gives the model the call, its "cancelled" result, then the message;
   - an unknown interrupt id next to a real answer is ignored.
 - [x] 7.3 Docs and example: the README approval rules (with the AG-UI rule and the `cancelled` pattern) and module reference, both `AGENTS.md` files, and `src/index.ts` cancels interrupts still open when the user sends a new message.
+
+## 8. One active run per thread
+
+- [x] 8.1 Add `Thread.ThreadBusy` (TaggedError with brand, `activeRunId`) and `claim`/`release` to `Thread`, and implement them in `layerMemory` (11). Verify in `Thread.test.ts`: a second run's claim fails naming the first; the same run claims again; a release by another run does nothing; the holder's release frees the thread; threads are independent.
+- [x] 8.2 In the pipeline, claim after the `input` check and before `load`; release after `runEnded` and before the terminal event, even if `runEnded` failed; in `run`/`make`, release a run whose stream stops before its terminal event (11). Verify in `Runner.test.ts`:
+  - a second run while one is streaming ends `RUN_STARTED`, `RUN_ERROR` (`ThreadBusy`), commits nothing and isn't reported; the first finishes, and the thread can be claimed at the moment its `RUN_FINISHED` is seen;
+  - a run on another thread runs normally;
+  - a failing claim ends with `ThreadError` and isn't reported;
+  - a cancelled request-scoped run releases the thread; the commit logs show `claim` first and `release` after `runEnded`;
+  - a `RunInputMismatch` run neither claims nor is reported;
+  - a crashed detached run keeps the thread busy until it is started again and ends.
+- [x] 8.3 Docs: the README's Threads section (one run at a time, claim expiry, re-entrancy), the detached-runs caveat, the custom `Thread` store example and the error list; `packages/effentic/AGENTS.md`'s `Thread.ts` and `Runner.ts` entries and an invariant.

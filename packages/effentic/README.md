@@ -185,7 +185,7 @@ Pick a runner by what should happen when the client goes away:
 
 Guarantees for every runner:
 
-- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `ThreadError`, a provider error such as `RateLimitError`, …).
+- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `ThreadBusy`, `ThreadError`, a provider error such as `RateLimitError`, …).
 - **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, tool calls and steps are always closed, including when a run fails mid-message.
 
 What a client sees for a tool-using reply:
@@ -248,7 +248,13 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 - a stored tool call that never got a result is answered with a failed result;
 - tool results are placed directly after their calls.
 
-**Compaction is up to you.** To summarise a long thread, return a summary entry from `load` in place of the history it covers. `runEnded` is called once per run, after the last commit, however the run ended (success, approval interrupt or failure, even one before the model is called), which makes it a natural place to trigger compaction. The one exception is a run that was cancelled, such as a request-scoped run whose client disconnected: it hasn't ended, and running it again finishes it.
+**One run at a time.** A thread has at most one active run, because each run reconciles the client against what it loaded and commits on top of it. Every runner claims the thread (`Thread.claim`) before loading it, and a run started while another is active ends at once with `RUN_ERROR` code `ThreadBusy`, without touching the thread. The claim is released after the run's last commit and before its `RUN_FINISHED` / `RUN_ERROR` is sent, so a client can start the next run as soon as it sees the last one end. `HttpAgent` already runs one run at a time per agent, so `ThreadBusy` usually means a second tab or a run that is still going in the background.
+
+- A request-scoped run (`run` / `make`) that is cancelled releases the thread.
+- A detached or workflow run that crashes keeps it: the thread stays busy until the run is resumed and ends. A durable store should expire a claim after longer than any run takes, so a crashed run that is never resumed doesn't hold its thread for ever.
+- The same run claims again when it resumes, so starting the same run twice at once is not prevented.
+
+**Compaction is up to you.** To summarise a long thread, return a summary entry from `load` in place of the history it covers. `runEnded` is called once per run that claimed the thread, after the last commit and while the run still holds the thread, however the run ended (success, approval interrupt or failure, even one before the model is called), which makes it a natural place to trigger compaction. A run rejected before claiming the thread (`ThreadBusy`, `RunInputMismatch`) is not reported. Nor is a run that was cancelled, such as a request-scoped run whose client disconnected: it hasn't ended, and running it again finishes it.
 
 `load` is also what each run reconciles the client against, so a compacted thread must keep:
 
@@ -385,7 +391,7 @@ Calling `start` again with the same input and context completes a crashed attemp
 - otherwise it closes whatever the earlier attempt left open in the log and continues;
 - steps replayed from the checkpoint store publish no events.
 
-Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision is up to you, and the same run must not be started twice concurrently.
+Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision is up to you, and the same run must not be started twice concurrently. A crashed run keeps its thread claimed, so other runs on the thread fail with `ThreadBusy` until you start it again and it ends.
 
 ### Workflow runs
 
@@ -488,7 +494,7 @@ To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`
 
 Each plane is a `Context.Service`. Implement it with your store and provide it as a layer.
 
-**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. If `load` returns a compacted thread, it must keep what runs reconcile against ([Threads](#threads)).
+**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. If `load` returns a compacted thread, it must keep what runs reconcile against ([Threads](#threads)). `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
 
 ```ts
 const ThreadLive = Layer.effect(
@@ -498,9 +504,13 @@ const ThreadLive = Layer.effect(
     return Thread.Thread.of({
       // entries in commit order; [] for an unknown thread
       load: (threadId) => db.loadEntries(threadId),
+      // set active_run_id when it is null, already runId, or expired; else fail with ThreadBusy
+      claim: (threadId, runId) => db.claimThread(threadId, runId),
+      // clear active_run_id if it is runId
+      release: (threadId, runId) => db.releaseThread(threadId, runId),
       // append each entry whose id is not stored yet, in order
       commit: (threadId, runId, entries) => db.appendNew(threadId, entries),
-      // once per run, after its last commit: a hook for compaction or bookkeeping
+      // once per run that claimed the thread, after its last commit: a hook for compaction or bookkeeping
       runEnded: (threadId, runId, outcome) => Effect.void,
     });
   }),
@@ -530,7 +540,7 @@ Everything is exported from `"effentic"` as namespaces.
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
 | `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                                    |
 | `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowPayload`, `RunInputMismatch`                                  |
-| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `layerMemory`                                                                              |
+| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |
 | `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use                      |

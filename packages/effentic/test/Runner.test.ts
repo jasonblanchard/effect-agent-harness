@@ -1,6 +1,6 @@
 import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Layer, Schema, Scope, Stream } from "effect";
+import { Deferred, Effect, Exit, Fiber, Layer, Schema, Scope, Stream } from "effect";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
@@ -58,12 +58,13 @@ const clientHistoryAfterWeatherTurn: ReadonlyArray<AgUi.Message> = [
 ];
 
 /**
- * Wraps the in-memory store, logging every call; `rewrite` replaces what a
- * thread loads. `failCommit` and `failRunEnded` make those calls fail after
- * logging them.
+ * Wraps the in-memory store, logging every call but `load`; `rewrite` replaces
+ * what a thread loads. `failClaim`, `failCommit` and `failRunEnded` make those
+ * calls fail after logging them.
  */
 const spyThread = (
   options: {
+    readonly failClaim?: boolean;
     readonly failCommit?: (ids: ReadonlyArray<string>) => boolean;
     readonly failRunEnded?: boolean;
   } = {},
@@ -80,6 +81,16 @@ const spyThread = (
           const entries = rewritten.get(threadId);
           return entries === undefined ? inner.load(threadId) : Effect.succeed(entries);
         },
+        claim: (threadId, runId) =>
+          Effect.suspend(() => {
+            log.push(`claim ${runId}`);
+            return options.failClaim === true ? dbDown() : inner.claim(threadId, runId);
+          }),
+        release: (threadId, runId) =>
+          Effect.suspend(() => {
+            log.push(`release ${runId}`);
+            return inner.release(threadId, runId);
+          }),
         commit: (threadId, runId, entries) =>
           Effect.suspend(() => {
             const ids = entries.map((e) => e.id);
@@ -168,6 +179,8 @@ describe("Runner.run", () => {
       const model = scriptedModel([]);
       const failing = Layer.succeed(Thread.Thread)({
         load: () => Effect.fail(new Thread.ThreadError({ cause: new Error("db down") })),
+        claim: () => Effect.void,
+        release: () => Effect.void,
         commit: () => Effect.void,
         runEnded: () => Effect.void,
       });
@@ -204,7 +217,14 @@ describe("Runner.run commits", () => {
       yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      expect(spy.log).toEqual(["commit r1: u1", "commit r1: id-1,id-2", "commit r1: id-3", "runEnded r1: Success"]);
+      expect(spy.log).toEqual([
+        "claim r1",
+        "commit r1: u1",
+        "commit r1: id-1,id-2",
+        "commit r1: id-3",
+        "runEnded r1: Success",
+        "release r1",
+      ]);
     }),
   );
 
@@ -220,7 +240,7 @@ describe("Runner.run commits", () => {
         expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ModelStreamError" });
         expect((yield* loadThread).map((e) => e.id)).toEqual(["u1", "id-1", "id-2"]);
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
-      expect(spy.log.at(-1)).toBe("runEnded r1: Failed ModelStreamError");
+      expect(spy.log.slice(-2)).toEqual(["runEnded r1: Failed ModelStreamError", "release r1"]);
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toHaveLength(1);
     }),
   );
@@ -234,7 +254,13 @@ describe("Runner.run commits", () => {
       yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Email Ada")])]).pipe(
         Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, spy.layer]),
       );
-      expect(spy.log).toEqual(["commit r1: u1", "commit r1: id-1", "runEnded r1: Interrupted"]);
+      expect(spy.log).toEqual([
+        "claim r1",
+        "commit r1: u1",
+        "commit r1: id-1",
+        "runEnded r1: Interrupted",
+        "release r1",
+      ]);
     }),
   );
 
@@ -262,7 +288,13 @@ describe("Runner.run commits", () => {
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
       expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ThreadError" });
-      expect(spy.log).toEqual(["commit r1: u1", "commit r1: id-1,id-2", "runEnded r1: Failed ThreadError"]);
+      expect(spy.log).toEqual([
+        "claim r1",
+        "commit r1: u1",
+        "commit r1: id-1,id-2",
+        "runEnded r1: Failed ThreadError",
+        "release r1",
+      ]);
     }),
   );
 
@@ -287,7 +319,8 @@ describe("Runner.run commits", () => {
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      expect(spy.log).toEqual(["commit r1: u1"]);
+      // Not reported, since it has not ended, but the request-scoped runner frees the thread.
+      expect(spy.log).toEqual(["claim r1", "commit r1: u1", "release r1"]);
     }),
   );
 
@@ -302,6 +335,87 @@ describe("Runner.run commits", () => {
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual(["runEnded r1: Failed ModelStreamError"]);
     }),
   );
+});
+
+describe("Runner one run per thread", () => {
+  it.effect("rejects a second run while one is active, without touching the thread", () => {
+    const spy = spyThread();
+    return Effect.gen(function* () {
+      const streaming = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const model = scriptedModel([
+        Stream.fromIterable(text("0", "Hel", "lo")).pipe(
+          Stream.concat(Stream.fromEffectDrain(Deferred.await(release))),
+          Stream.concat(Stream.make(finish("stop"))),
+        ),
+        [...text("0", "Hi again."), finish("stop")],
+      ]);
+      yield* Effect.gen(function* () {
+        const first = yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
+          Stream.tap((event) =>
+            event.type === EventType.TEXT_MESSAGE_CONTENT
+              ? Deferred.succeed(streaming, undefined)
+              : event.type === EventType.RUN_FINISHED
+                ? // The thread is already free when the client sees the end of the run.
+                  Effect.flatMap(Thread.Thread, (thread) => thread.claim("t1", "probe")).pipe(
+                    Effect.andThen(Effect.flatMap(Thread.Thread, (thread) => thread.release("t1", "probe"))),
+                    Effect.orDie,
+                  )
+                : Effect.void,
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(streaming);
+
+        const [busy] = yield* runAgUi(weatherAgent, [
+          input("r2", [userMessage("u1", "hi"), userMessage("u2", "again")]),
+        ]);
+        expect(types(busy!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(busy![1]).toMatchObject({ code: "ThreadBusy" });
+        expect(spy.log.filter((line) => line.includes("r2"))).toEqual(["claim r2"]);
+
+        yield* Deferred.succeed(release, undefined);
+        const firstEvents = Array.from(yield* Fiber.join(first));
+        expect(firstEvents.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+
+        const [retry] = yield* runAgUi(weatherAgent, [
+          input("r3", [
+            userMessage("u1", "hi"),
+            { id: "id-1", role: "assistant", content: "Hello" },
+            userMessage("u2", "again"),
+          ]),
+        ]);
+        expect(retry!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+      expect(model.prompts).toHaveLength(2);
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.layer)));
+  });
+
+  it.effect("runs on different threads at once", () =>
+    Effect.gen(function* () {
+      const thread = yield* Thread.Thread;
+      yield* thread.claim("t1", "r1");
+      const model = scriptedModel([[...text("0", "Hi."), finish("stop")]]);
+      const [events] = yield* runAgUi(weatherAgent, [
+        { threadId: "t2", runId: "r1", messages: [userMessage("u1", "hi")] },
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+      expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory))),
+  );
+
+  it.effect("reports a failing claim in-band, and not to the store", () => {
+    const spy = spyThread({ failClaim: true });
+    return Effect.gen(function* () {
+      const model = scriptedModel([]);
+      const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
+        Effect.provide([model.layer, countingWeatherLayer().layer]),
+      );
+      expect(types(events!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(events![1]).toMatchObject({ code: "ThreadError" });
+      expect(spy.log).toEqual(["claim r1"]);
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.layer)));
+  });
 });
 
 describe("Runner.run approvals", () => {
@@ -519,6 +633,11 @@ describe("Runner.run run ids", () => {
       expect(again![1]).toMatchObject({ code: "RunInputMismatch" });
       expect((yield* loadThread).map((entry) => entry.id)).not.toContain("u2");
       expect(spy.log.filter((line) => line.startsWith("commit")).at(-1)).not.toContain("u2");
+      // The rejected run never claimed the thread, so it is not reported either.
+      expect(spy.log.filter((line) => line.startsWith("claim") || line.startsWith("runEnded"))).toEqual([
+        "claim r1",
+        "runEnded r1: Success",
+      ]);
     }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), spy.layer)));
   });
 });
@@ -617,6 +736,31 @@ describe("Runner.makeDetached", () => {
       expect(after[2]).toEqual({ type: EventType.STEP_STARTED, stepName: "step-2" });
       expect(after[3]).toMatchObject({ messageId: "id-4" });
       yield* Effect.promise(() => verify([...before.map((s) => s.event), ...after]));
+    }).pipe(Effect.provide(shared())),
+  );
+
+  it.effect("keeps the thread claimed by a crashed run until it is completed", () =>
+    Effect.gen(function* () {
+      const crashed = yield* Scope.make();
+      yield* start(crashed, [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))]);
+      const log = yield* EventLog.EventLog;
+      yield* log.subscribe("t1", "r1").pipe(
+        Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT),
+        Stream.runDrain,
+      );
+      yield* Scope.close(crashed, Exit.void);
+
+      const other = input("r2", [userMessage("u1", "Weather in Paris?"), userMessage("u2", "And London?")]);
+      const busy = (model: ReturnType<typeof scriptedModel>) =>
+        runAgUi(weatherAgent, [other]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+      const [rejected] = yield* busy(scriptedModel([]));
+      expect(rejected!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ThreadBusy" });
+
+      yield* start(yield* Scope.make(), [[...text("0", "18°C"), finish("stop")]]);
+      yield* subscribe();
+      const thread = yield* Thread.Thread;
+      yield* thread.claim("t1", "probe");
+      yield* thread.release("t1", "probe");
     }).pipe(Effect.provide(shared())),
   );
 

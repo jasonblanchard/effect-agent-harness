@@ -151,6 +151,26 @@ The thread still can't get stuck: `status: "cancelled"` is the explicit way to g
 
 - *Alternative rejected:* resolve the answered approvals and end `Interrupted` again with the rest. AG-UI allows it, but it raises questions the rejection avoids: whether a new user message in the same run is committed after a call with no result, how to emit the still-open interrupts again with their original ids, and how a partial step 0 counts against the step limit. A missing answer is a client defect, and the clearest response to it is a specific error.
 
+### 11. One active run per thread, claimed in the thread store
+
+Each run loads the thread, reconciles the client against it and commits on top of it, and `commit` has no expected version. Two runs on one thread at once (a second tab, or a detached run still going when the user posts again) each plan against their own snapshot, and their commits interleave into a history neither of them produced. Rather than add optimistic versions to `load`/`commit` and teach every runner to retry, a thread has at most one active run, and the library enforces it.
+
+The claim lives in the `Thread` store, because that is the state every runner and every process shares:
+
+```ts
+readonly claim: (threadId: string, runId: string) => Effect<void, ThreadBusy | ThreadError>; // free, or already this run
+readonly release: (threadId: string, runId: string) => Effect<void, ThreadError>; // only if this run holds it
+```
+
+- **Where the pipeline claims:** after the `input` check (decision 9) and before `load`. A run rejected before the claim (`RunInputMismatch`, `ThreadBusy`, a failing claim) ends with `RUN_ERROR` and is not reported to `runEnded`: it never held the thread, and reporting it would trigger compaction hooks while another run is active. This changes the `durable-agent-planes` rule that every failure is reported.
+- **Where it releases:** after `runEnded`, even if `runEnded` failed, and before the terminal event is emitted. A client that starts its next run as soon as it sees `RUN_FINISHED` therefore finds the thread free. If the release fails, the run fails with `ThreadError`, as a failing `runEnded` does.
+- **Re-entrant for the same run.** A resumed run claims again, so crash recovery under `makeDetached` and `workflow` works unchanged. The cost is that the same run started twice at once is not prevented, which the docs already forbid.
+- **Interruption.** `run`/`make` release a run whose stream stops before its terminal event, because nothing resumes a cancelled request. Detached and workflow runs keep the claim when interrupted, because they are meant to be resumed. A crashed run that is never resumed would hold its thread for ever, so the docs tell durable stores to expire claims after longer than any run takes. The in-memory store needs no expiry: its claims die with the process.
+- **`HttpAgent` already runs one run at a time** per agent instance, so a well-behaved single-tab client never sees `ThreadBusy`.
+
+- *Alternative rejected:* optimistic concurrency (`load → { entries, version }`, `commit(…, expectedVersion)`). It detects the conflict only at commit time, after the model has been called and tools may have run, and leaves the runner to decide what to do with a half-finished run.
+- *Alternative rejected:* an in-process lock in the runner. It doesn't hold across processes or across separate runner instances.
+
 ## Risks / Trade-offs
 
 - [A system prompt that changes every run defeats prefix prompt caching on long threads, because it is the first thing in the prompt] → Document it, recommend keeping changing values small and few, and leave the stable/changing split as the follow-up named in the proposal.

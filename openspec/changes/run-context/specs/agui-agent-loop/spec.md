@@ -64,6 +64,25 @@ The projection of the thread taken at the start of a run SHALL be memoised under
 - **WHEN** a run is re-executed with a ledger-backed checkpoint store after the thread was rewritten
 - **THEN** the model prompt for the remaining steps is built from the original projection
 
+### Requirement: Run-ended notification
+The agent SHALL notify the thread store once when a run that claimed its thread ends, after its last commit, with the outcome kind: success, interrupted or failed. Failures anywhere in the run after the claim SHALL be notified, including failures before the model is called and a failing commit. A run that fails before claiming the thread (`RunInputMismatch`, `ThreadBusy`, a failing claim) SHALL NOT be notified. If the notification itself fails, a run that succeeded or was interrupted SHALL end with `RUN_ERROR` whose `code` is `ThreadError`, and a run that already failed SHALL keep its own error code.
+
+#### Scenario: Interrupted run
+- **WHEN** a run ends with an approval interrupt
+- **THEN** the store is notified with the interrupted outcome after the step's entries were committed
+
+#### Scenario: Commit fails mid-run
+- **WHEN** committing step 1's entries fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError`, and the store is notified once with the failed outcome and that code
+
+#### Scenario: Notification fails after success
+- **WHEN** a run finishes successfully and the run-ended notification fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` instead of `RUN_FINISHED`
+
+#### Scenario: Claim fails
+- **WHEN** claiming the thread fails with `ThreadError`
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` and the store is not notified
+
 ## ADDED Requirements
 
 ### Requirement: Run info from the AG-UI input and the caller
@@ -99,3 +118,27 @@ Everything the runner stores for a run SHALL be scoped by the input's thread id 
 #### Scenario: Same input executed again
 - **WHEN** a run is interrupted and executed again on the same thread with the same input
 - **THEN** it continues from its stored steps
+
+### Requirement: One active run per thread
+Every runner SHALL claim the input's thread after checking the input against its run id and before loading the thread, and SHALL release the claim after the run-ended notification and before emitting the terminal event, so a client's next run after `RUN_FINISHED` or `RUN_ERROR` finds the thread free. A run whose claim fails SHALL end with `RUN_ERROR` carrying the claim's error code (`ThreadBusy` when another run is active) without loading or committing anything. A request-scoped run that is cancelled before its terminal event SHALL release its claim. A detached or workflow run that is interrupted SHALL keep its claim, so the thread stays busy until the run is resumed and ends.
+
+#### Scenario: Second run while one is streaming
+- **WHEN** run "r1" on thread "t1" is streaming and run "r2" is started on "t1"
+- **THEN** "r2" ends with `RUN_STARTED` then `RUN_ERROR` with code `ThreadBusy`, commits nothing and is not reported to the store, and "r1" finishes normally
+
+#### Scenario: Free when the client sees the end
+- **WHEN** a client observes `RUN_FINISHED` for "r1"
+- **THEN** another run can claim "t1" at that moment
+
+#### Scenario: Cancelled request
+- **WHEN** a request-scoped run is cancelled because its consumer stopped
+- **THEN** its claim is released
+
+#### Scenario: Crashed detached run
+- **WHEN** a detached run's scope is closed mid-step and another run is started on its thread
+- **THEN** the other run ends with `ThreadBusy`, and after the detached run is started again and finishes, the thread is free
+
+#### Scenario: Different threads
+- **WHEN** a run holds thread "t1"
+- **THEN** a run on thread "t2" runs normally
+

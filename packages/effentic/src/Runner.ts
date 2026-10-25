@@ -47,22 +47,36 @@ const failed = (cause: Cause.Cause<unknown>): Agent.Event => {
   return { _tag: "Failed", error, code: Agent.errorCode(error) };
 };
 
+/** Ends the stream with a `Failed` event instead of failing it. Interruption passes through. */
+const failInBand = <R>(stream: Stream.Stream<Agent.Event, unknown, R>): Stream.Stream<Agent.Event, never, R> =>
+  Stream.catchCause(stream, (cause) =>
+    Cause.hasInterruptsOnly(cause)
+      ? // An interrupt-only cause has no failures, so its error type is irrelevant.
+        Stream.failCause(cause as Cause.Cause<never>)
+      : Stream.make(failed(cause)),
+  );
+
 /**
- * Calls `runEnded` for a terminal event. If the store fails, a successful or
- * interrupted run ends as failed instead; a run that already failed keeps its
- * own error.
+ * For a terminal event, calls `runEnded` and then releases the thread, even if
+ * `runEnded` failed. If either fails, a successful or interrupted run ends as
+ * failed instead; a run that already failed keeps its own error.
  */
-const reportEnd = (
+const endRun = (
   threadId: string,
   runId: string,
   event: Extract<Agent.Event, { readonly _tag: "Finished" | "Failed" }>,
 ): Effect.Effect<Agent.Event, never, Thread.Thread> =>
   Effect.flatMap(Thread.Thread, (thread) =>
-    thread.runEnded(
-      threadId,
-      runId,
-      event._tag === "Finished" ? { _tag: event.outcome._tag } : { _tag: "Failed", code: event.code },
-    ),
+    thread
+      .runEnded(
+        threadId,
+        runId,
+        event._tag === "Finished" ? { _tag: event.outcome._tag } : { _tag: "Failed", code: event.code },
+      )
+      .pipe(
+        Effect.exit,
+        Effect.flatMap((ended) => Effect.andThen(thread.release(threadId, runId), ended)),
+      ),
   ).pipe(
     Effect.as<Agent.Event>(event),
     Effect.catchCause((cause) =>
@@ -77,22 +91,29 @@ const reportEnd = (
  * One AG-UI run over the server-owned thread:
  *
  * 1. check that the input is the one the run id was first used with
- *    (memoised as the `input` checkpoint), then load the thread, take the client's delta and its `resume` answers, and
+ *    (memoised as the `input` checkpoint), and claim the thread, so it has
+ *    one active run;
+ * 2. load the thread, take the client's delta and its `resume` answers, and
  *    commit them;
- * 2. project the thread, memoised as the `prompt` checkpoint so a resumed run
+ * 3. project the thread, memoised as the `prompt` checkpoint so a resumed run
  *    uses the projection the crashed attempt used;
- * 3. run the agent with the run's info (the input's ids and `forwardedProps`,
+ * 4. run the agent with the run's info (the input's ids and `forwardedProps`,
  *    and the caller's context), committing each step's entries as it finishes;
- * 4. tell the store the run ended, however it ended;
- * 5. project the events onto AG-UI.
+ * 5. tell the store the run ended, however it ended, and release the thread
+ *    before the terminal event is emitted, so the client's next run finds it
+ *    free;
+ * 6. project the events onto AG-UI.
  *
  * Every checkpoint is scoped by the thread id as well as the run id, so a run
  * id the client reuses on another thread replays nothing.
  *
  * Failures, including those before the model is called (`ThreadError`,
- * `HistoryMismatch`, `UnansweredInterrupt`, `RunInputMismatch`), end the stream with `RUN_ERROR`, so it never fails.
- * Only an interrupted run (e.g. a cancelled request) is not reported to the
- * store, since it has not ended: running it again finishes it.
+ * `HistoryMismatch`, `UnansweredInterrupt`, `RunInputMismatch`,
+ * `ThreadBusy`), end the stream with `RUN_ERROR`, so it never fails. A run
+ * that never claimed the thread is not reported to the store. Nor is an
+ * interrupted run (e.g. a cancelled request), since it has not ended: it keeps
+ * its claim, and running it again finishes it. The request-scoped runners
+ * release a cancelled run's claim themselves.
  */
 const pipeline =
   <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) =>
@@ -101,6 +122,41 @@ const pipeline =
     runOptions?: RunOptions,
   ): Stream.Stream<AgUi.Event, never, Agent.Requirements<Tools, R> | Thread.Thread> => {
     const { threadId, runId } = input;
+    // Runs while the run holds the thread.
+    const claimed = (thread: Thread.Thread["Service"], checkpoint: Checkpoint.Checkpoint["Service"]) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const stored = yield* thread.load(threadId);
+          const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
+          const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
+          // Answers to the previous run come before anything new the client says.
+          const added = [...responses, ...Messages.ingest(delta, { clientSystem: options?.clientSystem })];
+          yield* thread.commit(threadId, runId, added);
+          const prompt = yield* checkpoint.memo(
+            { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
+            Effect.sync(() => Messages.project([...stored, ...added])),
+          );
+
+          return Agent.run(agent)({
+            runId,
+            threadId,
+            props: input.forwardedProps,
+            context: runOptions?.context,
+            prompt: prompt.value,
+          }).pipe(
+            Stream.tap((event) =>
+              event._tag === "StepFinished" ? thread.commit(threadId, runId, event.entries) : Effect.void,
+            ),
+          );
+        }),
+      ).pipe(
+        failInBand,
+        // After the catch, so a run that failed anywhere above is reported too.
+        Stream.mapEffect((event) =>
+          event._tag === "Finished" || event._tag === "Failed" ? endRun(threadId, runId, event) : Effect.succeed(event),
+        ),
+      );
+
     const events = Stream.unwrap(
       Effect.gen(function* () {
         const thread = yield* Thread.Thread;
@@ -113,43 +169,10 @@ const pipeline =
         if (first.value !== fingerprint) {
           return yield* new RunInputMismatch();
         }
-        const stored = yield* thread.load(threadId);
-        const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
-        const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
-        // Answers to the previous run come before anything new the client says.
-        const added = [...responses, ...Messages.ingest(delta, { clientSystem: options?.clientSystem })];
-        yield* thread.commit(threadId, runId, added);
-        const prompt = yield* checkpoint.memo(
-          { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
-          Effect.sync(() => Messages.project([...stored, ...added])),
-        );
-
-        return Agent.run(agent)({
-          runId,
-          threadId,
-          props: input.forwardedProps,
-          context: runOptions?.context,
-          prompt: prompt.value,
-        }).pipe(
-          Stream.tap((event) =>
-            event._tag === "StepFinished" ? thread.commit(threadId, runId, event.entries) : Effect.void,
-          ),
-        );
+        yield* thread.claim(threadId, runId);
+        return claimed(thread, checkpoint);
       }),
-    ).pipe(
-      Stream.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? // An interrupt-only cause has no failures, so its error type is irrelevant.
-            Stream.failCause(cause as Cause.Cause<never>)
-          : Stream.make(failed(cause)),
-      ),
-      // After the catch, so a run that failed anywhere above is reported too.
-      Stream.mapEffect((event) =>
-        event._tag === "Finished" || event._tag === "Failed"
-          ? reportEnd(threadId, runId, event)
-          : Effect.succeed(event),
-      ),
-    );
+    ).pipe(failInBand);
     return AgUi.fold(input)(events).pipe(Stream.withSpan("effentic/Runner.run", { attributes: { threadId, runId } }));
   };
 
@@ -158,8 +181,33 @@ const pipeline =
  * consumer stops reading (a client disconnects, `abortRun()`), the run is
  * cancelled, including any model request or tool call in progress.
  */
-export const run = <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) =>
-  pipeline(agent, options);
+export const run = <Tools extends Record<string, Tool.Any>, R>(agent: Agent.Agent<Tools, R>, options?: Options) => {
+  const runWith = pipeline(agent, options);
+  return (input: AgUi.RunAgentInput, runOptions?: RunOptions) =>
+    Stream.suspend(() => {
+      // A run that ended has released its thread. Nothing resumes a cancelled
+      // request-scoped run, so a stream that stops before the end frees it.
+      let ended = false;
+      return runWith(input, runOptions).pipe(
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            ended ||= AgUi.isTerminal(event);
+          }),
+        ),
+        Stream.ensuring(
+          Effect.suspend(() =>
+            ended
+              ? Effect.void
+              : Effect.flatMap(Thread.Thread, (thread) => thread.release(input.threadId, input.runId)).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError("effentic: releasing a cancelled run's thread failed", cause),
+                  ),
+                ),
+          ),
+        ),
+      );
+    });
+};
 
 /**
  * Captures the services once and returns a request-scoped runner whose
@@ -176,7 +224,7 @@ export const make = <Tools extends Record<string, Tool.Any>, R>(
   Agent.Requirements<Tools, R> | Thread.Thread
 > =>
   Effect.map(Effect.context<Agent.Requirements<Tools, R> | Thread.Thread>(), (context) => {
-    const runWith = pipeline(agent, options);
+    const runWith = run(agent, options);
     return (input, runOptions) => runWith(input, runOptions).pipe(Stream.provideContext(context));
   });
 
