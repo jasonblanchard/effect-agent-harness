@@ -1,5 +1,5 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "printWidth": 120,
-  "ignorePatterns": ["pnpm-lock.yaml", "openspec/**", ".claude/**"]
+  "ignorePatterns": ["pnpm-lock.yaml", "openspec/**", ".claude/**", "**/routeTree.gen.ts"]
 }

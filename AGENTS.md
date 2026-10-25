@@ -4,6 +4,7 @@ Effect-based AG-UI agent library. pnpm monorepo:
 
 - `packages/effentic` — the library (`Agent`, `AgUi`, `Messages`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Sse` modules). See its `AGENTS.md`.
 - `packages/examples/ag-ui` — a runnable example wiring the library to Anthropic. See its `AGENTS.md`.
+- `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effentic backend. See its `AGENTS.md`.
 - `openspec/` — spec-driven change proposals (see "Planning changes" below).
 
 ## Commands
