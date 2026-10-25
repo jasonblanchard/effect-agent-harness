@@ -168,10 +168,13 @@ Tool tips:
 
 `Runner` connects an agent to AG-UI. All runners do the same work for each run:
 
-1. Load the thread from the `Thread` store.
-2. Take the new messages from the client, plus its answers to the previous run's interrupts.
-3. Run the agent with the run's info (below), committing each finished step to the thread.
-4. Emit AG-UI events.
+1. Check the input against what was stored for its run id (`RunInputMismatch` if it differs), and claim the thread (`ThreadBusy` if another run is active). See [Threads](#threads).
+2. Load the thread from the `Thread` store.
+3. Take the new messages from the client, plus its answers to the previous run's interrupts (every open one must be answered).
+4. Run the agent with the run's info (below), committing each finished step to the thread.
+5. Report the run's end to the store (`runEnded`) and release the thread, then emit the terminal event.
+
+AG-UI events are emitted throughout.
 
 Pick a runner by what should happen when the client goes away:
 
@@ -185,7 +188,7 @@ Pick a runner by what should happen when the client goes away:
 
 Guarantees for every runner:
 
-- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `ThreadBusy`, `ThreadError`, a provider error such as `RateLimitError`, …).
+- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `UnansweredInterrupt`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, a provider error such as `RateLimitError`, …).
 - **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, tool calls and steps are always closed, including when a run fails mid-message.
 
 What a client sees for a tool-using reply:
@@ -424,7 +427,7 @@ The payload (`Runner.WorkflowPayload`: the input and the context) is what the en
 
 ## Reconnecting to a run
 
-The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` returns the stored events after `after`, then live events, and completes after the terminal event. `Sse.encodeStored` turns cursors into SSE `id`s, so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
+The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` checks `after` and then returns a stream of the stored events after it, then live events, which completes after the terminal event (at once if `after` is already at or past it). A cursor the run's log never issued, such as a malformed `Last-Event-ID`, fails `subscribe` with `InvalidCursor` before any response starts, so the route can answer 400 instead of streaming nothing. `Sse.encodeStored` turns cursors into SSE `id`s, so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
 
 ```ts
 yield *
@@ -441,11 +444,15 @@ yield *
       const headers = yield* HttpServerRequest.schemaHeaders(
         Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
       );
-      return HttpServerResponse.stream(
-        Sse.encodeStored(log.subscribe(threadId, runId, headers["last-event-id"])).pipe(Stream.encodeText),
-        { contentType: Sse.contentType },
-      );
-    }),
+      const events = yield* log.subscribe(threadId, runId, headers["last-event-id"]);
+      return HttpServerResponse.stream(Sse.encodeStored(events).pipe(Stream.encodeText), {
+        contentType: Sse.contentType,
+      });
+    }).pipe(
+      Effect.catchTag("InvalidCursor", (error) =>
+        Effect.succeed(HttpServerResponse.text(error.message, { status: 400 })),
+      ),
+    ),
   );
 ```
 
@@ -544,7 +551,7 @@ const LedgerLive = Layer.succeed(Checkpoint.Ledger)({
 const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 ```
 
-**Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
+**Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must check the cursor before returning its stream (failing with `InvalidCursor` for one the run's log never issued), deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`, including at once when the cursor is at or past it. `read` rejects unknown cursors the same way. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
 
 ## Module reference
 
@@ -553,10 +560,10 @@ Everything is exported from `"effentic"` as namespaces.
 | Module       | Main exports                                                                                                                               |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors  |
 | `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowOptions`, `WorkflowPayload`, `RunInputMismatch`               |
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                      |
 | `Messages`   | `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use  |
 | `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                     |

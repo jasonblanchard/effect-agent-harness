@@ -252,7 +252,10 @@ const detached =
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const append = (event: AgUi.Event) => log.append(input.threadId, input.runId, event);
-      const history = (yield* log.read(input.threadId, input.runId)).map((stored) => stored.event);
+      // Without a cursor, the read cannot fail with `InvalidCursor`.
+      const history = (yield* log
+        .read(input.threadId, input.runId)
+        .pipe(Effect.catchTag("InvalidCursor", Effect.die))).map((stored) => stored.event);
       const last = history.at(-1);
       if (last !== undefined && AgUi.isTerminal(last)) {
         return;

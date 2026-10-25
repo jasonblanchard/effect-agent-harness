@@ -687,7 +687,7 @@ describe("Runner.makeDetached", () => {
     });
 
   const subscribe = (after?: string) =>
-    Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("t1", "r1", after)));
+    Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1", after))));
 
   it.effect("makes the run observable through the event log", () =>
     Effect.gen(function* () {
@@ -717,7 +717,7 @@ describe("Runner.makeDetached", () => {
         ),
       ]);
       const log = yield* EventLog.EventLog;
-      const firstThree = yield* Stream.runCollect(log.subscribe("t1", "r1").pipe(Stream.take(3)));
+      const firstThree = yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")).pipe(Stream.take(3)));
       expect(firstThree).toHaveLength(3);
       yield* Deferred.succeed(release, undefined);
       const all = (yield* subscribe()).map((s) => s.event);
@@ -735,7 +735,7 @@ describe("Runner.makeDetached", () => {
         weatherTurn[0]!,
         Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never)),
       ]);
-      yield* log.subscribe("t1", "r1").pipe(
+      yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
         Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT && s.event.messageId === "id-3"),
         Stream.runDrain,
       );
@@ -770,7 +770,7 @@ describe("Runner.makeDetached", () => {
       const crashed = yield* Scope.make();
       yield* start(crashed, [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))]);
       const log = yield* EventLog.EventLog;
-      yield* log.subscribe("t1", "r1").pipe(
+      yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
         Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT),
         Stream.runDrain,
       );
@@ -824,7 +824,7 @@ describe("Runner.workflow", () => {
       const events = yield* Effect.gen(function* () {
         yield* workflow.execute({ input: run1 }, { discard: true });
         const log = yield* EventLog.EventLog;
-        const first = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((s) => s.event);
+        const first = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
         // Executing the same run id again joins the finished execution.
         yield* workflow.execute({ input: run1 });
         expect((yield* log.read("t1", "r1")).map((s) => s.event)).toEqual(first);
@@ -896,7 +896,7 @@ describe("Runner.workflow", () => {
         yield* workflow.execute({ input: run1 });
         yield* workflow.execute({ input: { ...run1, threadId: "t2" } });
         for (const threadId of ["t1", "t2"]) {
-          const events = (yield* Stream.runCollect(log.subscribe(threadId, "r1"))).map((s) => s.event);
+          const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe(threadId, "r1")))).map((s) => s.event);
           yield* Effect.promise(() => verify(events));
           expect(events[0]).toMatchObject({ type: EventType.RUN_STARTED, threadId, runId: "r1" });
         }
@@ -1047,7 +1047,7 @@ describe("Runner run info", () => {
       );
       yield* runner.start(input("r1", [userMessage("u1", "hi")]), { context: { userId: "u1" } });
       const log = yield* EventLog.EventLog;
-      const events = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((stored) => stored.event);
+      const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((stored) => stored.event);
       yield* Effect.promise(() => verify(events));
       expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory, EventLog.layerMemory))),
@@ -1061,7 +1061,9 @@ describe("Runner run info", () => {
       yield* Effect.gen(function* () {
         yield* workflow.execute(payload, { discard: true });
         const log = yield* EventLog.EventLog;
-        const events = (yield* Stream.runCollect(log.subscribe("t1", "r1"))).map((stored) => stored.event);
+        const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map(
+          (stored) => stored.event,
+        );
         yield* Effect.promise(() => verify(events));
         // Executing the same run id again joins the finished execution.
         yield* workflow.execute(payload);

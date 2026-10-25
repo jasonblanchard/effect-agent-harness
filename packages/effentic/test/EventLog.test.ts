@@ -9,7 +9,7 @@ const append = (...events: ReadonlyArray<AgUi.Event>) =>
   Effect.flatMap(EventLog.EventLog, (log) => Effect.forEach(events, (event) => log.append("t1", "r1", event)));
 
 const subscribe = (after?: string) =>
-  Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(log.subscribe("t1", "r1", after)));
+  Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1", after))));
 
 describe("EventLog.layerMemory", () => {
   it.effect("assigns increasing cursors and reads in append order", () =>
@@ -73,11 +73,32 @@ describe("EventLog.layerMemory", () => {
     }).pipe(Effect.provide(EventLog.layerMemory)),
   );
 
+  it.effect("completes at once when reconnecting after the terminal event", () =>
+    Effect.gen(function* () {
+      const [, finished] = yield* append(AgUi.runStarted(input), AgUi.runFinished(input));
+      expect(yield* subscribe(finished!.cursor)).toEqual([]);
+    }).pipe(Effect.provide(EventLog.layerMemory)),
+  );
+
+  it.effect("rejects a cursor the run's log never issued, before streaming anything", () =>
+    Effect.gen(function* () {
+      const log = yield* EventLog.EventLog;
+      yield* append(AgUi.runStarted(input), AgUi.textMessageStart("m1"));
+      for (const cursor of ["abc", "", "-1", "01", "1.0", "2"]) {
+        expect(yield* Effect.flip(log.subscribe("t1", "r1", cursor))).toEqual(new EventLog.InvalidCursor({ cursor }));
+        expect(yield* Effect.flip(log.read("t1", "r1", cursor))).toEqual(new EventLog.InvalidCursor({ cursor }));
+      }
+      expect(yield* Effect.flip(log.subscribe("t1", "unknown", "0"))).toEqual(
+        new EventLog.InvalidCursor({ cursor: "0" }),
+      );
+    }).pipe(Effect.provide(EventLog.layerMemory)),
+  );
+
   it.effect("waits for events when subscribing before the run starts", () =>
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const first = yield* Deferred.make<void>();
-      const fiber = yield* log.subscribe("t1", "r1").pipe(
+      const fiber = yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
         Stream.tap(() => Deferred.succeed(first, undefined)),
         Stream.runCollect,
         Effect.forkChild,

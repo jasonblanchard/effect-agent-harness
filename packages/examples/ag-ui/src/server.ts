@@ -102,9 +102,15 @@ const AgentRoutes = HttpRouter.use((router) =>
           Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
         );
 
-        return sse(Sse.encodeStored(log.subscribe(threadId, runId, lastEventId)));
+        // Fails before the response starts if the cursor was never issued, so
+        // the client gets a 400 instead of a stream that never yields.
+        const events = yield* log.subscribe(threadId, runId, lastEventId);
+        return sse(Sse.encodeStored(events));
       }).pipe(
-        Effect.catchTag("Unauthorized", unauthorized),
+        Effect.catchTags({
+          Unauthorized: unauthorized,
+          InvalidCursor: (error) => Effect.succeed(HttpServerResponse.text(error.message, { status: 400 })),
+        }),
         Effect.orElseSucceed(() => HttpServerResponse.text("Invalid request", { status: 400 })),
       ),
     );
