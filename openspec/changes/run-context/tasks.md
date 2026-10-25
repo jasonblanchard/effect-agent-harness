@@ -91,3 +91,4 @@ Conventions for every task: run from the repo root; `pnpm --filter effentic test
   - a `RunInputMismatch` run neither claims nor is reported;
   - a crashed detached run keeps the thread busy until it is started again and ends.
 - [x] 8.3 Docs: the README's Threads section (one run at a time, claim expiry, re-entrancy), the detached-runs caveat, the custom `Thread` store example and the error list; `packages/effentic/AGENTS.md`'s `Thread.ts` and `Runner.ts` entries and an invariant.
+- [x] 8.4 Make `Runner.workflow` take `WorkflowOptions` (`Options` plus a required `name`) and name the workflow with it (12). Verify in `Runner.test.ts` that two agents with different system prompts, registered on one in-memory engine as "weather" and "brief", each run their own body, and that the test fails when both use the same name. Document the name in the README's workflow section and module reference and in `packages/effentic/AGENTS.md`.

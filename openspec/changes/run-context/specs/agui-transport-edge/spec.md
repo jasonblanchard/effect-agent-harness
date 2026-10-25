@@ -59,7 +59,7 @@ Starting a detached run again with the same thread id and run id SHALL NOT re-ap
 - **THEN** starting again appends nothing and calls no model
 
 ### Requirement: Workflow-backed runner
-The package SHALL provide the run as an `effect/workflow` workflow whose payload is the run's input together with its optional context, and whose idempotency key is made from the thread id and the run id, using workflow activities as the checkpoint store, so a durable engine persists and replays runs. Executing it twice with the same thread id and run id SHALL join the same execution; the same run id on another thread SHALL be a separate execution. A resumed execution SHALL see the context from its payload.
+The package SHALL provide the run as an `effect/workflow` workflow named by a name the caller must supply, whose payload is the run's input together with its optional context, and whose idempotency key is made from the thread id and the run id, using workflow activities as the checkpoint store, so a durable engine persists and replays runs. Executing it twice with the same thread id and run id SHALL join the same execution; the same run id on another thread SHALL be a separate execution. A resumed execution SHALL see the context from its payload. Workflows for different agents registered with one engine under different names SHALL each run their own agent.
 
 #### Scenario: Run inside the in-memory engine
 - **WHEN** a run is executed through the workflow runner with the in-memory workflow engine
@@ -68,6 +68,10 @@ The package SHALL provide the run as an `effect/workflow` workflow whose payload
 #### Scenario: Run id reused on another thread
 - **WHEN** inputs with run id "r1" on threads "t1" and "t2" are each executed through the workflow runner
 - **THEN** each thread's event log holds its own complete run, and the weather handler ran once per thread
+
+#### Scenario: Two agents on one engine
+- **WHEN** workflows for an agent with system prompt "Be helpful." named "weather" and one with "Be brief." named "brief" are registered with one in-memory engine, and each executes a run
+- **THEN** the "weather" run's model calls start with "Be helpful." and the "brief" run's with "Be brief."
 
 #### Scenario: Context in the payload
 - **WHEN** a run is executed through the workflow runner with the context `{ userId: "u1" }`

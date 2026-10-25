@@ -171,6 +171,17 @@ readonly release: (threadId: string, runId: string) => Effect<void, ThreadError>
 - *Alternative rejected:* optimistic concurrency (`load → { entries, version }`, `commit(…, expectedVersion)`). It detects the conflict only at commit time, after the model has been called and tools may have run, and leaves the runner to decide what to do with a half-finished run.
 - *Alternative rejected:* an in-process lock in the runner. It doesn't hold across processes or across separate runner instances.
 
+### 12. The workflow name is required
+
+`Runner.workflow` used the fixed name `"effentic/Run"`. `effect/workflow` registers workflows in a map keyed by name, so a second agent's layer silently replaced the first, and every execution ran whichever registered last. Execution ids are a hash of the name and the idempotency key, so the two agents also shared one key space. The name is persisted with every execution, so changing a default later would leave executions already in flight without a handler.
+
+`Runner.workflow(agent, options)` now requires `WorkflowOptions` (`Options` plus `name`) and uses the name as given.
+
+- **On the runner, not `Agent.define`.** The name identifies stored executions; it isn't part of the agent's behaviour. Evals and request-scoped runs don't need it, and one agent can be deployed as two workflows, such as an old and a new version side by side.
+- **No default,** because a default is how two agents end up sharing a name.
+- **No prefix:** the caller owns the stored identity, and what it passes is what the engine stores.
+- Agents that share a `Thread` store and `EventLog` must still not share thread ids. Both stores key by thread, which the docs say.
+
 ## Risks / Trade-offs
 
 - [A system prompt that changes every run defeats prefix prompt caching on long threads, because it is the first thing in the prompt] → Document it, recommend keeping changing values small and few, and leave the stable/changing split as the follow-up named in the proposal.
@@ -185,5 +196,5 @@ readonly release: (threadId: string, runId: string) => Effect<void, ThreadError>
 1. Archive `durable-agent-planes` first, because this change modifies requirements it introduces.
 2. Custom `Checkpoint.Ledger` and `EventLog` implementations take the thread id as a new first argument and include it in their keys.
 3. Callers of `Agent.run` add `threadId` (and `props`/`context` if wanted) and drop the system message from their prompt. Callers of `Messages.project` drop the first argument.
-4. Callers of `Runner.workflow` execute with `{ input, context }` instead of `input`. Executions already persisted with the old payload shape won't decode, so let them finish before deploying.
+4. Callers of `Runner.workflow` pass a `name` and execute with `{ input, context }` instead of `input`. Executions persisted before the deploy are under `"effentic/Run"`, with the old payload shape, so they would have no handler and wouldn't decode: let them finish first.
 5. Before deploying over durable checkpoint ledgers, event logs or workflow engines, let in-flight runs finish, or give the runs started after the deploy new run ids. Old `prompt` checkpoints must not be resumed by the new code, and old keys lack the thread id, so the new code wouldn't find them anyway.

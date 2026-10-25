@@ -794,7 +794,7 @@ describe("Runner.workflow", () => {
 
       const model = scriptedModel(weatherTurn);
       const weather = countingWeatherLayer();
-      const { workflow, layer } = Runner.workflow(weatherAgent);
+      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
       const events = yield* Effect.gen(function* () {
         yield* workflow.execute({ input: run1 }, { discard: true });
         const log = yield* EventLog.EventLog;
@@ -826,10 +826,45 @@ describe("Runner.workflow", () => {
       expect(model.prompts).toHaveLength(2);
     }),
   );
+  it.effect("runs each agent's own body when two agents share one engine", () =>
+    Effect.gen(function* () {
+      const briefAgent = Agent.define({ toolkit: WeatherToolkit, system: "Be brief." });
+      const model = scriptedModel([
+        [...text("0", "Hi."), finish("stop")],
+        [...text("0", "Hi."), finish("stop")],
+      ]);
+      const weather = Runner.workflow(weatherAgent, { name: "weather" });
+      const brief = Runner.workflow(briefAgent, { name: "brief" });
+      yield* Effect.gen(function* () {
+        yield* weather.workflow.execute({ input: input("r1", [userMessage("u1", "hi")]) });
+        yield* brief.workflow.execute({ input: { threadId: "t2", runId: "r1", messages: [userMessage("u1", "hi")] } });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(weather.layer, brief.layer).pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                model.layer,
+                countingWeatherLayer().layer,
+                counterIds(),
+                Thread.layerMemory,
+                EventLog.layerMemory,
+                WorkflowEngine.layerMemory,
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(model.prompts.map((prompt) => prompt.content[0])).toMatchObject([
+        { role: "system", content: "Be helpful." },
+        { role: "system", content: "Be brief." },
+      ]);
+    }),
+  );
+
   it.effect("runs a run id reused on another thread as its own execution", () =>
     Effect.gen(function* () {
       const weather = countingWeatherLayer();
-      const { workflow, layer } = Runner.workflow(weatherAgent);
+      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
         const log = yield* EventLog.EventLog;
         yield* workflow.execute({ input: run1 });
@@ -995,7 +1030,7 @@ describe("Runner run info", () => {
   it.effect("gives a workflow run the context from its payload, once per run id", () =>
     Effect.gen(function* () {
       const { agent, handlers, byTool } = recordingAgent();
-      const { workflow, layer } = Runner.workflow(agent);
+      const { workflow, layer } = Runner.workflow(agent, { name: "who-am-i" });
       const payload = { input: input("r1", [userMessage("u1", "hi")]), context: { userId: "u1" } };
       yield* Effect.gen(function* () {
         yield* workflow.execute(payload, { discard: true });

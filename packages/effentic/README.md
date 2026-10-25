@@ -398,12 +398,14 @@ Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision i
 To have `effect/workflow` own runs (persisted, resumed after restarts, deduplicated by thread id and run id), use `Runner.workflow`:
 
 ```ts
-const { workflow, layer } = Runner.workflow(agent);
+const { workflow, layer } = Runner.workflow(agent, { name: "support" });
 
 // Register `layer` with your engine (WorkflowEngine.layerMemory in tests,
 // ClusterWorkflowEngine in production), then start runs:
 yield * workflow.execute({ input, context: { principal } }, { discard: true });
 ```
+
+`name` is required. The engine registers the workflow under it, derives execution ids from it and stores it with every execution. Give each agent on an engine its own name: two workflows with the same name replace each other's registration and share execution ids. Don't rename a workflow while it has executions in flight, because they would have no handler to resume them. Agents that share a `Thread` store and `EventLog` must not share thread ids either, since both stores key by thread.
 
 The payload (`Runner.WorkflowPayload`: the input and the context) is what the engine persists, so a resumed execution sees the original context; the context must be JSON-encodable. Executing the same run (same `threadId` and `runId`) again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* workflow.executionId(payload))`.
 
@@ -539,7 +541,7 @@ Everything is exported from `"effentic"` as namespaces.
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
 | `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                                    |
-| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowPayload`, `RunInputMismatch`                                  |
+| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowOptions`, `WorkflowPayload`, `RunInputMismatch`               |
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |

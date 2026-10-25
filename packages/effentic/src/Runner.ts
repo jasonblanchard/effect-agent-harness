@@ -302,6 +302,16 @@ export const makeDetached = <Tools extends Record<string, Tool.Any>, R>(
     };
   });
 
+export interface WorkflowOptions extends Options {
+  /**
+   * The workflow's name. The engine registers the workflow under it, derives
+   * execution ids from it and persists it with every execution, so it must be
+   * unique per engine (one per agent) and must not change while executions
+   * under it are in flight.
+   */
+  readonly name: string;
+}
+
 /** What {@link workflow} persists per run: the AG-UI input and the caller's context. */
 export const WorkflowPayload = Schema.Struct({
   input: AgUi.RunAgentInput,
@@ -311,8 +321,9 @@ export const WorkflowPayload = Schema.Struct({
 /**
  * The run as an `effect/workflow` workflow, keyed by thread id and run id, with workflow
  * activities as checkpoints, so a durable engine (e.g. `ClusterWorkflowEngine`)
- * persists the run and replays it after a crash or deploy. Register `layer`
- * with the engine and start a run with
+ * persists the run and replays it after a crash or deploy. Give it a `name`
+ * unique to this agent ({@link WorkflowOptions}), register `layer` with the
+ * engine, and start a run with
  * `workflow.execute({ input, context }, { discard: true })`; observe it
  * through the {@link EventLog.EventLog}. The payload, context included, is what
  * the engine persists, so a resumed execution sees the original context.
@@ -323,9 +334,9 @@ export const WorkflowPayload = Schema.Struct({
  */
 export const workflow = <Tools extends Record<string, Tool.Any>, R>(
   agent: Agent.Agent<Tools, R>,
-  options?: Options,
+  options: WorkflowOptions,
 ) => {
-  const run = Workflow.make("effentic/Run", {
+  const run = Workflow.make(options.name, {
     payload: WorkflowPayload,
     // JSON, so no choice of ids can make two keys collide.
     idempotencyKey: (payload) => JSON.stringify([payload.input.threadId, payload.input.runId]),
