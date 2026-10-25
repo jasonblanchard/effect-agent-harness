@@ -3,21 +3,23 @@
 ## Purpose
 
 Runs a language-model agent with server-side tools for one AG-UI run. It turns the run input into an AG-UI event stream that a strict AG-UI client accepts, and it works the same way whichever model provider is configured.
-
 ## Requirements
-
 ### Requirement: Run lifecycle
-The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input. `RUN_STARTED` SHALL declare the AG-UI `protocolVersion`, and `RUN_FINISHED` SHALL carry the success outcome. `RUN_ERROR` SHALL carry a `code` naming the kind of failure when one is known.
+The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success or interruption, or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input. `RUN_STARTED` SHALL declare the AG-UI `protocolVersion`, and `RUN_FINISHED` SHALL carry the success outcome or the interrupt outcome. `RUN_ERROR` SHALL carry a `code` naming the kind of failure when one is known.
 
 #### Scenario: Successful run
 - **WHEN** a run is started with `threadId` "t1" and `runId` "r1" and the model replies with text only
 - **THEN** the first event is `RUN_STARTED` with `threadId` "t1" and `runId` "r1"
-- **AND** the last event is `RUN_FINISHED` with `threadId` "t1" and `runId` "r1"
+- **AND** the last event is `RUN_FINISHED` with `threadId` "t1" and `runId` "r1" and outcome type `success`
 
 #### Scenario: Model failure
 - **WHEN** the model request fails partway through a run
 - **THEN** the run ends with a single `RUN_ERROR` event carrying a message
 - **AND** no events follow it
+
+#### Scenario: Failure before the model is called
+- **WHEN** loading the thread fails
+- **THEN** the run emits `RUN_STARTED` followed by `RUN_ERROR` whose `code` is `ThreadError`
 
 ### Requirement: Well-formed spans
 Every `TEXT_MESSAGE_CONTENT` SHALL fall between a `TEXT_MESSAGE_START` and a `TEXT_MESSAGE_END` with the same `messageId`. Every `TOOL_CALL_ARGS` SHALL fall between a `TOOL_CALL_START` and a `TOOL_CALL_END` with the same `toolCallId`. No text message or tool call SHALL be left open when the terminal event is emitted, including when the model stream ends abruptly or the run fails.
@@ -49,7 +51,7 @@ For every tool call the model makes, the agent SHALL emit `TOOL_CALL_START` with
 - **THEN** the tool call's `parentMessageId` equals that step's text `messageId`
 
 ### Requirement: Server-side tool execution and multi-step loop
-The agent SHALL run each tool call against its configured tools and emit a `TOOL_CALL_RESULT` with the result serialized as JSON in `content`. If the model's step ends by requesting tool calls and every call in that step has a result, the agent SHALL send the tool results back to the model and continue with a new step. Otherwise it SHALL finish the run, listing any tool calls the step made without a result in the outcome's `pendingToolCallIds`.
+The agent SHALL run each tool call the model makes against its configured tools, outside the model call and at most once per run and tool call id, and emit a `TOOL_CALL_RESULT` with the result serialized as JSON in `content`. If the model's step ends by requesting tool calls and none of them requires approval, the agent SHALL send the tool results back to the model and continue with a new step. Otherwise it SHALL finish the run.
 
 #### Scenario: Weather question answered with a tool
 - **WHEN** the user asks for the weather in Paris and the model calls "get-weather"
@@ -58,9 +60,13 @@ The agent SHALL run each tool call against its configured tools and emit a `TOOL
 - **AND** the model's follow-up text is streamed before `RUN_FINISHED`
 
 #### Scenario: Tool call without a result
-- **WHEN** the model's step ends by requesting a tool call that no configured tool answers
+- **WHEN** the model's step ends with a tool call and a finish reason other than `tool-calls` or `stop`
 - **THEN** the model is not called again
-- **AND** the run ends with `RUN_FINISHED` whose outcome lists that call in `pendingToolCallIds`
+- **AND** the call receives a failed `TOOL_CALL_RESULT` naming the finish reason, and the run ends with `RUN_FINISHED`
+
+#### Scenario: Tool result after the model stream
+- **WHEN** the model calls "get-weather"
+- **THEN** `TOOL_CALL_END` for that call precedes its `TOOL_CALL_RESULT`, and the handler ran after the model stream ended
 
 ### Requirement: Tool failures are returned to the model
 When a tool handler fails, the agent SHALL report the failure to the model as that tool call's result and emit it as `TOOL_CALL_RESULT`. It SHALL NOT end the run because of the failure.
@@ -99,34 +105,216 @@ The `toolCallId` on `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END` and `TO
 - **WHEN** the model layer reports a tool call with ID "toolu_abc"
 - **THEN** all events for that tool call carry `toolCallId` "toolu_abc"
 
-### Requirement: Conversation history from the client
-The agent SHALL rebuild the model conversation from the run input's `messages` on every run and SHALL NOT keep conversation state between runs. It SHALL convert:
-- system and developer messages into system instructions, only when configured to allow them (they SHALL be dropped by default)
-- user messages with text into user turns
-- assistant messages into assistant turns containing their text and tool calls
-- tool messages into tool results, with the tool name taken from the matching earlier assistant tool call, marked as failed when the message carries an `error`
-
-It SHALL ignore message roles it does not support. A configured system prompt SHALL come before the converted history. Every tool call sent to the model SHALL have a result: a tool call with no tool message before the next user, system or assistant message, or before the end of the history, SHALL be sent with a failed result.
-
-#### Scenario: Follow-up question uses earlier context
-- **WHEN** a second run's `messages` contain the first run's user message, the assistant message with its tool call, the tool message, and a new user message
-- **THEN** the model receives all of them as conversation history, with the tool result linked to its tool call by ID
-
-#### Scenario: Earlier run stopped before a tool result
-- **WHEN** `messages` contain an assistant tool call followed by a user message, with no tool message for that call
-- **THEN** the model receives the tool call followed by a failed result for it, and the run proceeds
-
-#### Scenario: Client system messages dropped by default
-- **WHEN** the agent is not configured to allow client system messages and `messages` include a `system` message
-- **THEN** that message is not sent to the model and the configured system prompt still is
-
-#### Scenario: Unsupported message role
-- **WHEN** `messages` include an `activity` message
-- **THEN** the run proceeds and the activity message is not sent to the model
-
 ### Requirement: Provider independence
 The agent SHALL work with any configured language model and SHALL NOT depend on a specific model provider.
 
 #### Scenario: Scripted model
 - **WHEN** the agent runs against a scripted test model that emits text and tool-call parts
 - **THEN** it produces the same kind of well-formed AG-UI event stream as with a real provider
+
+### Requirement: Thread history from the server store
+The agent SHALL keep the history of each `threadId` in the thread store and SHALL rebuild the model prompt on every run from the store, not from the client's full history. The prompt SHALL be: the agent's system prompt as resolved for this run, then the stored entries' messages in order, then the approval responses recorded for this run, then the ingested client delta, with every tool result placed directly after the assistant message holding its tool call. Every tool call sent to the model SHALL have a result: a stored tool call with no result and no approval request SHALL be sent with a failed result.
+
+#### Scenario: Follow-up question uses earlier context
+- **WHEN** a second run on the same thread arrives after a first run that made a tool call
+- **THEN** the model receives the first run's user message, assistant message with its tool call, tool result, and the new user message, in that order, all taken from the store
+
+#### Scenario: Earlier run stopped before a tool result
+- **WHEN** the store holds an assistant tool call with no tool result and no approval request for it
+- **THEN** the model receives the tool call followed by a failed result for it, and the run proceeds
+
+#### Scenario: Client system messages dropped by default
+- **WHEN** the agent is not configured to allow client system messages and the client delta includes a `system` message
+- **THEN** that message is neither committed nor sent to the model, and the agent's system prompt still is
+
+#### Scenario: Unsupported message role
+- **WHEN** the client delta includes an `activity` message
+- **THEN** the run proceeds and the activity message is neither committed nor sent to the model
+
+#### Scenario: Compacted store
+- **WHEN** the store returns a summary system entry and the latest user entry
+- **THEN** the model receives the agent's system prompt, the summary and the user message only
+
+#### Scenario: System prompt is not stored
+- **WHEN** a run on a new thread finishes
+- **THEN** the thread's stored entries do not include the agent's system prompt
+
+### Requirement: Client messages are ingested as a delta
+The agent SHALL treat as new only the client messages after the last client message whose id matches a stored entry; when the store is empty, every client message is new. From the delta it SHALL accept `user` messages with text (as user entries keyed by the client's message id) and, only when configured to allow them, `system`/`developer` messages; every other role in the delta SHALL be dropped. The accepted entries SHALL be committed before the model is called.
+
+#### Scenario: Full history resent by the client
+- **WHEN** the client sends the stored history plus one new user message
+- **THEN** only the new user message is committed and appended to the prompt
+
+#### Scenario: Client sends assistant turns
+- **WHEN** the delta contains an assistant message
+- **THEN** it is neither committed nor sent to the model
+
+#### Scenario: First run on a thread
+- **WHEN** the store is empty and the client sends one user message
+- **THEN** that message is committed and the model receives it after the system prompt
+
+### Requirement: History mismatch is rejected
+When the store is not empty and no client message id matches a stored entry, the agent SHALL NOT call the model and SHALL end the run with `RUN_ERROR` whose `code` is `HistoryMismatch`.
+
+#### Scenario: Unrelated client history
+- **WHEN** the store holds entries for the thread and the client's messages share no id with them
+- **THEN** the run emits `RUN_STARTED` then `RUN_ERROR` with code `HistoryMismatch`, and the model is not called
+
+### Requirement: Per-step commit
+After each model step completes, the agent SHALL commit that step's assistant entry and tool entries to the store before continuing. A run that stops mid-step SHALL leave no partial entries for that step.
+
+#### Scenario: Two-step run
+- **WHEN** a run makes a tool call in step 1 and replies with text in step 2
+- **THEN** the store receives two commits after the delta: step 1's assistant and tool entries, then step 2's assistant entry
+
+#### Scenario: Failure during step 2
+- **WHEN** the model fails during step 2
+- **THEN** the store holds step 1's entries and nothing from step 2
+
+### Requirement: Run-ended notification
+The agent SHALL notify the thread store once when a run that claimed its thread ends, after its last commit, with the outcome kind: success, interrupted or failed. Failures anywhere in the run after the claim SHALL be notified, including failures before the model is called and a failing commit. A run that fails before claiming the thread (`RunInputMismatch`, `ThreadBusy`, a failing claim) SHALL NOT be notified. If the notification itself fails, a run that succeeded or was interrupted SHALL end with `RUN_ERROR` whose `code` is `ThreadError`, and a run that already failed SHALL keep its own error code.
+
+#### Scenario: Interrupted run
+- **WHEN** a run ends with an approval interrupt
+- **THEN** the store is notified with the interrupted outcome after the step's entries were committed
+
+#### Scenario: Commit fails mid-run
+- **WHEN** committing step 1's entries fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError`, and the store is notified once with the failed outcome and that code
+
+#### Scenario: Notification fails after success
+- **WHEN** a run finishes successfully and the run-ended notification fails
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` instead of `RUN_FINISHED`
+
+#### Scenario: Claim fails
+- **WHEN** claiming the thread fails with `ThreadError`
+- **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` and the store is not notified
+
+### Requirement: Tool approval interrupts the run
+When the model calls a tool that requires approval, the agent SHALL NOT run it. It SHALL record an approval request on the assistant entry and end the run with `RUN_FINISHED` whose outcome is `interrupt`, listing one interrupt per pending approval with `id` set to the approval id, `reason` `tool-approval` and `toolCallId` set to the tool call. The tool call's `TOOL_CALL_START`/`ARGS`/`END` events SHALL still be streamed.
+
+#### Scenario: Email needs approval
+- **WHEN** the model calls "send-email", which requires approval
+- **THEN** the run streams the tool call, emits no `TOOL_CALL_RESULT` for it, and ends with `RUN_FINISHED` whose outcome is `interrupt` with one interrupt whose `toolCallId` is the call's id
+
+### Requirement: Resume entries answer approvals
+A run input MAY carry `resume` entries. For each pending approval request whose approval id equals an entry's `interruptId`, the agent SHALL record an approval response: approved only when `status` is `resolved` and `payload.approved` is `true`, otherwise denied with `payload.reason` or a default reason. Entries matching no pending request SHALL be ignored.
+
+#### Scenario: Resolved with approval
+- **WHEN** the next run carries `resume: [{ interruptId, status: "resolved", payload: { approved: true } }]` for the pending email approval
+- **THEN** an approving response is recorded for that approval id
+
+#### Scenario: Resolved without an explicit approval
+- **WHEN** the next run carries `status: "resolved"` with no `payload.approved`
+- **THEN** the call is denied
+
+#### Scenario: Unknown interrupt id
+- **WHEN** a resume entry names an interrupt id with no pending request
+- **THEN** it is ignored and the run proceeds
+
+### Requirement: Approval decisions execute before the first model step
+Approved calls SHALL execute before the first model step of the run and emit `TOOL_CALL_RESULT`; denied calls SHALL emit a failed `TOOL_CALL_RESULT` naming the reason. The model SHALL then be called with those results in the prompt.
+
+#### Scenario: Approved
+- **WHEN** the next run carries an approving resume entry for the pending email approval
+- **THEN** the email handler runs once, `TOOL_CALL_RESULT` for the email call is emitted before any text, and the model is called with the result
+
+#### Scenario: Cancelled
+- **WHEN** the next run carries `resume: [{ interruptId, status: "cancelled" }]`
+- **THEN** the email handler does not run and a failed `TOOL_CALL_RESULT` with content naming "cancelled" is emitted
+
+### Requirement: Step events
+The agent SHALL emit `STEP_STARTED` before the first content event of each model step and `STEP_FINISHED` after its last, with `stepName` `step-<n>` where `<n>` is the 1-based step number. Results of approvals resolved before the first model step SHALL be emitted without step events.
+
+#### Scenario: Two steps
+- **WHEN** a run makes a tool call in step 1 and replies in step 2
+- **THEN** the events contain `STEP_STARTED step-1` … `STEP_FINISHED step-1`, then `STEP_STARTED step-2` … `STEP_FINISHED step-2`, and the sequence passes the AG-UI client's checks
+
+### Requirement: Projected prompt is stable across a resumed run
+The projection of the thread taken at the start of a run SHALL be memoised under the thread id and run id, so a run executed again after an interruption uses the same projection even if the store changed in between. The projection SHALL NOT include the agent's system prompt, which the agent run memoises separately.
+
+#### Scenario: Store compacted between attempts
+- **WHEN** a run is re-executed with a ledger-backed checkpoint store after the thread was rewritten
+- **THEN** the model prompt for the remaining steps is built from the original projection
+
+### Requirement: Every open approval must be answered
+A run on a thread with pending approval requests SHALL carry a resume entry for each of them. If any pending request has no resume entry, the run SHALL end with `RUN_ERROR` code `UnansweredInterrupt` without committing anything it sent, calling the model or running a tool, so the thread is unchanged and the requests stay open. A missing answer SHALL NOT be treated as a denial: AG-UI 1.0 forbids a producer to read an omission as abandonment. A client gives up on a request by answering it `cancelled`. Resume entries that match no pending request SHALL be ignored.
+
+#### Scenario: Client ignores the interrupt
+- **WHEN** a run follows an interrupted run with no `resume` entries
+- **THEN** the events are `RUN_STARTED` then `RUN_ERROR` with code `UnansweredInterrupt`, the email handler does not run, the model is not called and the thread is unchanged
+
+#### Scenario: Interrupt ignored with a new user message
+- **WHEN** a run follows an interrupted run with no `resume` entries and its delta holds a new user message
+- **THEN** the run is rejected the same way and the new user message is not committed
+
+#### Scenario: Answered after a rejected run
+- **WHEN** that rejected run is followed by a run that approves the pending email approval
+- **THEN** the email handler runs once and the run finishes with outcome `success`
+
+#### Scenario: Cancelled with a new user message
+- **WHEN** a run follows an interrupted run with `resume: [{ interruptId, status: "cancelled" }]` and its delta holds a new user message
+- **THEN** the model receives the pending tool call, directly followed by its failed "cancelled" result, then the new user message
+
+#### Scenario: Only some interrupts answered
+- **WHEN** the previous run ended with two approval interrupts and the next run answers only one
+- **THEN** the run is rejected with `UnansweredInterrupt` naming the other one, and neither answer is committed
+
+### Requirement: Run info from the AG-UI input and the caller
+The agent SHALL run each AG-UI run with run info taken from its input and from the caller: the input's `runId` and `threadId`, the input's `forwardedProps` as the run's properties, unchanged, and as its context the value the caller passed when starting the run, unchanged. Nothing in the AG-UI input SHALL become the run's context. An input without `forwardedProps` SHALL run with no properties, and a run started without a context SHALL run with no context.
+
+#### Scenario: Forwarded properties reach the system prompt
+- **WHEN** an agent's system prompt reads the properties of the current run and a run arrives with `forwardedProps: { locale: "fr" }`
+- **THEN** the system prompt is computed with properties `{ locale: "fr" }` and with that input's run id and thread id
+
+#### Scenario: No forwarded properties
+- **WHEN** a run arrives without `forwardedProps`
+- **THEN** the system prompt is computed with no properties
+
+#### Scenario: Caller's context reaches tools
+- **WHEN** a caller starts a run with the context `{ userId: "u1" }` and the model calls a tool that reads the current run
+- **THEN** the handler sees the context `{ userId: "u1" }`
+
+#### Scenario: The client cannot set the context
+- **WHEN** a caller starts a run with the context `{ userId: "u1" }` and the input's `forwardedProps` is `{ context: { userId: "u2" }, userId: "u2" }`
+- **THEN** the run's context is `{ userId: "u1" }`, and the client's values appear only in the run's properties
+
+### Requirement: A run id names one input on its thread
+Everything the runner stores for a run SHALL be scoped by the input's thread id as well as its run id, because the client chooses both and the caller authorises only the thread. Before loading or committing anything, the runner SHALL memoise the input under the thread id and run id. If a run is executed again on the same thread with the same run id and a different input, it SHALL end with `RUN_ERROR` code `RunInputMismatch` without committing anything, calling the model or running a tool.
+
+#### Scenario: Run id reused on another thread
+- **WHEN** run "r1" on thread "t1" calls `get-weather`, and then a run with run id "r1" and a different message is started on thread "t2" with the same ledger-backed checkpoint store
+- **THEN** the second run calls the model with only thread "t2"'s history, the weather handler does not run again, and thread "t2" holds only its own user message and reply
+
+#### Scenario: Run id reused on the same thread with a different input
+- **WHEN** run "r1" on thread "t1" finished, and a run with run id "r1" on thread "t1" is started with an added user message
+- **THEN** the events are `RUN_STARTED` then `RUN_ERROR` with code `RunInputMismatch`, the model is not called, and the added message is not committed
+
+#### Scenario: Same input executed again
+- **WHEN** a run is interrupted and executed again on the same thread with the same input
+- **THEN** it continues from its stored steps
+
+### Requirement: One active run per thread
+Every runner SHALL claim the input's thread after checking the input against its run id and before loading the thread, and SHALL release the claim after the run-ended notification and before emitting the terminal event, so a client's next run after `RUN_FINISHED` or `RUN_ERROR` finds the thread free. A run whose claim fails SHALL end with `RUN_ERROR` carrying the claim's error code (`ThreadBusy` when another run is active) without loading or committing anything. A request-scoped run that is cancelled before its terminal event SHALL release its claim. A detached or workflow run that is interrupted SHALL keep its claim, so the thread stays busy until the run is resumed and ends.
+
+#### Scenario: Second run while one is streaming
+- **WHEN** run "r1" on thread "t1" is streaming and run "r2" is started on "t1"
+- **THEN** "r2" ends with `RUN_STARTED` then `RUN_ERROR` with code `ThreadBusy`, commits nothing and is not reported to the store, and "r1" finishes normally
+
+#### Scenario: Free when the client sees the end
+- **WHEN** a client observes `RUN_FINISHED` for "r1"
+- **THEN** another run can claim "t1" at that moment
+
+#### Scenario: Cancelled request
+- **WHEN** a request-scoped run is cancelled because its consumer stopped
+- **THEN** its claim is released
+
+#### Scenario: Crashed detached run
+- **WHEN** a detached run's scope is closed mid-step and another run is started on its thread
+- **THEN** the other run ends with `ThreadBusy`, and after the detached run is started again and finishes, the thread is free
+
+#### Scenario: Different threads
+- **WHEN** a run holds thread "t1"
+- **THEN** a run on thread "t2" runs normally
+
