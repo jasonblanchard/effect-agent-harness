@@ -1,6 +1,7 @@
 import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
+import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
@@ -1131,10 +1132,9 @@ describe("Runner run info", () => {
   const runOnce = <Tools extends Record<string, Tool.Any>, R>(
     agent: Agent.Agent<Tools, R>,
     runInput: AgUi.RunAgentInput,
-    runOptions?: Runner.RunOptions,
   ) =>
     Effect.gen(function* () {
-      const events = Array.from(yield* Stream.runCollect(Runner.run(agent)(runInput, runOptions)));
+      const events = Array.from(yield* Stream.runCollect(Runner.run(agent)(runInput)));
       yield* Effect.promise(() => verify(events));
       return events;
     });
@@ -1160,30 +1160,147 @@ describe("Runner run info", () => {
     }),
   );
 
-  it.effect("takes the context only from the caller, never from the client", () =>
+  it.effect("never stores the system prompt in the thread", () =>
     Effect.gen(function* () {
-      const { agent, handlers, bySystem, byTool } = recordingAgent();
-      const forwardedProps = { context: { userId: "u2" }, userId: "u2" };
-      yield* runOnce(
-        agent,
-        { ...input("r1", [userMessage("u1", "hi")]), forwardedProps },
-        {
-          context: { userId: "u1" },
-        },
-      ).pipe(Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]));
-      const expected = { runId: "r1", threadId: "t1", props: forwardedProps, context: { userId: "u1" } };
-      expect(bySystem).toEqual([expected]);
-      expect(byTool).toEqual([expected]);
-    }),
+      yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+      const stored = yield* loadThread;
+      expect(stored.map((entry) => entry.message.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    }).pipe(
+      Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]),
+    ),
   );
+});
 
-  it.effect("gives each run of one captured runner its own context", () =>
+// -----------------------------------------------------------------------------
+// Run contexts
+// -----------------------------------------------------------------------------
+
+class AuthContext extends Runner.RunContext<AuthContext>()("test/Auth", {
+  schema: Schema.Struct({ userId: Schema.NonEmptyString }),
+}) {}
+class CurrentUser extends Context.Service<CurrentUser, { readonly userId: string }>()("test/CurrentUser") {}
+class Tenant extends Context.Service<Tenant, { readonly id: string }>()("test/Tenant") {}
+class Directory extends Context.Service<Directory, { readonly known: ReadonlyArray<string> }>()("test/Directory") {}
+
+class UserNotFound extends Schema.TaggedError<UserNotFound, { readonly brand: unique symbol }>()("UserNotFound", {}) {}
+
+describe("Runner run contexts", () => {
+  const WhoIsUser = Tool.make("who-is-user", {
+    parameters: Schema.Struct({}),
+    success: Schema.String,
+    failureMode: "return",
+    failure: Schema.String,
+    dependencies: [CurrentUser, Tenant],
+  });
+  const UserToolkit = Toolkit.make(WhoIsUser);
+  const userAgent = Agent.define({ toolkit: UserToolkit });
+
+  /** Handlers recording `user@tenant` for each call. */
+  const userHandlers = () => {
+    const seen: Array<string> = [];
+    const layer = UserToolkit.toLayer({
+      "who-is-user": () =>
+        Effect.gen(function* () {
+          const user = yield* CurrentUser;
+          const tenant = yield* Tenant;
+          seen.push(`${user.userId}@${tenant.id}`);
+          return user.userId;
+        }),
+    });
+    return { layer, seen };
+  };
+
+  /**
+   * The per-run layer: `CurrentUser` from `AuthContext`, and `Tenant` from
+   * `CurrentUser`. Counts builds and finalizers; `fail` makes the user lookup fail.
+   */
+  const userLayer = (options: { readonly fail?: boolean } = {}) => {
+    const counts = { builds: 0, finalized: 0 };
+    const currentUser = Layer.effect(CurrentUser)(
+      Effect.gen(function* () {
+        const auth = yield* AuthContext;
+        counts.builds++;
+        yield* Effect.addFinalizer(() => Effect.sync(() => counts.finalized++));
+        if (options.fail === true) {
+          return yield* new UserNotFound();
+        }
+        return { userId: auth.userId };
+      }),
+    );
+    const tenant = Layer.effect(Tenant)(
+      Effect.gen(function* () {
+        const user = yield* CurrentUser;
+        return { id: `tenant-${user.userId}` };
+      }),
+    );
+    return { layer: tenant.pipe(Layer.provideMerge(currentUser)), counts };
+  };
+
+  /** Provides the run's `AuthContext` for `userId`, as a route does. */
+  const asUser = (userId: string) => Stream.provideService(AuthContext, { userId });
+
+  const whoIsUserTurn = (callId = "c1"): ReadonlyArray<Step> => [
+    [...toolCall(callId, "who-is-user", {}), finish("tool-calls")],
+    [...text("0", "Done."), finish("stop")],
+  ];
+
+  it("leaves the run contexts on each run for the caller to provide", () => {
+    type StreamServices<T> = T extends Stream.Stream<any, any, infer R> ? R : never;
+    /** Whether service `S` is among the requirements of stream `T`. */
+    type StreamRequires<T, S> = [S] extends [StreamServices<T>] ? true : false;
+    const run1 = input("r1", []);
+    const runner = Runner.run(userAgent, { dependencies: [AuthContext], layer: userLayer().layer });
+    const unprovided = runner(run1);
+    expectTypeOf<StreamRequires<typeof unprovided, AuthContext>>().toEqualTypeOf<true>();
+    const provided = unprovided.pipe(asUser("u1"));
+    expectTypeOf<StreamRequires<typeof provided, AuthContext>>().toEqualTypeOf<false>();
+    expectTypeOf<StreamRequires<typeof provided, CurrentUser>>().toEqualTypeOf<false>();
+    // A runner without run contexts adds no requirement.
+    const plain = Runner.run(weatherAgent)(run1);
+    expectTypeOf<StreamRequires<typeof plain, AuthContext>>().toEqualTypeOf<false>();
+  });
+
+  it("requires what the per-run layer doesn't provide", () => {
+    /** Whether service `S` is among the requirements of effect `T`. */
+    type Requires<T, S> = [S] extends [Effect.Services<T>] ? true : false;
+    const { layer } = userLayer();
+    const made = Runner.make(userAgent, { dependencies: [AuthContext], layer });
+    expectTypeOf<Requires<typeof made, CurrentUser>>().toEqualTypeOf<false>();
+    expectTypeOf<Requires<typeof made, Tenant>>().toEqualTypeOf<false>();
+    expectTypeOf<Requires<typeof made, AuthContext>>().toEqualTypeOf<false>();
+    // Each run's stream requires exactly the run contexts.
+    expectTypeOf<Effect.Success<typeof made>>().toEqualTypeOf<
+      (input: AgUi.RunAgentInput) => Stream.Stream<AgUi.Event, never, AuthContext>
+    >();
+
+    // What the layer itself needs, other than the run contexts, is captured.
+    const fromDirectory = Layer.effect(CurrentUser)(
+      Effect.gen(function* () {
+        const auth = yield* AuthContext;
+        const directory = yield* Directory;
+        return { userId: directory.known.includes(auth.userId) ? auth.userId : "guest" };
+      }),
+    );
+    const withDirectory = Runner.make(userAgent, {
+      dependencies: [AuthContext],
+      layer: Layer.effect(Tenant)(Effect.succeed({ id: "acme" })).pipe(Layer.provideMerge(fromDirectory)),
+    });
+    expectTypeOf<Requires<typeof withDirectory, Directory>>().toEqualTypeOf<true>();
+    expectTypeOf<Requires<typeof withDirectory, AuthContext>>().toEqualTypeOf<false>();
+
+    // Without a layer providing them, the agent's per-run services stay required.
+    const unprovided = Runner.make(userAgent);
+    expectTypeOf<Requires<typeof unprovided, CurrentUser>>().toEqualTypeOf<true>();
+  });
+
+  it.effect("builds each run's services from the run context it was provided", () =>
     Effect.gen(function* () {
-      const { agent, handlers, byTool } = recordingAgent();
-      const runAgent = yield* Runner.make(agent).pipe(
+      const handlers = userHandlers();
+      const { layer, counts } = userLayer();
+      const runAgent = yield* Runner.make(userAgent, { dependencies: [AuthContext], layer }).pipe(
         Effect.provide([
-          scriptedModel([...whoAmITurn(), ...whoAmITurn()]).layer,
-          handlers,
+          scriptedModel([...whoIsUserTurn(), ...whoIsUserTurn()]).layer,
+          handlers.layer,
           evalLayers,
           Thread.layerMemory,
         ]),
@@ -1194,75 +1311,365 @@ describe("Runner run info", () => {
       ] as const) {
         const events = Array.from(
           yield* Stream.runCollect(
-            runAgent(
-              { threadId, runId: `r-${userId}`, messages: [userMessage(`m-${userId}`, "hi")] },
-              {
-                context: { userId },
-              },
+            runAgent({ threadId, runId: `r-${userId}`, messages: [userMessage(`m-${userId}`, "hi")] }).pipe(
+              asUser(userId),
             ),
           ),
         );
         yield* Effect.promise(() => verify(events));
       }
-      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }, { userId: "u2" }]);
+      expect(handlers.seen).toEqual(["u1@tenant-u1", "u2@tenant-u2"]);
+      expect(counts).toEqual({ builds: 2, finalized: 2 });
     }),
   );
 
-  it.effect("gives a detached run the context passed to start", () =>
+  it.effect("takes a plain service as a per-run dependency", () =>
     Effect.gen(function* () {
-      const { agent, handlers, byTool } = recordingAgent();
-      const runner = yield* Runner.makeDetached(agent).pipe(
-        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers]),
-      );
-      yield* runner.start(input("r1", [userMessage("u1", "hi")]), { context: { userId: "u1" } });
-      const log = yield* EventLog.EventLog;
-      const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((stored) => stored.event);
-      yield* Effect.promise(() => verify(events));
-      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory, EventLog.layerMemory))),
-  );
-
-  it.effect("gives a workflow run the context from its payload, once per run id", () =>
-    Effect.gen(function* () {
-      const { agent, handlers, byTool } = recordingAgent();
-      const { workflow, layer } = Runner.workflow(agent, { name: "who-am-i" });
-      const payload = { input: input("r1", [userMessage("u1", "hi")]), context: { userId: "u1" } };
-      yield* Effect.gen(function* () {
-        yield* workflow.execute(payload, { discard: true });
-        const log = yield* EventLog.EventLog;
-        const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map(
-          (stored) => stored.event,
-        );
-        yield* Effect.promise(() => verify(events));
-        // Executing the same run id again joins the finished execution.
-        yield* workflow.execute(payload);
-      }).pipe(
-        Effect.provide(
-          layer.pipe(
-            Layer.provideMerge(
-              Layer.mergeAll(
-                scriptedModel(whoAmITurn()).layer,
-                handlers,
-                counterIds(),
-                Thread.layerMemory,
-                EventLog.layerMemory,
-                WorkflowEngine.layerMemory,
-              ),
-            ),
-          ),
+      class Principal extends Context.Service<Principal, { readonly userId: string }>()("test/Principal") {}
+      const handlers = userHandlers();
+      const fromPrincipal = Layer.effect(CurrentUser)(Principal);
+      const runAgent = yield* Runner.make(userAgent, {
+        dependencies: [Principal],
+        layer: Layer.effect(Tenant)(Effect.succeed({ id: "acme" })).pipe(Layer.provideMerge(fromPrincipal)),
+      }).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory]));
+      const events = Array.from(
+        yield* Stream.runCollect(
+          runAgent(input("r1", [userMessage("u1", "hi")])).pipe(Stream.provideService(Principal, { userId: "u1" })),
         ),
       );
-      expect(byTool.map((run) => run.context)).toEqual([{ userId: "u1" }]);
+      yield* Effect.promise(() => verify(events));
+      expect(handlers.seen).toEqual(["u1@acme"]);
     }),
   );
 
-  it.effect("never stores the system prompt in the thread", () =>
+  it.effect("lets the caller provide the per-run layer on each run's stream", () =>
     Effect.gen(function* () {
-      yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
-      const stored = yield* loadThread;
-      expect(stored.map((entry) => entry.message.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+      const handlers = userHandlers();
+      const { layer, counts } = userLayer();
+      // The built services are the dependencies; the caller provides the layer and what it reads.
+      const runAgent = yield* Runner.make(userAgent, { dependencies: [CurrentUser, Tenant] }).pipe(
+        Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory]),
+      );
+      const events = Array.from(
+        yield* Stream.runCollect(
+          runAgent(input("r1", [userMessage("u1", "hi")])).pipe(Stream.provide(layer), asUser("u1")),
+        ),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+      expect(counts).toEqual({ builds: 1, finalized: 1 });
+    }),
+  );
+
+  it.effect("forwards a run context the caller already holds", () =>
+    Effect.gen(function* () {
+      const handlers = userHandlers();
+      const runAgent = yield* Runner.make(userAgent, { dependencies: [AuthContext], layer: userLayer().layer }).pipe(
+        Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory]),
+      );
+      // As a route does when auth middleware provided `AuthContext` to it.
+      const route = Effect.gen(function* () {
+        const stream = runAgent(input("r1", [userMessage("u1", "hi")]));
+        return stream.pipe(Stream.provideContext(yield* Effect.context<AuthContext>()));
+      });
+      const stream = yield* route.pipe(Effect.provideService(AuthContext, { userId: "u1" }));
+      const events = Array.from(yield* Stream.runCollect(stream));
+      yield* Effect.promise(() => verify(events));
+      expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+    }),
+  );
+
+  it.effect("takes the context only from the caller, never from the client", () =>
+    Effect.gen(function* () {
+      const handlers = userHandlers();
+      const forwardedProps = { [AuthContext.key]: { userId: "u2" }, userId: "u2" };
+      const events = Array.from(
+        yield* Stream.runCollect(
+          Runner.run(userAgent, { dependencies: [AuthContext], layer: userLayer().layer })({
+            ...input("r1", [userMessage("u1", "hi")]),
+            forwardedProps,
+          }).pipe(asUser("u1")),
+        ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory])),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+    }),
+  );
+
+  it.effect("ends a run whose per-run layer fails before claiming the thread", () =>
+    Effect.gen(function* () {
+      const spy = spyThread();
+      const model = scriptedModel([]);
+      const handlers = userHandlers();
+      const failing = userLayer({ fail: true });
+      const events = Array.from(
+        yield* Stream.runCollect(
+          Runner.run(userAgent, { dependencies: [AuthContext], layer: failing.layer })(
+            input("r1", [userMessage("u1", "hi")]),
+          ).pipe(asUser("u1")),
+        ).pipe(Effect.provide([model.layer, handlers.layer, spy.layer])),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(types(events)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(events.at(-1)).toMatchObject({ code: "UserNotFound" });
+      expect(model.prompts).toEqual([]);
+      expect(failing.counts).toEqual({ builds: 1, finalized: 1 });
+
+      // The input was not memoised: the same run id with another input is not a mismatch.
+      const retried = Array.from(
+        yield* Stream.runCollect(
+          Runner.run(userAgent, { dependencies: [AuthContext], layer: userLayer().layer })(
+            input("r1", [userMessage("u2", "hi again")]),
+          ).pipe(asUser("u1")),
+        ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, spy.layer])),
+      );
+      expect(retried.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      // The failed run touched nothing: the store's first call is the retry's claim, and only the retry ended.
+      expect(spy.log[0]).toBe("claim r1");
+      expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual(["runEnded r1: Success"]);
+      expect(handlers.seen).toEqual(["u1@tenant-u1"]);
     }).pipe(
-      Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]),
+      Effect.provide(
+        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+      ),
     ),
   );
+
+  it.effect("finalizes the per-run services when the run ends or is cancelled", () =>
+    Effect.gen(function* () {
+      const finished = userLayer();
+      yield* Stream.runDrain(
+        Runner.run(userAgent, { dependencies: [AuthContext], layer: finished.layer })(
+          input("r1", [userMessage("u1", "hi")]),
+        ).pipe(asUser("u1")),
+      ).pipe(
+        Effect.provide([scriptedModel(whoIsUserTurn()).layer, userHandlers().layer, evalLayers, Thread.layerMemory]),
+      );
+      expect(finished.counts).toEqual({ builds: 1, finalized: 1 });
+
+      const cancelled = userLayer();
+      const model = scriptedModel([Stream.fromIterable(text("0", "Hel", "lo")).pipe(Stream.concat(Stream.never))]);
+      const firstEvents = yield* Stream.runCollect(
+        Runner.run(userAgent, { dependencies: [AuthContext], layer: cancelled.layer })(
+          input("r1", [userMessage("u1", "hi")]),
+        ).pipe(
+          asUser("u1"),
+          Stream.takeUntil((event) => event.type === EventType.TEXT_MESSAGE_CONTENT),
+        ),
+      ).pipe(Effect.provide([model.layer, userHandlers().layer, evalLayers, Thread.layerMemory]));
+      expect(firstEvents.length).toBeGreaterThan(0);
+      expect(cancelled.counts).toEqual({ builds: 1, finalized: 1 });
+    }),
+  );
+
+  it.effect("runs a run id again with a different run context, building its services from the new one", () =>
+    Effect.gen(function* () {
+      const handlers = userHandlers();
+      const run1 = input("r1", [userMessage("u1", "hi")]);
+      const runner = Runner.run(userAgent, { dependencies: [AuthContext], layer: userLayer().layer });
+      // Attempt 1 stops while step 2 is streaming, after step 1's tool call ran as u1.
+      yield* Stream.runDrain(
+        runner(run1).pipe(
+          asUser("u1"),
+          Stream.takeUntil((event) => event.type === EventType.TEXT_MESSAGE_CONTENT),
+        ),
+      ).pipe(
+        Effect.provide([
+          scriptedModel([
+            [...toolCall("c1", "who-is-user", {}), finish("tool-calls")],
+            Stream.fromIterable(text("0", "Hel")).pipe(Stream.concat(Stream.never)),
+          ]).layer,
+          handlers.layer,
+        ]),
+      );
+      const events = Array.from(
+        yield* Stream.runCollect(runner(run1).pipe(asUser("u2"))).pipe(
+          Effect.provide([scriptedModel(whoIsUserTurn("c2")).layer, handlers.layer]),
+        ),
+      );
+      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      expect(handlers.seen).toEqual(["u1@tenant-u1", "u2@tenant-u2"]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+          counterIds(),
+          Thread.layerMemory,
+        ),
+      ),
+    ),
+  );
+
+  describe("detached", () => {
+    const run1 = input("r1", [userMessage("u1", "hi")]);
+    const shared = () =>
+      Layer.mergeAll(
+        Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+        counterIds(),
+        Thread.layerMemory,
+        EventLog.layerMemory,
+      );
+    const subscribe = Effect.flatMap(EventLog.EventLog, (log) =>
+      Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1"))).pipe(
+        Effect.map((stored) => stored.map((s) => s.event)),
+      ),
+    );
+
+    /** Starts `run1` detached in `scope` as `userId`, against a model scripted with `steps`. */
+    const start = (
+      scope: Scope.Scope,
+      steps: ReadonlyArray<Step>,
+      perRun: ReturnType<typeof userLayer>,
+      handlers: ReturnType<typeof userHandlers>,
+      userId = "u1",
+    ) =>
+      Effect.gen(function* () {
+        const model = scriptedModel(steps);
+        const runner = yield* Runner.makeDetached(userAgent, { dependencies: [AuthContext], layer: perRun.layer }).pipe(
+          Effect.provide([model.layer, handlers.layer]),
+          Effect.provideService(Scope.Scope, scope),
+        );
+        yield* runner.start(run1).pipe(Effect.provideService(AuthContext, { userId }));
+        return model;
+      });
+
+    it.effect("gives a detached run the services built from the run context provided around start", () =>
+      Effect.gen(function* () {
+        const handlers = userHandlers();
+        yield* start(yield* Scope.make(), whoIsUserTurn(), userLayer(), handlers);
+        const events = yield* subscribe;
+        yield* Effect.promise(() => verify(events));
+        expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+      }).pipe(Effect.provide(shared())),
+    );
+
+    it.effect("logs a layer failure as RUN_ERROR", () =>
+      Effect.gen(function* () {
+        yield* start(yield* Scope.make(), [], userLayer({ fail: true }), userHandlers());
+        const events = yield* subscribe;
+        yield* Effect.promise(() => verify(events));
+        expect(types(events)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(events.at(-1)).toMatchObject({ code: "UserNotFound" });
+      }).pipe(Effect.provide(shared())),
+    );
+
+    it.effect("builds the services again when a crashed run is started again, and not for a finished one", () =>
+      Effect.gen(function* () {
+        const log = yield* EventLog.EventLog;
+        const handlers = userHandlers();
+        const perRun = userLayer();
+        const crashed = yield* Scope.make();
+        yield* start(
+          crashed,
+          [
+            [...toolCall("c1", "who-is-user", {}), finish("tool-calls")],
+            Stream.fromIterable(text("0", "Hel")).pipe(Stream.concat(Stream.never)),
+          ],
+          perRun,
+          handlers,
+        );
+        yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
+          Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT),
+          Stream.runDrain,
+        );
+        yield* Scope.close(crashed, Exit.void);
+        expect(perRun.counts).toEqual({ builds: 1, finalized: 1 });
+
+        yield* start(yield* Scope.make(), [[...text("0", "Done."), finish("stop")]], perRun, handlers);
+        const events = yield* subscribe;
+        yield* Effect.promise(() => verify(events));
+        expect(perRun.counts).toEqual({ builds: 2, finalized: 2 });
+        // Step 1's tool call replayed from its checkpoint rather than running again.
+        expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+
+        const again = yield* start(yield* Scope.make(), [], perRun, handlers);
+        expect(again.prompts).toEqual([]);
+        expect(perRun.counts.builds).toBe(2);
+      }).pipe(Effect.provide(shared())),
+    );
+  });
+
+  describe("workflow", () => {
+    const engine = (steps: ReadonlyArray<Step>, handlers: ReturnType<typeof userHandlers>) =>
+      Layer.mergeAll(
+        scriptedModel(steps).layer,
+        handlers.layer,
+        counterIds(),
+        Thread.layerMemory,
+        EventLog.layerMemory,
+        WorkflowEngine.layerMemory,
+      );
+    const run1 = input("r1", [userMessage("u1", "hi")]);
+
+    it.effect("gives a workflow run the services built from the run context provided around start", () =>
+      Effect.gen(function* () {
+        const handlers = userHandlers();
+        const perRun = userLayer();
+        const { start, layer } = Runner.workflow(userAgent, {
+          name: "who-is-user",
+          dependencies: [AuthContext],
+          layer: perRun.layer,
+        });
+        yield* Effect.gen(function* () {
+          yield* start(run1);
+          const log = yield* EventLog.EventLog;
+          const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
+          yield* Effect.promise(() => verify(events));
+          // Starting the same run again joins the finished execution.
+          yield* start(run1);
+          expect((yield* log.read("t1", "r1")).map((s) => s.event)).toEqual(events);
+        }).pipe(
+          Effect.provideService(AuthContext, { userId: "u1" }),
+          Effect.provide(layer.pipe(Layer.provideMerge(engine(whoIsUserTurn(), handlers)))),
+        );
+        expect(handlers.seen).toEqual(["u1@tenant-u1"]);
+        expect(perRun.counts.builds).toBe(1);
+      }),
+    );
+
+    it("takes only run contexts as dependencies, so it can persist them", () => {
+      class Principal extends Context.Service<Principal, { readonly userId: string }>()("test/Principal") {}
+      // Never called: only their types matter, and the second would fail without a schema.
+      const workflows = [
+        () =>
+          Runner.workflow(userAgent, { name: "who-is-user", dependencies: [AuthContext], layer: userLayer().layer }),
+        // @ts-expect-error A plain service has no schema to persist it with.
+        () => Runner.workflow(userAgent, { name: "who-is-user", dependencies: [Principal] }),
+      ];
+      expect(workflows).toHaveLength(2);
+    });
+
+    it.effect("gives a run's execution id from its input", () =>
+      Effect.gen(function* () {
+        const { workflow, executionId } = Runner.workflow(userAgent, {
+          name: "who-is-user",
+          dependencies: [AuthContext],
+          layer: userLayer().layer,
+        });
+        expect(yield* executionId(run1).pipe(Effect.provideService(AuthContext, { userId: "u1" }))).toBe(
+          yield* workflow.executionId({ input: run1, context: { [AuthContext.key]: { userId: "u1" } } }),
+        );
+      }),
+    );
+
+    it.effect("fails to start a run whose run context fails its schema", () =>
+      Effect.gen(function* () {
+        const handlers = userHandlers();
+        const { start, layer } = Runner.workflow(userAgent, {
+          name: "who-is-user",
+          dependencies: [AuthContext],
+          layer: userLayer().layer,
+        });
+        const exit = yield* Effect.gen(function* () {
+          const result = yield* Effect.exit(start(run1).pipe(Effect.provideService(AuthContext, { userId: "" })));
+          const log = yield* EventLog.EventLog;
+          expect(yield* log.read("t1", "r1")).toEqual([]);
+          return result;
+        }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(engine([], handlers)))));
+        // The engine dies encoding the payload, at the run context that failed.
+        expect(Exit.isFailure(exit) && String(exit.cause)).toMatch(/Schema validation failed[\s\S]*"test\/Auth"/);
+        expect(handlers.seen).toEqual([]);
+      }),
+    );
+  });
 });

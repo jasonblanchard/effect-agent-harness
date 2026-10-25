@@ -1,12 +1,20 @@
-import { Effect, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import { HttpServerRequest } from "effect/http";
-import { Agent } from "effentic";
 
 export const Principal = Schema.Struct({ userId: Schema.String, name: Schema.String });
 export type Principal = typeof Principal.Type;
 
-/** What the routes pass to the runner as `context`, and what the agent reads back from `Agent.CurrentRun`. */
-export const AppContext = Schema.Struct({ principal: Principal });
+/** The principal the route verified, which the routes provide to each run. */
+export class AuthContext extends Context.Service<AuthContext, Principal>()("ag-ui/Auth") {}
+
+/** Who the run acts for. The system prompt and the email tool require it. */
+export class CurrentUser extends Context.Service<CurrentUser, Principal>()("ag-ui/CurrentUser") {}
+
+/**
+ * Builds `CurrentUser` for each run from its `AuthContext`. A real server
+ * might look the user up here; this one takes the principal as it is.
+ */
+export const CurrentUserLayer = Layer.effect(CurrentUser)(AuthContext);
 
 /** The only token this example accepts; `src/agent.ts` sends it. A real server verifies a JWT or asks its identity provider. */
 export const DEMO_TOKEN = "demo-token";
@@ -26,10 +34,3 @@ export const authenticate = Effect.gen(function* () {
   }
   return { userId: "demo", name: "Demo User" } satisfies Principal;
 });
-
-/** The principal of the run in progress. The routes always set it, so a missing one is a bug. */
-export const currentPrincipal = Effect.gen(function* () {
-  const run = yield* Agent.CurrentRun;
-  const { principal } = yield* Schema.decodeUnknownEffect(AppContext)(run.context);
-  return principal;
-}).pipe(Effect.orDie);

@@ -3,7 +3,7 @@ import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
-import { authenticate, currentPrincipal } from "./auth.ts";
+import { AuthContext, authenticate, CurrentUser, CurrentUserLayer } from "./auth.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
 import { GetWeather, getWeather } from "./tools/weather.tool.ts";
 
@@ -12,14 +12,14 @@ const AssistantToolkit = Toolkit.make(GetWeather, SendEmail);
 
 const assistant = Agent.define({
   toolkit: AssistantToolkit,
-  // Resolved once per run, from the run's principal and the clock.
+  // Resolved once per run, from the run's user and the clock.
   system: Effect.gen(function* () {
-    const principal = yield* currentPrincipal;
+    const user = yield* CurrentUser;
     const today = DateTime.formatIsoDateUtc(yield* DateTime.now);
     return `
       You are a helpful AI assistant. Be friendly, conversational, and helpful.
       Answer questions to the best of your ability and engage in natural conversation.
-      You are talking to ${principal.name}. Today is ${today}.
+      You are talking to ${user.name}. Today is ${today}.
     `;
   }),
 });
@@ -52,15 +52,16 @@ const invalidInput = (error: { readonly message: string }) =>
 
 const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401 }));
 
-// The routes authenticate the request and pass the principal, never the token,
-// as the run's context. A real server would also check here that the principal
+// The routes authenticate the request and provide the principal, never the
+// token, as the run's `AuthContext`; `CurrentUserLayer` turns it into the
+// `CurrentUser` the agent requires, once per run. A real server would also check here that the principal
 // owns the thread id: the stores do no access control. That one check also
 // covers the thread's runs, because the library keys every run by thread id
 // and run id, and the client picks the run id.
 
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const runAgent = yield* Runner.make(assistant);
+    const runAgent = yield* Runner.make(assistant, { dependencies: [AuthContext], layer: CurrentUserLayer });
 
     // POST /agent: the run streams back as SSE, and ends if the client disconnects.
     yield* router.add(
@@ -69,14 +70,14 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return sse(Sse.encode(runAgent(input, { context: { principal } })));
+        return sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
     // POST /runs starts a run that outlives the request;
     // GET /threads/:threadId/runs/:runId/events follows it, resuming after the
     // client's `Last-Event-ID`.
-    const detached = yield* Runner.makeDetached(assistant);
+    const detached = yield* Runner.makeDetached(assistant, { dependencies: [AuthContext], layer: CurrentUserLayer });
     const log = yield* EventLog.EventLog;
 
     yield* router.add(
@@ -85,7 +86,7 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        yield* detached.start(input, { context: { principal } });
+        yield* detached.start(input).pipe(Effect.provideService(AuthContext, principal));
         return HttpServerResponse.empty({ status: 202 });
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
