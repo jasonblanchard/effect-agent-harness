@@ -30,6 +30,15 @@ describe("Thread.Entry", () => {
       expect(decoded).toEqual(entry);
     }),
   );
+
+  it.effect("round-trips the run id", () =>
+    Effect.gen(function* () {
+      const entry: Thread.Entry = { ...user("m1", "Hi"), runId: "r1" };
+      const encoded = yield* Schema.encodeEffect(Thread.Entry)(entry);
+      const decoded = yield* Schema.decodeUnknownEffect(Thread.Entry)(JSON.parse(JSON.stringify(encoded)));
+      expect(decoded).toEqual(entry);
+    }),
+  );
 });
 
 describe("Thread.layerMemory", () => {
@@ -46,7 +55,23 @@ describe("Thread.layerMemory", () => {
       const entries = [user("a", "A"), user("b", "B")];
       yield* thread.commit("t1", "r1", entries);
       yield* thread.commit("t1", "r1", entries);
-      expect(yield* thread.load("t1")).toEqual(entries);
+      expect(yield* thread.load("t1")).toEqual(entries.map((entry) => ({ ...entry, runId: "r1" })));
+    }).pipe(Effect.provide(Thread.layerMemory)),
+  );
+
+  it.effect("records the run that appended each entry", () =>
+    Effect.gen(function* () {
+      const thread = yield* Thread.Thread;
+      const [a, b, c] = [user("a", "A"), user("b", "B"), user("c", "C")];
+      yield* thread.commit("t1", "r1", [a, b]);
+      yield* thread.commit("t1", "r2", [c]);
+      // Recommitted by another run, an entry keeps its first run.
+      yield* thread.commit("t1", "r2", [a]);
+      expect((yield* thread.load("t1")).map((entry) => [entry.id, entry.runId])).toEqual([
+        ["a", "r1"],
+        ["b", "r1"],
+        ["c", "r2"],
+      ]);
     }).pipe(Effect.provide(Thread.layerMemory)),
   );
 

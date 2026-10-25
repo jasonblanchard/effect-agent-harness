@@ -105,6 +105,16 @@ describe("AgUi events", () => {
       outcome: { type: "interrupt", interrupts: [{ id: "a1", reason: "tool-approval", toolCallId: "c1" }] },
     });
   });
+
+  it("builds the approval interrupt for a tool call", () => {
+    expect(AgUi.approvalInterrupt({ approvalId: "a1", toolCallId: "c1", toolName: "send-email" })).toEqual({
+      id: "a1",
+      reason: "tool-approval",
+      toolCallId: "c1",
+      message: "Approve call to send-email?",
+      responseSchema: expect.objectContaining({ required: ["approved"] }),
+    });
+  });
 });
 
 // -----------------------------------------------------------------------------

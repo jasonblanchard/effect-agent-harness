@@ -65,6 +65,22 @@ const approvalResponseSchema = {
 };
 
 /**
+ * The interrupt for a tool call waiting for approval, as `RUN_FINISHED` carries
+ * it and as `Messages.history` returns it for an open request.
+ */
+export const approvalInterrupt = (approval: {
+  readonly approvalId: string;
+  readonly toolCallId: string;
+  readonly toolName: string;
+}): Interrupt => ({
+  id: approval.approvalId,
+  reason: "tool-approval",
+  toolCallId: approval.toolCallId,
+  message: `Approve call to ${approval.toolName}?`,
+  responseSchema: approvalResponseSchema,
+});
+
+/**
  * An answer to an interrupt of the previous run. For a tool approval, the call
  * is approved only when `status` is `"resolved"` and `payload` is an
  * {@link ApprovalResponse} with `approved: true`; anything else denies it.
@@ -254,18 +270,7 @@ export const fold =
           case "Finished": {
             return event.outcome._tag === "Success"
               ? [runFinished(input)]
-              : [
-                  runInterrupted(
-                    input,
-                    event.outcome.approvals.map((approval) => ({
-                      id: approval.approvalId,
-                      reason: "tool-approval",
-                      toolCallId: approval.toolCallId,
-                      message: `Approve call to ${approval.toolName}?`,
-                      responseSchema: approvalResponseSchema,
-                    })),
-                  ),
-                ];
+              : [runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
           }
           case "Failed": {
             const events = current?.close() ?? [];

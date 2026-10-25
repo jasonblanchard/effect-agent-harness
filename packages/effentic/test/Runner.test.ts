@@ -7,6 +7,7 @@ import * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
+import * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
 import {
@@ -577,6 +578,174 @@ describe("Runner.run approvals", () => {
       ]);
       expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"cancelled"}' });
       expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+    }),
+  );
+});
+
+describe("Runner thread history", () => {
+  const read = Effect.map(loadThread, Messages.history);
+  const emailStep: Step = [
+    ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
+    finish("tool-calls"),
+  ];
+
+  it.effect("reads a thread back with the ids and content its events carried", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([
+        [
+          ...text("0", "Let me "),
+          ...text("1", "check."),
+          ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
+          finish("tool-calls"),
+        ],
+        [...text("0", "It is 18°C."), finish("stop")],
+      ]);
+      const { events, history } = yield* Effect.gen(function* () {
+        const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+        return { events: events!, history: yield* read };
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
+
+      // A step's text segments all go out under the step's one message id.
+      const starts = [
+        ...new Set(events.flatMap((e) => (e.type === EventType.TEXT_MESSAGE_START ? [e.messageId] : []))),
+      ];
+      const textOf = (messageId: string) =>
+        events.flatMap((e) =>
+          e.type === EventType.TEXT_MESSAGE_CONTENT && e.messageId === messageId ? [e.delta] : [],
+        );
+      const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
+      expect(history.messages).toEqual([
+        { id: "u1", role: "user", content: "Weather in Paris?" },
+        {
+          id: starts[0],
+          role: "assistant",
+          content: textOf(starts[0]!).join(""),
+          toolCalls: [
+            { id: "toolu_1", type: "function", function: { name: "get-weather", arguments: '{"location":"Paris"}' } },
+          ],
+        },
+        { id: result?.messageId, role: "tool", toolCallId: "toolu_1", content: result?.content },
+        { id: starts[1], role: "assistant", content: "It is 18°C." },
+      ]);
+      expect(history.messages[1]).toMatchObject({ content: "Let me check." });
+      expect(history.interrupts).toBeUndefined();
+    }),
+  );
+
+  it.effect("reads an interrupted thread's open interrupts as RUN_FINISHED carried them", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([emailStep]);
+      const { events, history } = yield* Effect.gen(function* () {
+        const [events] = yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Email Ada")])]);
+        return { events: events!, history: yield* read };
+      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      const last = events.at(-1);
+      const outcome = last?.type === EventType.RUN_FINISHED ? last.outcome : undefined;
+      expect(outcome?.type).toBe("interrupt");
+      expect(history.interrupts).toEqual({
+        runId: "r1",
+        pending: outcome?.type === "interrupt" ? outcome.interrupts : undefined,
+      });
+    }),
+  );
+
+  it.effect("accepts a read history with a new user message after a completed run", () =>
+    Effect.gen(function* () {
+      const spy = spyThread();
+      const model = scriptedModel([...weatherTurn, [...text("0", "Still 18°C."), finish("stop")]]);
+      const second = yield* Effect.gen(function* () {
+        yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+        const { messages } = yield* read;
+        const [second] = yield* runAgUi(weatherAgent, [input("r2", [...messages, userMessage("u2", "And now?")])]);
+        return second!;
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
+      expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe("commit r2: u2");
+      expect(model.prompts[2]!.content.map((m) => m.role)).toEqual([
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+      ]);
+    }),
+  );
+
+  it.effect("accepts a read history answering its restored interrupt", () =>
+    Effect.gen(function* () {
+      const spy = spyThread();
+      const model = scriptedModel([emailStep, [...text("0", "Sent."), finish("stop")]]);
+      const handlers = countingApprovalLayer();
+      const second = yield* Effect.gen(function* () {
+        yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Email Ada")])]);
+        const { messages, interrupts } = yield* read;
+        const [second] = yield* runAgUi(approvalAgent, [
+          input("r2", messages, [
+            { interruptId: interrupts!.pending[0]!.id, status: "resolved", payload: { approved: true } },
+          ]),
+        ]);
+        return second!;
+      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, spy.layer]));
+      expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(handlers.emails).toEqual(["ada@example.com"]);
+      // Only the approval response: nothing from the read history is committed again.
+      expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe("commit r2: id-2:response");
+    }),
+  );
+
+  it.effect("rejects an edited history before committing or calling the model", () =>
+    Effect.gen(function* () {
+      const spy = spyThread();
+      const model = scriptedModel([...weatherTurn]);
+      const { second, before, after } = yield* Effect.gen(function* () {
+        yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+        const before = yield* loadThread;
+        const [second] = yield* runAgUi(weatherAgent, [
+          input("r2", [clientHistoryAfterWeatherTurn[0]!, userMessage("u1b", "Weather in Rome?")]),
+        ]);
+        return { second: second!, before, after: yield* loadThread };
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
+      expect(types(second)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(second[1]).toMatchObject({ code: "HistoryDiverged" });
+      expect(after).toEqual(before);
+      expect(model.prompts).toHaveLength(2);
+      expect(spy.log.filter((line) => line.includes("r2"))).toEqual([
+        "claim r2",
+        "runEnded r2: Failed HistoryDiverged",
+        "release r2",
+      ]);
+    }),
+  );
+
+  it.effect("rejects a store that compacts into an unseen assistant entry after the client's latest", () =>
+    Effect.gen(function* () {
+      const run = (summary: Thread.Entry, first: boolean) => {
+        const spy = spyThread();
+        const model = scriptedModel([...weatherTurn, [...text("0", "OK"), finish("stop")]]);
+        return Effect.gen(function* () {
+          yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
+          const stored = yield* loadThread;
+          // A summary in place of the first user message: first, or after everything the client saw.
+          spy.rewrite("t1", first ? [summary, ...stored.slice(1)] : [...stored, summary]);
+          const [second] = yield* runAgUi(weatherAgent, [
+            input("r2", [...clientHistoryAfterWeatherTurn, userMessage("u2", "And now?")]),
+          ]);
+          return second!;
+        }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
+      };
+
+      const late = yield* run(
+        {
+          id: "sum",
+          message: Prompt.makeMessage("assistant", { content: [Prompt.makePart("text", { text: "Summary" })] }),
+        },
+        false,
+      );
+      expect(late.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "HistoryDiverged" });
+
+      const early = yield* run({ id: "sum", message: Prompt.makeMessage("system", { content: "Summary" }) }, true);
+      expect(early.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
     }),
   );
 });

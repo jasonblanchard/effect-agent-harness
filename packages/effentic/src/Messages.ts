@@ -1,3 +1,4 @@
+import type { AssistantMessage, Interrupt, ToolMessage, UserMessage } from "@ag-ui/core";
 import { Option, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import * as Agent from "./Agent.ts";
@@ -7,7 +8,8 @@ import type * as Thread from "./Thread.ts";
 // -----------------------------------------------------------------------------
 // The server owns the thread. A run takes from the client only what is
 // new (`delta`, `ingest`) and its answers to the previous run's interrupts
-// (`resume`), and builds the model prompt from the store (`project`).
+// (`resume`), and builds the model prompt from the store (`project`). A
+// client that lost its state reads the thread back (`history`).
 // -----------------------------------------------------------------------------
 
 /** The client's history shares no message with the stored thread. */
@@ -21,21 +23,75 @@ export class HistoryMismatch extends Schema.TaggedError<HistoryMismatch, { reado
 }
 
 /**
- * The client messages that are new to the store: everything after the last
- * client message whose id is a stored entry id. With an empty store, every
- * client message is new. With a non-empty store and no shared id, the client
- * is on a different history and the run must not proceed.
+ * The client's history leaves the stored thread before its end: it lacks a
+ * stored message it could have seen, e.g. because it edited or regenerated a
+ * turn, or missed a step. Appending its new messages would put them after
+ * history the client does not have.
+ */
+export class HistoryDiverged extends Schema.TaggedError<HistoryDiverged, { readonly brand: unique symbol }>()(
+  "HistoryDiverged",
+  {},
+) {
+  override get message(): string {
+    return "The client's messages leave the stored thread before its end";
+  }
+}
+
+/**
+ * The client messages that are new to the store.
+ *
+ * A client message is known if a stored entry has its id, or if it is a `tool`
+ * message and a stored tool result has its `toolCallId` (clients such as
+ * TanStack AI send tool results under ids of their own). Other client
+ * messages, such as the text of a step that was cancelled before it committed,
+ * are ignored. The new messages are those after the last known one.
+ *
+ * With an empty store, every client message is new. With a non-empty store and
+ * no known message, the client is on a different history (`HistoryMismatch`).
+ * If a stored entry after the last known one would be shown by {@link history}
+ * and no client message matches it, the client is missing part of the thread
+ * (`HistoryDiverged`). Entries committed by `runId` itself don't count: a run
+ * executed again after a crash meets the steps its earlier attempt committed,
+ * which its input could not hold.
  */
 export const delta = (
   stored: ReadonlyArray<Thread.Entry>,
   client: ReadonlyArray<AgUi.Message>,
-): Result.Result<ReadonlyArray<AgUi.Message>, HistoryMismatch> => {
+  runId?: string,
+): Result.Result<ReadonlyArray<AgUi.Message>, HistoryMismatch | HistoryDiverged> => {
   if (stored.length === 0) {
     return Result.succeed(client);
   }
-  const ids = new Set(stored.map((entry) => entry.id));
-  const last = client.findLastIndex((message) => ids.has(message.id));
-  return last === -1 ? Result.fail(new HistoryMismatch()) : Result.succeed(client.slice(last + 1));
+  const byId = new Map(stored.map((entry, index) => [entry.id, index]));
+  const byCall = new Map<string, number>();
+  for (const [index, { message }] of stored.entries()) {
+    if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type === "tool-result") {
+          byCall.set(part.id, index);
+        }
+      }
+    }
+  }
+  const positions = client.map(
+    (message) =>
+      byId.get(message.id) ??
+      (message.role === "tool" && message.toolCallId !== undefined ? byCall.get(message.toolCallId) : undefined),
+  );
+  const last = positions.findLastIndex((position) => position !== undefined);
+  if (last === -1) {
+    return Result.fail(new HistoryMismatch());
+  }
+  const anchor = positions[last]!;
+  const matched = new Set(positions);
+  const missing = stored.some(
+    (entry, index) =>
+      index > anchor &&
+      !matched.has(index) &&
+      (runId === undefined || entry.runId !== runId) &&
+      shown(entry) !== undefined,
+  );
+  return missing ? Result.fail(new HistoryDiverged()) : Result.succeed(client.slice(last + 1));
 };
 
 export interface IngestOptions {
@@ -115,25 +171,8 @@ export const resume = (
   stored: ReadonlyArray<Thread.Entry>,
   entries: ReadonlyArray<AgUi.ResumeEntry>,
 ): Result.Result<ReadonlyArray<Thread.Entry>, UnansweredInterrupt> => {
-  const requested: Array<string> = [];
-  const responded = new Set<string>();
-  for (const { message } of stored) {
-    if (message.role === "assistant") {
-      for (const part of message.content) {
-        if (part.type === "tool-approval-request") {
-          requested.push(part.approvalId);
-        }
-      }
-    } else if (message.role === "tool") {
-      for (const part of message.content) {
-        if (part.type === "tool-approval-response") {
-          responded.add(part.approvalId);
-        }
-      }
-    }
-  }
   const answers = new Map(entries.map((entry) => [entry.interruptId, entry]));
-  const pending = requested.filter((approvalId) => !responded.has(approvalId));
+  const pending = pendingApprovals(stored).map((request) => request.approvalId);
   const unanswered = pending.filter((approvalId) => !answers.has(approvalId));
   if (unanswered.length > 0) {
     return Result.fail(new UnansweredInterrupt({ interruptIds: unanswered }));
@@ -154,6 +193,177 @@ export const resume = (
       };
     }),
   );
+};
+
+interface PendingApproval {
+  readonly approvalId: string;
+  readonly toolCallId: string;
+  /** The assistant entry holding the request. */
+  readonly entry: Thread.Entry;
+}
+
+/** The approval requests in `stored` that have no response yet, in commit order. */
+const pendingApprovals = (stored: ReadonlyArray<Thread.Entry>): ReadonlyArray<PendingApproval> => {
+  const requested: Array<PendingApproval> = [];
+  const responded = new Set<string>();
+  for (const entry of stored) {
+    const { message } = entry;
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type === "tool-approval-request") {
+          requested.push({ approvalId: part.approvalId, toolCallId: part.toolCallId, entry });
+        }
+      }
+    } else if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type === "tool-approval-response") {
+          responded.add(part.approvalId);
+        }
+      }
+    }
+  }
+  return requested.filter((request) => !responded.has(request.approvalId));
+};
+
+// -----------------------------------------------------------------------------
+// Reading a thread back
+// -----------------------------------------------------------------------------
+
+/** A message {@link history} returns. User and tool content is always a string. */
+export type ShownMessage =
+  | (UserMessage & { readonly content: string })
+  | AssistantMessage
+  | (ToolMessage & { readonly content: string });
+
+/** A thread as a client restores it. See {@link history}. */
+export interface History {
+  /** The messages the thread's runs showed, as their events showed them. */
+  readonly messages: ReadonlyArray<ShownMessage>;
+  /**
+   * The approval requests still waiting for an answer, as the `RUN_FINISHED`
+   * that raised them carried them, and the run that raised them (`undefined`
+   * if the store did not record it). `undefined` when none are open.
+   */
+  readonly interrupts: { readonly runId: string | undefined; readonly pending: ReadonlyArray<Interrupt> } | undefined;
+}
+
+/**
+ * The message a client was shown for an entry, with the id and content the
+ * run's events gave it, or `undefined` if the events showed none: system
+ * entries, approval responses, and assistant entries with neither text nor
+ * tool calls. Reasoning is dropped, as the events drop it.
+ */
+const shown = (entry: Thread.Entry): ShownMessage | undefined => {
+  const { id, message } = entry;
+  switch (message.role) {
+    case "user": {
+      return { id, role: "user", content: textOf(message.content) };
+    }
+    case "assistant": {
+      const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+      const toolCalls = message.content.flatMap((part) =>
+        part.type === "tool-call"
+          ? [
+              {
+                id: part.id,
+                type: "function" as const,
+                function: { name: part.name, arguments: JSON.stringify(part.params ?? {}) },
+              },
+            ]
+          : [],
+      );
+      if (text.length === 0 && toolCalls.length === 0) {
+        return undefined;
+      }
+      return {
+        id,
+        role: "assistant",
+        ...(text.length > 0 ? { content: text } : {}),
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
+    }
+    case "tool": {
+      const result = message.content.find((part) => part.type === "tool-result");
+      // Encoded as `TOOL_CALL_RESULT` encodes it.
+      return result === undefined
+        ? undefined
+        : { id, role: "tool", toolCallId: result.id, content: JSON.stringify(result.result ?? null) };
+    }
+    case "system": {
+      return undefined;
+    }
+  }
+};
+
+/**
+ * The thread as its runs' events showed it, for a client that has lost its
+ * state (a reload, another device) to restore. Serve it from a route of your
+ * own, e.g. `Effect.map(thread.load(threadId), Messages.history)`, authorised
+ * like the run route. A client that sends the messages back, with new user
+ * messages after them, is matched against the store as if it had streamed
+ * them.
+ *
+ * Messages are in commit order, with each tool result moved directly after
+ * the assistant message holding its call. Ids and content are the events':
+ * an assistant message's text is its segments joined, and a tool result is
+ * its `TOOL_CALL_RESULT` content. Tool call arguments are re-encoded, so their
+ * formatting may differ from the streamed deltas.
+ */
+export const history = (entries: ReadonlyArray<Thread.Entry>): History => {
+  const messages = entries.flatMap((entry) => {
+    const message = shown(entry);
+    return message === undefined ? [] : [message];
+  });
+  // Each tool result goes after the assistant message holding its call.
+  const caller = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      for (const call of message.toolCalls ?? []) {
+        caller.set(call.id, message.id);
+      }
+    }
+  }
+  const results = new Map<string, Array<ShownMessage>>();
+  const rest: Array<ShownMessage> = [];
+  for (const message of messages) {
+    const owner = message.role === "tool" ? caller.get(message.toolCallId) : undefined;
+    if (owner === undefined) {
+      // Includes a result whose call is not loaded (compacted away): it stays where it is.
+      rest.push(message);
+    } else {
+      results.set(owner, [...(results.get(owner) ?? []), message]);
+    }
+  }
+  const ordered = rest.flatMap((message) => [message, ...(results.get(message.id) ?? [])]);
+
+  const pending = pendingApprovals(entries);
+  const toolNames = new Map<string, string>();
+  for (const { message } of entries) {
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type === "tool-call") {
+          toolNames.set(part.id, part.name);
+        }
+      }
+    }
+  }
+  return {
+    messages: ordered,
+    interrupts:
+      pending.length === 0
+        ? undefined
+        : {
+            // One active run per thread, so every open request is the last interrupted run's.
+            runId: pending.at(-1)!.entry.runId,
+            pending: pending.map((request) =>
+              AgUi.approvalInterrupt({
+                approvalId: request.approvalId,
+                toolCallId: request.toolCallId,
+                toolName: toolNames.get(request.toolCallId) ?? "",
+              }),
+            ),
+          },
+  };
 };
 
 /** Result sent to the model for a tool call the history never answered. */

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Result } from "effect";
 import { Prompt } from "effect/ai";
-import type * as AgUi from "../src/AgUi.ts";
+import * as AgUi from "../src/AgUi.ts";
 import * as Messages from "../src/Messages.ts";
 import type * as Thread from "../src/Thread.ts";
 
@@ -37,6 +37,28 @@ const toolResult = (id: string, callId: string, result: unknown): Thread.Entry =
         providerExecuted: false,
       }),
     ],
+  }),
+});
+
+const assistantText = (id: string, text: string): Thread.Entry => ({
+  id,
+  message: Prompt.makeMessage("assistant", { content: [Prompt.makePart("text", { text })] }),
+});
+
+const assistantEmpty = (id: string): Thread.Entry => ({
+  id,
+  message: Prompt.makeMessage("assistant", { content: [] }),
+});
+
+const system = (id: string, content: string): Thread.Entry => ({
+  id,
+  message: Prompt.makeMessage("system", { content }),
+});
+
+const approvalResponse = (approvalId: string): Thread.Entry => ({
+  id: `${approvalId}:response`,
+  message: Prompt.makeMessage("tool", {
+    content: [Prompt.toolApprovalResponsePart({ approvalId, approved: true })],
   }),
 });
 
@@ -83,6 +105,203 @@ describe("Messages.delta", () => {
     const result = Messages.delta([user("u1", "hi")], [clientMessage("x1", "user", "other")]);
     expect(Result.isFailure(result)).toBe(true);
     expect(Result.isFailure(result) && result.failure._tag).toBe("HistoryMismatch");
+  });
+
+  // u1, a call c1 and its result, then the reply a2.
+  const thread = [
+    user("u1", "Weather?"),
+    assistantCall("m1", "c1"),
+    toolResult("t1", "c1", 21),
+    assistantText("a2", "21°"),
+  ];
+  const callMessage: AgUi.Message = {
+    id: "m1",
+    role: "assistant",
+    toolCalls: [{ id: "c1", function: { name: "get-weather", arguments: "{}" } }],
+  };
+  const u3 = clientMessage("u3", "user", "Thanks");
+
+  it("matches a tool message by its toolCallId", () => {
+    const client = [
+      clientMessage("u1", "user", "Weather?"),
+      callMessage,
+      { id: "tool-c1", role: "tool", toolCallId: "c1", content: "21" },
+      clientMessage("a2", "assistant", "21°"),
+      u3,
+    ];
+    expect(Messages.delta(thread, client)).toEqual(Result.succeed([u3]));
+    // A tool result is the last stored entry, and the client holds it under its own id.
+    expect(Messages.delta(thread.slice(0, 3), client.slice(0, 3))).toEqual(Result.succeed([]));
+  });
+
+  it("ignores messages the store never committed", () => {
+    const client = [
+      clientMessage("u1", "user", "Weather?"),
+      // A step that was cancelled mid-stream, then the turns that followed it.
+      clientMessage("x1", "assistant", "Let me"),
+      callMessage,
+      { id: "t1", role: "tool", toolCallId: "c1", content: "21" },
+      clientMessage("r1", "reasoning", "thinking"),
+      clientMessage("a2", "assistant", "21°"),
+      u3,
+    ];
+    expect(Messages.delta(thread, client)).toEqual(Result.succeed([u3]));
+  });
+
+  it("accepts a tool result the client placed before a later message", () => {
+    const stored = [
+      user("u1", "Email Ada"),
+      assistantCall("m1", "c1", "ap1"),
+      user("u2", "Also"),
+      toolResult("t1", "c1", 1),
+    ];
+    const client = [
+      clientMessage("u1", "user", "Email Ada"),
+      callMessage,
+      { id: "t1", role: "tool", toolCallId: "c1", content: "1" },
+      clientMessage("u2", "user", "Also"),
+      u3,
+    ];
+    expect(Messages.delta(stored, client)).toEqual(Result.succeed([u3]));
+  });
+
+  const diverged = (stored: ReadonlyArray<Thread.Entry>, client: ReadonlyArray<AgUi.Message>) => {
+    const result = Messages.delta(stored, client);
+    return Result.isFailure(result) && result.failure._tag === "HistoryDiverged";
+  };
+
+  it("fails with HistoryDiverged for an edited turn", () => {
+    const stored = ["m1", "m2", "m3", "m4", "m5"].map((id) => user(id, id));
+    expect(diverged(stored, [clientMessage("m1", "user", "m1"), clientMessage("m2'", "user", "edited")])).toBe(true);
+  });
+
+  it("fails with HistoryDiverged when the client drops the last reply", () => {
+    const client = [clientMessage("u1", "user", "Weather?"), callMessage, { id: "t1", role: "tool", toolCallId: "c1" }];
+    expect(diverged(thread, client)).toBe(true);
+    // Without the tool result too.
+    expect(diverged(thread, client.slice(0, 2))).toBe(true);
+  });
+
+  it("does not count entries the client was never shown", () => {
+    const stored = [
+      system("s1", "Summary of earlier turns"),
+      user("u1", "Email Ada"),
+      assistantCall("m1", "c1", "ap1"),
+      approvalResponse("ap1"),
+      assistantEmpty("a2"),
+    ];
+    const client = [clientMessage("u1", "user", "Email Ada"), callMessage];
+    expect(Messages.delta(stored, client)).toEqual(Result.succeed([]));
+  });
+
+  it("does not count entries the run being reconciled committed itself", () => {
+    // A run executed again after a crash: its first attempt committed step 1.
+    const stored = [
+      { ...user("u1", "Weather?"), runId: "r1" },
+      { ...assistantCall("m1", "c1"), runId: "r1" },
+      { ...toolResult("t1", "c1", 21), runId: "r1" },
+    ];
+    const client = [clientMessage("u1", "user", "Weather?")];
+    expect(Messages.delta(stored, client, "r1")).toEqual(Result.succeed([]));
+    expect(diverged(stored, client)).toBe(true);
+    expect(Result.isFailure(Messages.delta(stored, client, "r2"))).toBe(true);
+  });
+
+  it("fails with HistoryDiverged for an unseen entry a store put after the client's latest", () => {
+    const stored = [user("u1", "hi"), assistantText("a1", "hello"), assistantText("sum", "Summary")];
+    const client = [clientMessage("u1", "user", "hi"), clientMessage("a1", "assistant", "hello"), u3];
+    expect(diverged(stored, client)).toBe(true);
+  });
+});
+
+describe("Messages.history", () => {
+  it("shows user, assistant and tool messages with their stored ids", () => {
+    const entries = [
+      user("u1", "Weather?"),
+      {
+        id: "m1",
+        message: Prompt.makeMessage("assistant", {
+          content: [
+            Prompt.makePart("text", { text: "Let me " }),
+            Prompt.makePart("reasoning", { text: "hidden" }),
+            Prompt.makePart("text", { text: "check." }),
+            Prompt.makePart("tool-call", {
+              id: "c1",
+              name: "get-weather",
+              params: { location: "Paris" },
+              providerExecuted: false,
+            }),
+          ],
+        }),
+      },
+      toolResult("t1", "c1", { temp: 21 }),
+      assistantText("a2", "21°"),
+    ];
+    expect(Messages.history(entries)).toEqual({
+      messages: [
+        { id: "u1", role: "user", content: "Weather?" },
+        {
+          id: "m1",
+          role: "assistant",
+          content: "Let me check.",
+          toolCalls: [
+            { id: "c1", type: "function", function: { name: "get-weather", arguments: '{"location":"Paris"}' } },
+          ],
+        },
+        { id: "t1", role: "tool", toolCallId: "c1", content: '{"temp":21}' },
+        { id: "a2", role: "assistant", content: "21°" },
+      ],
+      interrupts: undefined,
+    });
+  });
+
+  it("moves a tool result directly after its call", () => {
+    const entries = [
+      assistantCall("m1", "c1", "ap1"),
+      user("u2", "Also"),
+      approvalResponse("ap1"),
+      toolResult("t1", "c1", 1),
+    ];
+    expect(Messages.history(entries).messages.map((message) => message.id)).toEqual(["m1", "t1", "u2"]);
+  });
+
+  it("keeps a result whose call is not loaded, and its read is accepted back", () => {
+    const entries = [system("s1", "Summary"), toolResult("t1", "c1", 1), assistantText("a2", "Done.")];
+    const { messages } = Messages.history(entries);
+    expect(messages.map((message) => message.id)).toEqual(["t1", "a2"]);
+    expect(Messages.delta(entries, [...messages, clientMessage("u3", "user", "Thanks")])).toEqual(
+      Result.succeed([clientMessage("u3", "user", "Thanks")]),
+    );
+  });
+
+  it("hides system entries, approval responses and empty assistant entries", () => {
+    const entries = [
+      system("s1", "Summary"),
+      user("u1", "Email Ada"),
+      assistantCall("m1", "c1", "ap1"),
+      approvalResponse("ap1"),
+      assistantEmpty("a2"),
+    ];
+    expect(Messages.history(entries).messages.map((message) => message.id)).toEqual(["u1", "m1"]);
+  });
+
+  it("is empty for an unknown thread", () => {
+    expect(Messages.history([])).toEqual({ messages: [], interrupts: undefined });
+  });
+
+  it("returns open approval requests with the run that raised them", () => {
+    const entries = [
+      { ...user("u1", "Email Ada"), runId: "r1" },
+      { ...assistantCall("m1", "c1", "ap1"), runId: "r1" },
+    ];
+    expect(Messages.history(entries).interrupts).toEqual({
+      runId: "r1",
+      pending: [AgUi.approvalInterrupt({ approvalId: "ap1", toolCallId: "c1", toolName: "get-weather" })],
+    });
+    // Without a recorded run.
+    expect(Messages.history([assistantCall("m1", "c1", "ap1")]).interrupts?.runId).toBeUndefined();
+    // Answered.
+    expect(Messages.history([assistantCall("m1", "c1", "ap1"), approvalResponse("ap1")]).interrupts).toBeUndefined();
   });
 });
 

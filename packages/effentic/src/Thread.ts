@@ -5,10 +5,13 @@ import { Prompt } from "effect/ai";
  * One committed message of a thread. The id is the AG-UI message id the client
  * sees (the user's own id, or the id the server minted for an assistant step or
  * tool result), so the client's history can be matched against the store.
+ * `runId` is the run whose commit appended the entry. The store records it, so
+ * entries passed to `commit` need not carry it.
  */
 export const Entry = Schema.Struct({
   id: Schema.String,
   message: Prompt.Message,
+  runId: Schema.optional(Schema.String),
 });
 export type Entry = typeof Entry.Type;
 
@@ -49,6 +52,11 @@ export class ThreadBusy extends Schema.TaggedError<ThreadBusy, { readonly brand:
  *   `resume` answers are matched against those; an answer to a request that is
  *   not loaded is ignored.
  *
+ * And it must not put a user, assistant or tool entry the client has never
+ * seen after the latest one it has: the client's next run would fail with
+ * `HistoryDiverged`. Write a summary as a `system` entry, which the client is
+ * never expected to hold.
+ *
  * A thread has at most one active run, because each run reconciles the client
  * against what it loaded and commits on top of it. Every runner claims the
  * thread before loading it and releases it when the run ends. A durable store
@@ -61,7 +69,9 @@ export class Thread extends Context.Service<
   {
     /**
      * The thread's entries in commit order, possibly compacted (see above);
-     * empty for an unknown thread.
+     * empty for an unknown thread. Every entry the store committed carries the
+     * `runId` of the commit that appended it; an entry the store wrote itself,
+     * such as a compaction summary, may have none.
      */
     readonly load: (threadId: string) => Effect.Effect<ReadonlyArray<Entry>, ThreadError>;
     /**
@@ -73,8 +83,9 @@ export class Thread extends Context.Service<
     /** Ends `runId`'s claim. Does nothing if `runId` is not the active run. */
     readonly release: (threadId: string, runId: string) => Effect.Effect<void, ThreadError>;
     /**
-     * Appends, in order, every entry whose id is not in the thread yet. Must be
-     * idempotent: a resumed run commits the same entries again.
+     * Appends, in order, every entry whose id is not in the thread yet, with
+     * `runId` recorded on it. Must be idempotent: a resumed run commits the same
+     * entries again, and an entry already present keeps its first run.
      */
     readonly commit: (
       threadId: string,
@@ -116,14 +127,14 @@ export const layerMemory: Layer.Layer<Thread> = Layer.sync(Thread, () => {
           active.delete(threadId);
         }
       }),
-    commit: (threadId, _runId, entries) =>
+    commit: (threadId, runId, entries) =>
       Effect.sync(() => {
         const thread = threads.get(threadId) ?? [];
         const ids = new Set(thread.map((entry) => entry.id));
         for (const entry of entries) {
           if (!ids.has(entry.id)) {
             ids.add(entry.id);
-            thread.push(entry);
+            thread.push({ ...entry, runId });
           }
         }
         threads.set(threadId, thread);

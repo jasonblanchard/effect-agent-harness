@@ -188,7 +188,7 @@ Pick a runner by what should happen when the client goes away:
 
 Guarantees for every runner:
 
-- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `UnansweredInterrupt`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, a provider error such as `RateLimitError`, …).
+- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, a provider error such as `RateLimitError`, …).
 - **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, tool calls and steps are always closed, including when a run fails mid-message.
 
 What a client sees for a tool-using reply:
@@ -237,14 +237,19 @@ Nothing in the AG-UI input can set `context`. See [Authentication and run contex
 
 ## Threads
 
-The server owns the history. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one whose id the store already has, and from it accepts only:
+The server owns the history. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
 
 - `user` messages that have text;
 - `system` / `developer` messages, and only with `clientSystem: "allow"`.
 
-Assistant and tool messages from the client are always ignored, so a client cannot invent a model turn or a tool result. If the store has entries but the client's history shares no id with them, the run fails with `HistoryMismatch` and the model is not called.
+Assistant and tool messages from the client are always ignored, so a client cannot invent a model turn or a tool result.
 
-Ids line up because the server mints them. Every assistant step and tool result is stored under the same id it was sent to the client with (`messageId` in `TEXT_MESSAGE_*` / `TOOL_CALL_RESULT`).
+Ids line up because the server mints them. Every assistant step and tool result is stored under the same id it was sent to the client with (`messageId` in `TEXT_MESSAGE_*` / `TOOL_CALL_RESULT`). A client message is matched against the store by that id. A `tool` message is also matched by its `toolCallId`, because some clients (TanStack AI) send tool results back under ids of their own. Client messages the store doesn't know are ignored, such as the text of a step that was cancelled before it committed.
+
+Two histories are rejected before anything is committed or the model is called:
+
+- **`HistoryMismatch`:** the store has entries, but none of the client's messages match them.
+- **`HistoryDiverged`:** the client lacks a stored message that comes after the last one it has, because it edited or regenerated a turn, or missed a step. Appending its new messages would put them after history it doesn't have, so the run fails instead. Edits and branches aren't supported. A client that gets this should read the thread again ([below](#reloading-a-thread)). Entries the client was never shown (system entries, approval responses) don't count, and nor do the steps an earlier attempt of the same run committed.
 
 The model prompt is the agent's system prompt followed by whatever `Thread.load` returns, unchanged. Two adjustments are made only so providers accept it:
 
@@ -263,8 +268,23 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 
 - **the latest entries the client has seen**, with their ids. The client's new messages are those after the last one whose id `load` returns. If none of its ids are returned, the run fails with `HistoryMismatch`.
 - **every assistant entry with an unanswered approval request.** `resume` answers are matched against these, and an answer to a request that isn't loaded is ignored.
+- **nothing new after what the client has seen.** Write a summary as a `system` entry, or put it before the latest entries the client has seen. A user, assistant or tool entry the client never saw, placed after them, makes its next run fail with `HistoryDiverged`.
 
-In practice: summarise older history, and keep the tail from the last user message on.
+In practice: summarise older history into a system entry, and keep the tail from the last user message on.
+
+### Reloading a thread
+
+A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `Messages.history` turns a thread back into what its runs' events showed, for the client to restore:
+
+```ts
+const { messages, interrupts } = yield * Effect.map(thread.load(threadId), Messages.history);
+// messages: the AG-UI user, assistant and tool messages, with the ids and content the events carried
+// interrupts: { runId, pending } for approvals still open (as RUN_FINISHED carried them), or undefined
+```
+
+The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, and answers each of `interrupts.pending` with a `resume` entry in its next run. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. System entries, approval responses and reasoning are not returned; tool results come directly after their calls. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
+
+TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effentic rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
 
@@ -516,7 +536,7 @@ To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`
 
 Each plane is a `Context.Service`. Implement it with your store and provide it as a layer.
 
-**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. If `load` returns a compacted thread, it must keep what runs reconcile against ([Threads](#threads)). `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
+**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. It must store each entry it appends with the commit's `runId`, and `load` must return it: `Messages.history` names the run that raised open approvals from it, and a run executed again after a crash recognises its own earlier steps by it (without it, that run fails with `HistoryDiverged`). An entry that is already stored keeps its first run. If `load` returns a compacted thread, it must keep what runs reconcile against ([Threads](#threads)). `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
 
 ```ts
 const ThreadLive = Layer.effect(
@@ -524,14 +544,14 @@ const ThreadLive = Layer.effect(
   Effect.gen(function* () {
     const db = yield* Database;
     return Thread.Thread.of({
-      // entries in commit order; [] for an unknown thread
+      // entries in commit order, each with the runId that appended it; [] for an unknown thread
       load: (threadId) => db.loadEntries(threadId),
       // set active_run_id when it is null, already runId, or expired; else fail with ThreadBusy
       claim: (threadId, runId) => db.claimThread(threadId, runId),
       // clear active_run_id if it is runId
       release: (threadId, runId) => db.releaseThread(threadId, runId),
-      // append each entry whose id is not stored yet, in order
-      commit: (threadId, runId, entries) => db.appendNew(threadId, entries),
+      // append each entry whose id is not stored yet, in order, recording runId on it
+      commit: (threadId, runId, entries) => db.appendNew(threadId, runId, entries),
       // once per run that claimed the thread, after its last commit: a hook for compaction or bookkeeping
       runEnded: (threadId, runId, outcome) => Effect.void,
     });
@@ -539,7 +559,7 @@ const ThreadLive = Layer.effect(
 );
 ```
 
-Entries are `{ id, message }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Thread.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
+Entries are `{ id, message, runId? }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Thread.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
 
 **Checkpoint ledger:** a get/set store keyed by `(threadId, runId, name)`. The values are JSON-encoded `Exit`s. Keep all three in the key: the client picks `runId`, so it is only unique within a thread.
 
@@ -557,13 +577,13 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                                                               |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors  |
-| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowOptions`, `WorkflowPayload`, `RunInputMismatch`               |
-| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                      |
-| `Messages`   | `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use  |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                     |
+| Module       | Main exports                                                                                                                                                                                              |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError`                                                                |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                            |
+| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowOptions`, `WorkflowPayload`, `RunInputMismatch`                                                                              |
+| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                               |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                   |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                     |
+| `Messages`   | `history`, `History`: reading a thread back; `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`: the building blocks the runners use |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                                                                                    |

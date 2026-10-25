@@ -127,7 +127,7 @@ const pipeline =
       Stream.unwrap(
         Effect.gen(function* () {
           const stored = yield* thread.load(threadId);
-          const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
+          const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages, runId));
           const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
           const malformed = Messages.malformedAnswers(input.resume ?? []);
           if (malformed.length > 0) {

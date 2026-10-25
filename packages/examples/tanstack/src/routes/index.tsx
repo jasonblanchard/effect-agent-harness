@@ -1,18 +1,35 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { fetchServerSentEvents, useChat, type UIMessage } from "@tanstack/ai-react";
-import { useState, type FormEvent } from "react";
+import { Schema } from "effect";
+import { useEffect, useState, type FormEvent } from "react";
 
 export const Route = createFileRoute("/")({
+  // The thread id lives in the URL (`/?thread=…`), so a reload continues the thread.
+  validateSearch: Schema.toStandardSchemaV1(Schema.Struct({ thread: Schema.optional(Schema.String) })),
   component: Chat,
 });
 
 function Chat() {
-  // The server owns the thread's history, so a fresh page needs a fresh thread:
-  // reusing an id the server already holds, without its history, is rejected.
-  const [threadId] = useState(() => crypto.randomUUID());
+  const { thread } = Route.useSearch();
+  const navigate = Route.useNavigate();
+  // A page without a thread id starts a new thread.
+  useEffect(() => {
+    if (thread === undefined) {
+      void navigate({ search: { thread: crypto.randomUUID() }, replace: true });
+    }
+  }, [thread, navigate]);
+  return thread === undefined ? null : <ChatThread key={thread} threadId={thread} />;
+}
+
+function ChatThread({ threadId }: { readonly threadId: string }) {
+  // The server owns the thread's history. With `persistence: true`, the client
+  // loads it on mount (`GET /api/chat?threadId=…`), open approvals included,
+  // and still sends its whole history on every run. Don't set `history`:
+  // paging makes the client send only new messages, which the server rejects.
   const { messages, sendMessage, isLoading, error, stop, interrupts, resumeInterruptsUnsafe } = useChat({
     connection: fetchServerSentEvents("/api/chat"),
     threadId,
+    persistence: true,
   });
   const [input, setInput] = useState("");
 

@@ -1,8 +1,9 @@
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { Config, DateTime, Effect, Layer, Stream } from "effect";
+import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
+import { modelMessagesToUIMessages } from "@tanstack/ai";
+import { Agent, AgUi, Checkpoint, EventLog, Messages, Runner, Sse, Thread } from "effentic";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
@@ -39,9 +40,38 @@ const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-e
 // held in memory until the next run answers them.
 const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
 
+const HydrateQuery = Schema.Struct({ threadId: Schema.String });
+
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const runAgent = yield* Runner.make(assistant);
+    const thread = yield* Thread.Thread;
+
+    // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
+    // true`). On mount, the page restores the thread's messages and its open
+    // approvals from here, so a reload continues the thread. Runs are
+    // request-scoped, so a reload cancels the run in flight: there is never
+    // an `activeRun` to rejoin.
+    yield* router.add(
+      "GET",
+      "/api/chat",
+      Effect.gen(function* () {
+        const { threadId } = yield* HttpServerRequest.schemaSearchParams(HydrateQuery);
+        const { messages, interrupts } = Messages.history(yield* thread.load(threadId));
+        return yield* HttpServerResponse.json({
+          // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent).
+          messages: modelMessagesToUIMessages(
+            messages.map((message) => ({ ...message, content: message.content ?? null })),
+          ),
+          interrupts: interrupts === undefined ? null : interrupts,
+          activeRun: null,
+        });
+      }).pipe(
+        Effect.catchTag("SchemaError", () =>
+          Effect.succeed(HttpServerResponse.text("Missing threadId", { status: 400 })),
+        ),
+      ),
+    );
 
     // POST /api/chat: TanStack AI's `fetchServerSentEvents` posts an AG-UI
     // `RunAgentInput` and reads the AG-UI events back as SSE. A disconnect
