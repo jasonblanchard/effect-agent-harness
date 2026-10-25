@@ -241,7 +241,20 @@ describe("AgUi.fold", () => {
         outcome: {
           type: "interrupt",
           interrupts: [
-            { id: "id-2", reason: "tool-approval", toolCallId: "c_email", message: "Approve call to send-email?" },
+            {
+              id: "id-2",
+              reason: "tool-approval",
+              toolCallId: "c_email",
+              message: "Approve call to send-email?",
+              // The approval contract, so a generic client knows what to send.
+              responseSchema: {
+                $schema: "https://json-schema.org/draft/2020-12/schema",
+                type: "object",
+                properties: { approved: { type: "boolean" }, reason: { type: "string" } },
+                required: ["approved"],
+                additionalProperties: true,
+              },
+            },
           ],
         },
       });

@@ -1,7 +1,7 @@
 import { Option, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import * as Agent from "./Agent.ts";
-import type * as AgUi from "./AgUi.ts";
+import * as AgUi from "./AgUi.ts";
 import type * as Thread from "./Thread.ts";
 
 // -----------------------------------------------------------------------------
@@ -76,11 +76,17 @@ export const ingest = (messages: ReadonlyArray<AgUi.Message>, options?: IngestOp
     }
   });
 
-const ApprovalPayload = Schema.Struct({
-  approved: Schema.optional(Schema.Unknown),
-  reason: Schema.optional(Schema.String),
-});
-const decodeApprovalPayload = Schema.decodeUnknownOption(ApprovalPayload);
+const decodeApprovalResponse = Schema.decodeUnknownOption(AgUi.ApprovalResponse);
+
+/**
+ * The interrupt ids of the `resolved` answers whose payload is not an
+ * {@link AgUi.ApprovalResponse}. {@link resume} denies such an answer, which is
+ * safe but easy to miss, so the runner logs a warning naming them.
+ */
+export const malformedAnswers = (entries: ReadonlyArray<AgUi.ResumeEntry>): ReadonlyArray<string> =>
+  entries.flatMap((entry) =>
+    entry.status === "resolved" && Option.isNone(decodeApprovalResponse(entry.payload)) ? [entry.interruptId] : [],
+  );
 
 /**
  * The run leaves open an interrupt of the previous run. AG-UI does not let a
@@ -99,8 +105,9 @@ export class UnansweredInterrupt extends Schema.TaggedError<UnansweredInterrupt,
 /**
  * Approval responses for every approval request in `stored` that has none
  * yet. A request is approved only when its resume entry is `resolved` with
- * `payload.approved === true`; otherwise it is denied with `payload.reason`,
- * or "cancelled" / "denied". If any pending request has no resume entry, the
+ * an {@link AgUi.ApprovalResponse} payload whose `approved` is `true`;
+ * otherwise it is denied with the payload's `reason`, or "cancelled" /
+ * "denied". A payload that is not an `ApprovalResponse` denies the request. If any pending request has no resume entry, the
  * result is `UnansweredInterrupt` naming each of them. Resume entries that
  * match no pending request are ignored.
  */
@@ -134,7 +141,7 @@ export const resume = (
   return Result.succeed(
     pending.map((approvalId) => {
       const answer = answers.get(approvalId)!;
-      const payload = Option.getOrUndefined(decodeApprovalPayload(answer.payload));
+      const payload = Option.getOrUndefined(decodeApprovalResponse(answer.payload));
       const approved = answer.status === "resolved" && payload?.approved === true;
       const reason = payload?.reason ?? (answer.status === "cancelled" ? "cancelled" : "denied");
       return {

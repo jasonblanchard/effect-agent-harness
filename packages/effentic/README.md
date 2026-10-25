@@ -313,7 +313,19 @@ When the model calls it, the handler does not run. Other tool calls in the same 
   "outcome": {
     "type": "interrupt",
     "interrupts": [
-      { "id": "…", "reason": "tool-approval", "toolCallId": "…", "message": "Approve call to send-email?" }
+      {
+        "id": "…",
+        "reason": "tool-approval",
+        "toolCallId": "…",
+        "message": "Approve call to send-email?",
+        "responseSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": { "approved": { "type": "boolean" }, "reason": { "type": "string" } },
+          "required": ["approved"],
+          "additionalProperties": true
+        }
+      }
     ]
   }
 }
@@ -331,7 +343,8 @@ await agent.runAgent({
 
 The answered call is executed (or denied) before the model is called again, and the model then sees the result. The rules:
 
-- **Approved** only when `status` is `"resolved"` and `payload.approved === true`. Anything else is a denial. `payload.reason` is passed to the model as the reason.
+- **Approved** only when `status` is `"resolved"` and `payload` is an approval response (`AgUi.ApprovalResponse`, `{ approved: boolean, reason?: string }`) with `approved: true`. Anything else is a denial. `payload.reason` is passed to the model as the reason. Each approval interrupt carries this contract as its `responseSchema`, so a generic client can tell what to send.
+- A `resolved` answer whose payload is not an approval response, such as `{ approve: true }` or `"yes"`, is denied, and the runner logs a warning naming the interrupt ids.
 - `status: "cancelled"` is denied with reason `"cancelled"`.
 - **Every open interrupt must be answered.** A run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredInterrupt`, and nothing it sent is committed. AG-UI 1.0 forbids treating a missing answer as a decision, and `HttpAgent` already refuses to send such a run. To move on without approving, for example when the user types a new message instead, answer each open interrupt with `status: "cancelled"` in the same run as the new message.
 - Resume entries for unknown interrupt ids are ignored.
@@ -540,10 +553,10 @@ Everything is exported from `"effentic"` as namespaces.
 | Module       | Main exports                                                                                                                               |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                                    |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `fold`, `closeOpen`, event constructors                |
 | `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `Options`, `RunOptions`, `WorkflowOptions`, `WorkflowPayload`, `RunInputMismatch`               |
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                    |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `layerMemory`                                                                                       |
-| `Messages`   | `delta`, `ingest`, `resume`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use                      |
+| `Messages`   | `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `UnansweredInterrupt`: the building blocks the runners use  |
 | `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                     |

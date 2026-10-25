@@ -129,6 +129,13 @@ const pipeline =
           const stored = yield* thread.load(threadId);
           const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages));
           const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
+          const malformed = Messages.malformedAnswers(input.resume ?? []);
+          if (malformed.length > 0) {
+            yield* Effect.logWarning(
+              "effentic: resolved answers that are not approval responses were denied",
+              malformed,
+            );
+          }
           // Answers to the previous run come before anything new the client says.
           const added = [...responses, ...Messages.ingest(delta, { clientSystem: options?.clientSystem })];
           yield* thread.commit(threadId, runId, added);

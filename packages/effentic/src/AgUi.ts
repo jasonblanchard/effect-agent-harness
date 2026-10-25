@@ -48,10 +48,26 @@ export const Message = Schema.Struct({
 export type Message = typeof Message.Type;
 
 /**
+ * The payload of a `resolved` answer to a tool approval. Every approval
+ * interrupt carries its JSON Schema as `responseSchema`, so a generic client
+ * can tell what to send.
+ */
+export const ApprovalResponse = Schema.Struct({
+  approved: Schema.Boolean,
+  /** Passed to the model as the denial reason. */
+  reason: Schema.optionalKey(Schema.String),
+});
+export type ApprovalResponse = typeof ApprovalResponse.Type;
+
+const approvalResponseSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  ...Schema.toJsonSchemaDocument(ApprovalResponse).schema,
+};
+
+/**
  * An answer to an interrupt of the previous run. For a tool approval, the call
- * is approved only when `status` is `"resolved"` and `payload.approved` is
- * `true`; anything else denies it. `payload.reason` is passed to the model as
- * the denial reason.
+ * is approved only when `status` is `"resolved"` and `payload` is an
+ * {@link ApprovalResponse} with `approved: true`; anything else denies it.
  */
 export const ResumeEntry = Schema.Struct({
   interruptId: Schema.String,
@@ -246,6 +262,7 @@ export const fold =
                       reason: "tool-approval",
                       toolCallId: approval.toolCallId,
                       message: `Approve call to ${approval.toolName}?`,
+                      responseSchema: approvalResponseSchema,
                     })),
                   ),
                 ];

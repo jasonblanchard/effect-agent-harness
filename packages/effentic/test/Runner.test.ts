@@ -1,6 +1,6 @@
 import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Fiber, Layer, Schema, Scope, Stream } from "effect";
+import { Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
@@ -467,7 +467,13 @@ describe("Runner.run approvals", () => {
         outcome: {
           type: "interrupt",
           interrupts: [
-            { id: "id-2", reason: "tool-approval", toolCallId: "c_email", message: "Approve call to send-email?" },
+            {
+              id: "id-2",
+              reason: "tool-approval",
+              toolCallId: "c_email",
+              message: "Approve call to send-email?",
+              responseSchema: expect.any(Object),
+            },
           ],
         },
       });
@@ -500,6 +506,26 @@ describe("Runner.run approvals", () => {
       const { emails, result } = yield* roundTrip((id) => [{ interruptId: id, status: "resolved" }]);
       expect(emails).toEqual([]);
       expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"denied"}' });
+    }),
+  );
+
+  it.effect("denies a resolved answer that is not an approval response, and logs a warning", () =>
+    Effect.gen(function* () {
+      const logs: Array<{ level: string; message: unknown }> = [];
+      const capture = Logger.make(({ logLevel, message }) => {
+        logs.push({ level: logLevel, message });
+      });
+      const { emails, result } = yield* roundTrip((id) => [
+        { interruptId: id, status: "resolved", payload: { approve: true } },
+      ]).pipe(Effect.provide(Logger.layer([capture])));
+      expect(emails).toEqual([]);
+      expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"denied"}' });
+      expect(logs).toEqual([
+        {
+          level: "Warn",
+          message: ["effentic: resolved answers that are not approval responses were denied", ["id-2"]],
+        },
+      ]);
     }),
   );
 

@@ -177,6 +177,20 @@ describe("Messages.resume", () => {
   });
 });
 
+describe("Messages.malformedAnswers", () => {
+  it("names the resolved answers whose payload is not an approval response", () => {
+    expect(
+      Messages.malformedAnswers([
+        { interruptId: "ok", status: "resolved", payload: { approved: false, reason: "no" } },
+        { interruptId: "typo", status: "resolved", payload: { approve: true } },
+        { interruptId: "string", status: "resolved", payload: { approved: "yes" } },
+        { interruptId: "missing", status: "resolved" },
+        { interruptId: "cancelled", status: "cancelled" },
+      ]),
+    ).toEqual(["typo", "string", "missing"]);
+  });
+});
+
 describe("Messages.project", () => {
   it("keeps the entries verbatim and adds no system prompt", () => {
     const summary: Thread.Entry = { id: "s", message: Prompt.makeMessage("system", { content: "Summary: ..." }) };
