@@ -3,7 +3,7 @@ import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
-import { AuthContext, authenticate, CurrentUser, CurrentUserLayer } from "./auth.ts";
+import { AuthContext, authenticate } from "./auth.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
 import { GetWeather, getWeather } from "./tools/weather.tool.ts";
 
@@ -14,7 +14,7 @@ const assistant = Agent.define({
   toolkit: AssistantToolkit,
   // Resolved once per run, from the run's user and the clock.
   system: Effect.gen(function* () {
-    const user = yield* CurrentUser;
+    const user = yield* AuthContext;
     const today = DateTime.formatIsoDateUtc(yield* DateTime.now);
     return `
       You are a helpful AI assistant. Be friendly, conversational, and helpful.
@@ -41,11 +41,17 @@ const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-e
 // Swap these for durable implementations in production.
 const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
 
-const sse = (frames: Stream.Stream<string, unknown>) =>
-  HttpServerResponse.stream(frames.pipe(Stream.encodeText), {
-    contentType: Sse.contentType,
-    headers: { "cache-control": "no-cache" },
-  });
+// The response body is consumed after the handler has returned, so it closes
+// over the handler's context. Whatever the stream still needs is a requirement
+// of the handler, which the web handler provides from the app layer's
+// services (`Layer.provideMerge` below keeps them in the layer's output).
+const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
+  Effect.map(Effect.context<R>(), (context) =>
+    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
+      contentType: Sse.contentType,
+      headers: { "cache-control": "no-cache" },
+    }),
+  );
 
 const invalidInput = (error: { readonly message: string }) =>
   Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 }));
@@ -53,16 +59,14 @@ const invalidInput = (error: { readonly message: string }) =>
 const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401 }));
 
 // The routes authenticate the request and provide the principal, never the
-// token, as the run's `AuthContext`; `CurrentUserLayer` turns it into the
-// `CurrentUser` the agent requires, once per run. A real server would also check here that the principal
-// owns the thread id: the stores do no access control. That one check also
-// covers the thread's runs, because the library keys every run by thread id
-// and run id, and the client picks the run id.
+// token, as the run's `AuthContext`, which the system prompt and the email
+// tool require. A real server would also check here that the principal owns
+// the thread id: the stores do no access control. That one check also covers
+// the thread's runs, because the library keys every run by thread id and run
+// id, and the client picks the run id.
 
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const runAgent = yield* Runner.make(assistant, { dependencies: [AuthContext], layer: CurrentUserLayer });
-
     // POST /agent: the run streams back as SSE, and ends if the client disconnects.
     yield* router.add(
       "POST",
@@ -70,14 +74,16 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
+        return yield* sse(Sse.encode(Runner.run(assistant)(input).pipe(Stream.provideService(AuthContext, principal))));
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
     // POST /runs starts a run that outlives the request;
     // GET /threads/:threadId/runs/:runId/events follows it, resuming after the
     // client's `Last-Event-ID`.
-    const detached = yield* Runner.makeDetached(assistant, { dependencies: [AuthContext], layer: CurrentUserLayer });
+    // A detached run outlives the request, so the runner captures its services
+    // now and names the one each `start` provides instead.
+    const detached = yield* Runner.makeDetached(assistant, { dependencies: [AuthContext] });
     const log = yield* EventLog.EventLog;
 
     yield* router.add(
@@ -106,7 +112,7 @@ const AgentRoutes = HttpRouter.use((router) =>
         // Fails before the response starts if the cursor was never issued, so
         // the client gets a 400 instead of a stream that never yields.
         const events = yield* log.subscribe(threadId, runId, lastEventId);
-        return sse(Sse.encodeStored(events));
+        return yield* sse(Sse.encodeStored(events));
       }).pipe(
         Effect.catchTags({
           Unauthorized: unauthorized,
@@ -116,7 +122,7 @@ const AgentRoutes = HttpRouter.use((router) =>
       ),
     );
   }),
-).pipe(Layer.provide(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
+).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
 
 /**
  * The AG-UI endpoints as an in-process web handler (`Request => Promise<Response>`).

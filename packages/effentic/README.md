@@ -67,23 +67,25 @@ const ModelLayer = AnthropicLanguageModel.layer({ model: "claude-haiku-5-5" }).p
 );
 
 // 4. An AG-UI route
-const AgentRoute = HttpRouter.use((router) =>
-  Effect.gen(function* () {
-    const runAgent = yield* Runner.make(weather);
-    yield* router.add(
-      "POST",
-      "/agent",
-      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.map((input) =>
-          HttpServerResponse.stream(Sse.encode(runAgent(input)).pipe(Stream.encodeText), {
-            contentType: Sse.contentType,
-          }),
-        ),
-        Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
-      ),
-    );
-  }),
-).pipe(Layer.provide(Layer.mergeAll(ModelLayer, ToolsLayer, Thread.layerMemory, Checkpoint.layerNone)));
+const runAgent = Runner.run(weather);
+
+// The response body is read after the handler has returned, so it closes over the handler's context.
+const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
+  Effect.map(Effect.context<R>(), (context) =>
+    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
+      contentType: Sse.contentType,
+    }),
+  );
+
+const AgentRoute = HttpRouter.add(
+  "POST",
+  "/agent",
+  HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
+    Effect.flatMap((input) => sse(Sse.encode(runAgent(input)))),
+    Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
+  ),
+  // The handler's services come from the app layer's output: merge them in rather than hide them.
+).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, Thread.layerMemory, Checkpoint.layerNone)));
 
 export const { handler } = HttpRouter.toWebHandler(AgentRoute);
 ```
@@ -178,11 +180,11 @@ Pick a runner by what should happen when the client goes away:
 
 | Runner                | A client disconnect…              | Requires                                                               |
 | --------------------- | --------------------------------- | ---------------------------------------------------------------------- |
-| `Runner.run` / `make` | cancels the run (model and tools) | `Thread`, `Checkpoint`, model, tools, and what the per-run layer needs |
+| `Runner.run`          | cancels the run (model and tools) | `Thread`, `Checkpoint`, model, tools, and what the per-run layer needs |
 | `Runner.makeDetached` | does nothing; the run continues   | the above + `EventLog`, `Scope`                                        |
 | `Runner.workflow`     | does nothing; an engine owns it   | the above (minus `Checkpoint`) + `WorkflowEngine`                      |
 
-`Runner.make` captures the services once and returns a function whose streams need nothing, so they can be used directly as response bodies. `Runner.run` is the same, but leaves the requirements on each stream.
+`Runner.run` is a plain function: nothing is captured, and each stream requires the agent's services. A route calls it inside its handler and closes over the handler's context before handing the stream to the response, as the quick start's `sse` does, because the body is read after the handler has returned. With `effect/http`, keep those services in the app layer's output (`Layer.provideMerge`): the web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument.
 
 Guarantees for every runner:
 
@@ -209,7 +211,7 @@ RUN_FINISHED { outcome: { type: "success" } }
 `Runner` takes options as a second argument:
 
 ```ts
-Runner.make(agent, { clientSystem: "allow" }); // default "drop"
+Runner.run(agent, { clientSystem: "allow" }); // default "drop"
 ```
 
 `clientSystem` controls `system` / `developer` messages sent by the client. By default they are dropped, so only your `system` prompt instructs the model.
@@ -227,7 +229,7 @@ Every run gets an `Agent.RunInfo`, which the system prompt and tools read throug
 Trusted data such as the verified principal is not run info. Whoever starts the run provides it as a service (a per-run dependency), and the agent reads it as services the runner builds per run:
 
 ```ts
-runAgent(input).pipe(Stream.provideService(AuthContext, principal)); // the function Runner.make returns; Runner.run(agent, …)(input) alike
+runAgent(input).pipe(Stream.provideService(AuthContext, principal)); // runAgent = Runner.run(agent, …)
 detached.start(input).pipe(Effect.provideService(AuthContext, principal));
 start(input).pipe(Effect.provideService(AuthContext, principal)); // from Runner.workflow
 ```
@@ -257,7 +259,7 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 
 **One run at a time.** A thread has at most one active run, because each run reconciles the client against what it loaded and commits on top of it. Every runner claims the thread (`Thread.claim`) before loading it, and a run started while another is active ends at once with `RUN_ERROR` code `ThreadBusy`, without touching the thread. The claim is released after the run's last commit and before its `RUN_FINISHED` / `RUN_ERROR` is sent, so a client can start the next run as soon as it sees the last one end. `HttpAgent` already runs one run at a time per agent, so `ThreadBusy` usually means a second tab or a run that is still going in the background.
 
-- A request-scoped run (`run` / `make`) that is cancelled releases the thread.
+- A request-scoped run (`run`) that is cancelled releases the thread.
 - A detached or workflow run that crashes keeps it: the thread stays busy until the run is resumed and ends. A durable store should expire a claim after longer than any run takes, so a crashed run that is never resumed doesn't hold its thread for ever.
 - The same run claims again when it resumes, so starting the same run twice at once is not prevented.
 
@@ -291,7 +293,7 @@ The system prompt is never stored in the thread: the agent adds it to every mode
 
 ## Authentication and run context
 
-effentic never sees the request's credentials. The route authenticates, and provides the result to the run as a service, the way any Effect dependency is provided. The runner declares which services each run needs from its caller (its `dependencies`, as a tool's `dependencies` are required per call), and how to turn them into the services the agent requires:
+effentic never sees the request's credentials. The route authenticates, and provides the result to the run as a service, the way any Effect dependency is provided. The agent can require that service directly, or a per-run `layer` turns it into the services the agent requires:
 
 ```ts
 // What the route provides for each run: the principal it verified.
@@ -308,28 +310,28 @@ const CurrentUserLayer = Layer.effect(CurrentUser)(
   }),
 );
 
-const runAgent = yield * Runner.make(agent, { dependencies: [AuthContext], layer: CurrentUserLayer });
+const runAgent = Runner.run(agent, { layer: CurrentUserLayer });
 
-yield *
-  router.add(
-    "POST",
-    "/agent",
-    Effect.gen(function* () {
-      const principal = yield* authenticate; // verify the bearer token: signature, expiry, audience
-      const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-      yield* threadOwners.authorize(input.threadId, principal); // see below
-      return sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
-    }).pipe(/* Unauthorized → 401, Forbidden → 403, decode errors → 400 */),
-  );
+const AgentRoute = HttpRouter.add(
+  "POST",
+  "/agent",
+  Effect.gen(function* () {
+    const principal = yield* authenticate; // verify the bearer token: signature, expiry, audience
+    const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
+    yield* threadOwners.authorize(input.threadId, principal); // see below
+    // `sse` as in the quick start: it closes over the handler's context, which holds UserDirectory and the rest.
+    return yield* sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
+  }).pipe(/* Unauthorized → 401, Forbidden → 403, decode errors → 400 */),
+);
 ```
 
 How it fits together:
 
-- **Dependencies are requirements of each run.** The runner captures everything else when it's built, but leaves its `dependencies` on each run's stream (or on `start`), so a run whose `AuthContext` isn't provided fails to typecheck. If auth middleware already provided it to the route, forward it: `Stream.provideContext(yield* Effect.context<AuthContext>())`. A runner without dependencies adds no requirement.
-- **The layer is ordinary Effect.** It reads the dependencies like any service, and services that depend on each other compose as layers do (a tenant from the user, say). What it needs besides the dependencies, such as `UserDirectory`, is captured when the runner is built, like the stores. What it provides is not required from outside.
+- **The principal is a requirement of each run.** `Runner.run` captures nothing: `AuthContext` is on the stream like every other service, so a run whose `AuthContext` isn't provided fails to typecheck. If auth middleware already provided it to the route, the handler's context holds it, and closing over that context (as `sse` does) provides it. A detached or workflow runner captures its services when it's built, so it names the per-run ones instead, `dependencies: [AuthContext]`, and leaves them on `start`. An agent without per-run services adds no requirement.
+- **The layer is ordinary Effect.** It reads `AuthContext` like any service, and services that depend on each other compose as layers do (a tenant from the user, say). What it needs besides, such as `UserDirectory`, stays on the stream too, provided the same way as the stores. What it provides is not required from outside.
 - **It's built for every run attempt, before the thread is claimed.** A run that fails to build it ends with `RUN_ERROR` (code: the error's tag), claims nothing and isn't reported to the store. Its finalizers run when the attempt ends. It's not memoised: a resumed run builds it again, so steps not yet run see the new services. A computed system prompt is memoised (as `system`), though, so it keeps the first attempt's text.
-- **You can provide the layer yourself with `make`.** List the built service in `dependencies` (`dependencies: [CurrentUser]`) and provide the layer on each run's stream: `runAgent(input).pipe(Stream.provide(CurrentUserLayer), Stream.provideService(AuthContext, principal))`. It's still built per run, but a failure to build it fails the stream (a broken response) instead of ending the run with `RUN_ERROR`. Detached and workflow runs need `layer`: a detached run's services must outlive the call to `start`, and a workflow rebuilds them from its persisted dependencies on every replay.
-- **"Context" means two things here.** A dependency is an entry in the run's Effect context (the services it can `yield*`). It's unrelated to the AG-UI input's own `context` field, which never reaches it.
+- **You can provide the layer yourself with `run`.** Leave `layer` out and provide it on each run's stream: `runAgent(input).pipe(Stream.provide(CurrentUserLayer), Stream.provideService(AuthContext, principal))`. It's still built per run, but a failure to build it fails the stream (a broken response) instead of ending the run with `RUN_ERROR`. Detached and workflow runs need `layer`: a detached run's services must outlive the call to `start`, and a workflow rebuilds them from its persisted dependencies on every replay.
+- **"Context" means two things here.** A per-run service is an entry in the run's Effect context (the services it can `yield*`). It's unrelated to the AG-UI input's own `context` field, which never reaches it.
 - **Keys must be unique**, as for any Effect service: two services with the same key are one service.
 
 Three rules:
@@ -614,7 +616,7 @@ Everything is exported from `"effentic"` as namespaces.
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError`                                                                |
 | `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                            |
-| `Runner`     | `run`, `make`, `makeDetached`, `workflow`, `RunContext`, `Options`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                  |
+| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                       |
 | `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                               |
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                   |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                     |

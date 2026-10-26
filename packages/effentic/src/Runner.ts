@@ -24,7 +24,7 @@ export interface RunContextClass<Self, Key extends string, S extends Schema.Top>
 
 export type AnyRunContext = RunContextClass<any, string, any>;
 
-/** Any service key, as {@link Options.dependencies} takes them. */
+/** Any service key, as {@link DetachedOptions.dependencies} takes them. */
 export type AnyService = Context.Key<any, any>;
 
 /**
@@ -37,10 +37,11 @@ export type AnyService = Context.Key<any, any>;
  * }) {}
  * ```
  *
- * A workflow's {@link Options.dependencies} must be run contexts, because the
- * engine persists each one in the run's payload, encoded with its schema. The
- * request-scoped and detached runners take any service, so a plain
- * `Context.Service` is enough there; a run context works too.
+ * A workflow's {@link DetachedOptions.dependencies} must be run contexts,
+ * because the engine persists each one in the run's payload, encoded with its
+ * schema. The detached runner takes any service, so a plain `Context.Service`
+ * is enough there; a run context works too. A request-scoped {@link run}
+ * declares nothing: the agent requires the service, and the route provides it.
  */
 export const RunContext =
   <Self>() =>
@@ -52,34 +53,21 @@ export const RunContext =
       static readonly schema = options.schema;
     };
 
-/** The services a runner's {@link Options.dependencies} name. */
+/** The services a runner's {@link DetachedOptions.dependencies} name. */
 export type DependencyServices<Dependencies extends ReadonlyArray<AnyService>> = Dependencies[number]["Identifier"];
 
-export interface Options<
-  Dependencies extends ReadonlyArray<AnyService> = readonly [],
-  ROut = never,
-  E = never,
-  RIn = never,
-> {
+/** Options of every runner. {@link run} takes exactly these. */
+export interface Options<ROut = never, E = never, RIn = never> {
   /** What to do with client-sent `system`/`developer` messages. See {@link Messages.IngestOptions}. */
   readonly clientSystem?: Messages.IngestOptions["clientSystem"];
   /**
-   * Services each run requires from whoever starts it, such as the verified
-   * principal, instead of capturing them when the runner is built, as a tool's
-   * `dependencies` are required per call. Provide them around each run
-   * (`Stream.provideService`, or `Effect.provideService` around `start`). Any
-   * service key, except for a {@link workflow}, which takes {@link RunContext}s.
-   */
-  readonly dependencies?: Dependencies;
-  /**
-   * Builds per-run services, such as the current user, typically from the
-   * `dependencies`. It is built for every run attempt, before the input check
-   * and the claim, and lives until the attempt ends. It is not memoised: a run
-   * executed again builds it again. A failure to build it ends the run with
-   * `RUN_ERROR`.
+   * Builds per-run services, such as the current user, typically from a
+   * service the caller provides per run, like the verified principal. It is
+   * built for every run attempt, before the input check and the claim, and
+   * lives until the attempt ends. It is not memoised: a run executed again
+   * builds it again. A failure to build it ends the run with `RUN_ERROR`.
    *
-   * With {@link make} or {@link run} you can instead list the built service
-   * itself in `dependencies` and provide the layer on each run's stream
+   * With {@link run} you can instead provide the layer on the run's stream
    * (`Stream.provide`), but then a failure to build it fails the stream
    * instead of ending the run with `RUN_ERROR`. A detached run needs `layer`,
    * so its services live as long as the run rather than the call to `start`,
@@ -90,11 +78,33 @@ export interface Options<
 }
 
 /**
- * What a runner captures when it's built: the agent's
- * requirements, less the per-run services and the per-run dependencies, plus
- * what the per-run layer needs, less the per-run dependencies. The thread store and the
- * checkpoint store are always required from outside, because the run uses them
- * before its per-run services exist.
+ * Options of the runners that capture their services when they're built
+ * ({@link makeDetached}, {@link workflow}), which therefore name the services
+ * to leave out of the capture.
+ */
+export interface DetachedOptions<
+  Dependencies extends ReadonlyArray<AnyService> = readonly [],
+  ROut = never,
+  E = never,
+  RIn = never,
+> extends Options<ROut, E, RIn> {
+  /**
+   * Services each run requires from whoever starts it, such as the verified
+   * principal, instead of capturing them when the runner is built, as a tool's
+   * `dependencies` are required per call. Provide them around each `start`
+   * (`Effect.provideService`). Any service key, except for a {@link workflow},
+   * which takes {@link RunContext}s.
+   */
+  readonly dependencies?: Dependencies;
+}
+
+/**
+ * What a runner needs from outside: the agent's requirements, less the per-run
+ * services and the per-run dependencies, plus what the per-run layer needs,
+ * less the per-run dependencies. The thread store and the checkpoint store are
+ * always required from outside, because the run uses them before its per-run
+ * services exist. A detached or workflow runner captures this when it's built;
+ * {@link run} has no dependencies and leaves it on each stream.
  */
 export type Requirements<
   Tools extends Record<string, Tool.Any>,
@@ -173,8 +183,8 @@ const endRun = (
  * Builds the per-run layer, which reads the per-run dependencies from the
  * context it runs in. The built services live in the scope this is given.
  */
-const resolveServices = <Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
-  options: Options<Dependencies, ROut, E, RIn> | undefined,
+const resolveServices = <ROut, E, RIn>(
+  options: Options<ROut, E, RIn> | undefined,
 ): Effect.Effect<Context.Context<ROut>, E, RIn | Scope.Scope> =>
   options?.layer === undefined
     ? // Without a layer there are no per-run services.
@@ -209,12 +219,12 @@ const resolveServices = <Dependencies extends ReadonlyArray<AnyService>, ROut, E
  * never fails. A run that never claimed the thread is not reported to the
  * store. Nor is an interrupted run (e.g. a cancelled request), since it has
  * not ended: it keeps its claim, and running it again finishes it. The
- * request-scoped runners release a cancelled run's claim themselves.
+ * request-scoped runner releases a cancelled run's claim itself.
  */
 const pipeline =
   <Tools extends Record<string, Tool.Any>, R, Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
     agent: Agent.Agent<Tools, R>,
-    options?: Options<Dependencies, ROut, E, RIn>,
+    options?: Options<ROut, E, RIn>,
   ) =>
   (
     input: AgUi.RunAgentInput,
@@ -290,26 +300,26 @@ const pipeline =
  * Runs an agent for one AG-UI `RunAgentInput`, scoped to the stream: when the
  * consumer stops reading (a client disconnects, `abortRun()`), the run is
  * cancelled, including any model request or tool call in progress.
+ *
+ * Nothing is captured: the function is plain, and each stream requires the
+ * agent's services (a per-run service such as the verified principal among
+ * them), the stores, and whatever the per-run `layer` needs. At a transport
+ * edge, call it inside the request handler, provide the per-request services
+ * (`Stream.provideService(AuthContext, principal)`) and close over the
+ * handler's context (`Stream.provideContext(yield* Effect.context())`) before
+ * handing the stream to the response, so it needs nothing more once the
+ * handler has returned. The rest is then a requirement of the handler: with
+ * `effect/http`, keep those services in the app layer's output
+ * (`Layer.provideMerge`), which the web handler provides to every request.
  */
-export const run = <
-  Tools extends Record<string, Tool.Any>,
-  R,
-  const Dependencies extends ReadonlyArray<AnyService> = readonly [],
-  ROut = never,
-  E = never,
-  RIn = never,
->(
+export const run = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
   agent: Agent.Agent<Tools, R>,
-  options?: Options<Dependencies, ROut, E, RIn>,
+  options?: Options<ROut, E, RIn>,
 ) => {
-  const runWith = pipeline(agent, options);
+  const runWith = pipeline<Tools, R, readonly [], ROut, E, RIn>(agent, options);
   return (
     input: AgUi.RunAgentInput,
-  ): Stream.Stream<
-    AgUi.Event,
-    never,
-    Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies>
-  > =>
+  ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
     Stream.suspend(() => {
       // A run that ended has released its thread. Nothing resumes a cancelled
       // request-scoped run, so a stream that stops before the end frees it.
@@ -336,35 +346,6 @@ export const run = <
 };
 
 /**
- * Captures the services once and returns a request-scoped runner. Use this at
- * a transport edge (HTTP response, WebSocket, ...) where the stream is
- * consumed after the surrounding effect has returned. Each run's stream
- * requires only the runner's per-run dependencies: provide them per request
- * (`Stream.provideService(AuthContext, principal)`) and the stream needs
- * nothing more. Services the per-run layer provides are not captured: they are
- * built for each run.
- */
-export const make = <
-  Tools extends Record<string, Tool.Any>,
-  R,
-  const Dependencies extends ReadonlyArray<AnyService> = readonly [],
-  ROut = never,
-  E = never,
-  RIn = never,
->(
-  agent: Agent.Agent<Tools, R>,
-  options?: Options<Dependencies, ROut, E, RIn>,
-): Effect.Effect<
-  (input: AgUi.RunAgentInput) => Stream.Stream<AgUi.Event, never, DependencyServices<Dependencies>>,
-  never,
-  Requirements<Tools, R, Dependencies, ROut, RIn>
-> =>
-  Effect.map(Effect.context<Requirements<Tools, R, Dependencies, ROut, RIn>>(), (context) => {
-    const runWith = run(agent, options);
-    return (input) => runWith(input).pipe(Stream.provideContext(context));
-  });
-
-/**
  * Runs the pipeline into the event log. If the log already holds an earlier
  * attempt of the run, that attempt is completed instead of started over: a
  * finished run is left alone, spans the attempt left open are closed, and its
@@ -374,7 +355,7 @@ export const make = <
 const detached =
   <Tools extends Record<string, Tool.Any>, R, Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
     agent: Agent.Agent<Tools, R>,
-    options?: Options<Dependencies, ROut, E, RIn>,
+    options?: DetachedOptions<Dependencies, ROut, E, RIn>,
   ) =>
   (
     input: AgUi.RunAgentInput,
@@ -383,7 +364,7 @@ const detached =
     EventLog.EventLogError,
     Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies> | EventLog.EventLog
   > => {
-    const runWith = pipeline(agent, options);
+    const runWith = pipeline<Tools, R, Dependencies, ROut, E, RIn>(agent, options);
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const append = (event: AgUi.Event) => log.append(input.threadId, input.runId, event);
@@ -427,7 +408,7 @@ export const makeDetached = <
   RIn = never,
 >(
   agent: Agent.Agent<Tools, R>,
-  options?: Options<Dependencies, ROut, E, RIn>,
+  options?: DetachedOptions<Dependencies, ROut, E, RIn>,
 ): Effect.Effect<
   { readonly start: (input: AgUi.RunAgentInput) => Effect.Effect<void, never, DependencyServices<Dependencies>> },
   never,
@@ -463,7 +444,7 @@ export interface WorkflowOptions<
   ROut = never,
   E = never,
   RIn = never,
-> extends Options<Dependencies, ROut, E, RIn> {
+> extends DetachedOptions<Dependencies, ROut, E, RIn> {
   /**
    * The workflow's name. The engine registers the workflow under it, derives
    * execution ids from it and persists it with every execution, so it must be

@@ -42,9 +42,23 @@ const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, Eve
 
 const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 
+// A plain function: nothing is captured until a request runs it.
+const runAgent = Runner.run(assistant);
+
+// The response body is consumed after the handler has returned, so it closes
+// over the handler's context. Whatever the stream still needs is a requirement
+// of the handler, which the web handler provides from the app layer's
+// services (`Layer.provideMerge` below keeps them in the layer's output).
+const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
+  Effect.map(Effect.context<R>(), (context) =>
+    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
+      contentType: Sse.contentType,
+      headers: { "cache-control": "no-cache" },
+    }),
+  );
+
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const runAgent = yield* Runner.make(assistant);
     const thread = yield* Thread.Thread;
 
     // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
@@ -82,10 +96,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       "/api/chat",
       Effect.gen(function* () {
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return HttpServerResponse.stream(Sse.encode(runAgent(input)).pipe(Stream.encodeText), {
-          contentType: Sse.contentType,
-          headers: { "cache-control": "no-cache" },
-        });
+        return yield* sse(Sse.encode(runAgent(input)));
       }).pipe(
         Effect.catch((error) =>
           Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 })),
@@ -93,7 +104,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       ),
     );
   }),
-).pipe(Layer.provide(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
+).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
 
 /** The chat endpoint as a web handler (`Request => Promise<Response>`), mounted by `src/routes/api/chat.ts`. */
 export const { handler } = HttpRouter.toWebHandler(ChatRoutes, { disableLogger: true });

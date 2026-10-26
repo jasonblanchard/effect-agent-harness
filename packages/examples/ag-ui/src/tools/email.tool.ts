@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect";
 import { Tool } from "effect/ai";
-import { CurrentUser } from "../auth.ts";
+import { AuthContext } from "../auth.ts";
 
 export const SendEmail = Tool.make("send-email", {
   description: "Send an email on the user's behalf",
@@ -14,14 +14,14 @@ export const SendEmail = Tool.make("send-email", {
   failureMode: "return",
   // The run stops with an AG-UI interrupt until the user approves the call.
   needsApproval: true,
-  // The handler reads who is sending; the runner builds it for each run.
-  dependencies: [CurrentUser],
+  // The handler reads who is sending; the route provides it for each run.
+  dependencies: [AuthContext],
 });
 
 /** A stand-in that only prints the email: this is an example. */
 export const sendEmail = ({ to, subject }: { readonly to: string; readonly subject: string }) =>
   Effect.gen(function* () {
-    const user = yield* CurrentUser;
+    const user = yield* AuthContext;
     console.log(`📧 (not really) sending "${subject}" from ${user.name} to ${to}`);
     return { sent: true };
   });

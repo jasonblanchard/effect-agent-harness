@@ -1,19 +1,23 @@
 ## MODIFIED Requirements
 
 ### Requirement: Runner without service requirements
-The package SHALL provide a way to capture the agent's services (language model, tool handlers, thread store, checkpoint store, any services the agent's system prompt declares, and the services the runner's per-run layer requires other than its declared run contexts) once and obtain a request-scoped runner. Services the per-run layer provides SHALL NOT be captured; they are built for each run. The runner SHALL accept, for each run, the run's input. Each run's event stream SHALL then require nothing but the runner's declared run contexts, so once the caller provides those it can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service. The stream SHALL require the agent's services (language model, tool handlers, thread store, checkpoint store, and any services the agent's system prompt or tools declare, such as the trusted context the caller provides per run), less the services the run's per-run layer provides, plus that layer's own requirements. The caller SHALL be able to provide them where it consumes the stream, for example by providing the per-request ones and closing over its own context, so that the stream requires nothing and can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+
+#### Scenario: Nothing captured when the function is made
+- **WHEN** the run function is made outside any Effect, before any service exists
+- **THEN** making it requires nothing, and each stream it returns requires the services the run needs
 
 #### Scenario: Stream used as a response body
-- **WHEN** a caller captures the runner while its route is being set up and calls it for each request
-- **THEN** each returned event stream can be consumed without providing any further services
+- **WHEN** a route calls the run inside its request handler, provides the request's principal to the stream and then provides the handler's own context to it
+- **THEN** the stream requires nothing further and can be consumed after the handler has returned
 
 #### Scenario: Context per request
-- **WHEN** a caller captures the runner once and provides the "app/Auth" services `{ userId: "u1" }` and `{ userId: "u2" }` to the runs of two requests
+- **WHEN** a route provides the "app/Auth" services `{ userId: "u1" }` and `{ userId: "u2" }` to the runs of two requests
 - **THEN** each run's tools see only the services built from its own run context
 
-#### Scenario: Per-run services are not captured
-- **WHEN** an agent requires `CurrentUser`, and the runner's layer provides it from a declared run context
-- **THEN** capturing the runner does not require `CurrentUser` or the run context, and each run's stream requires only the run context
+#### Scenario: Per-run services are built per run
+- **WHEN** an agent requires `CurrentUser`, and the run's layer provides it from "app/Auth"
+- **THEN** the run's stream requires "app/Auth" and not `CurrentUser`, and `CurrentUser` is built for each run
 
 ### Requirement: Detached runner
 The package SHALL provide a runner that starts a run, given its input, in a scope the caller or a workflow engine owns, returns before the run completes, and appends every AG-UI event of the run to the event log under the thread id and run id. Starting a run SHALL require the runner's declared run contexts, read when the run is started, so a service the caller provides around the start reaches the run. Observing the run SHALL be done by subscribing to the event log.

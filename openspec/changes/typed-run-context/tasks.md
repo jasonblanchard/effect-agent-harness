@@ -2,7 +2,7 @@
 
 Conventions for every task: run from the repo root; `pnpm --filter effentic test` for the library tests; before ticking a group, `pnpm tsc && pnpm lint && pnpm test && pnpm format:check` must pass with no findings (lint denies warnings). Numbers in parentheses point at design.md decisions. Every AG-UI event sequence a test produces goes through `verify` from `test/fixtures.ts`. Type tests use `expectTypeOf` and `@ts-expect-error`, as `Agent.test.ts` does.
 
-The change was first implemented with a `context` argument keyed by tag key (design 2, alternatives). Groups 2–6 rework it to run contexts provided through the Effect context.
+The change was first implemented with a `context` argument keyed by tag key (design 2, alternatives). Groups 2–6 rework it to run contexts provided through the Effect context. Group 9 then removes `Runner.make` and `dependencies` from the request-scoped runner (design 2, 7, 9): it supersedes the `make` parts of 3.2, 3.3, 5.1, 8.2 and 8.3, which are left ticked as history.
 
 ## 1. RunInfo loses `context`
 
@@ -45,6 +45,16 @@ The change was first implemented with a `context` argument keyed by tag key (des
 - [x] 8.2 Verify in `Runner.test.ts`: a plain `Context.Service` dependency on `Runner.make` builds `CurrentUser` per run ("Plain service as a dependency"); `Runner.workflow` with a plain service fails to typecheck ("Workflow rejects a plain service").
 - [x] 8.3 Make the example's `AuthContext` a plain `Context.Service` and inline the runner options. Rework the README's auth section around a plain service, and introduce `RunContext` in the workflow section; update both `AGENTS.md` files.
 
+## 9. Request-scoped runs captured by the route
+
+- [x] 9.1 In `Runner.ts` remove `make`. Split the options: `Options` (`clientSystem`, `layer`) for `run`; `DetachedOptions extends Options` adds `dependencies`, for `makeDetached`; `WorkflowOptions extends DetachedOptions` narrows them to RunContexts and adds `name` (7). `run` drops the `Dependencies` type parameter; its stream requires `Requirements<Tools, R, readonly [], ROut, RIn>`. Update the `Options`, `pipeline`, `run` and `makeDetached` doc comments (the `layer` note about providing it yourself with `Stream.provide` now refers to `run`), and `index.ts` if it names `make` (2, 9).
+- [x] 9.2 Tests. `Sse.test.ts`: the `Runner.make` block becomes `Runner.run` used the way a handler does: the stream is built inside an effect, given the services with `Stream.provideContext(yield* Effect.context())`, and consumed after that effect has returned ("Stream used as a response body"). `Runner.test.ts`: replace 3.2's `make` type tests with `run` ones: `run` is made outside any Effect ("Nothing captured when the function is made"); with `layer: CurrentUserLayer` the stream requires `AuthContext` and not `CurrentUser` ("Per-run services are built per run"); a layer that also requires `S` puts `S` on the stream; without a layer `CurrentUser` stays required ("Missing service fails to typecheck"); `run` rejects `dependencies` with `@ts-expect-error`. Move "Plain service as a dependency" to `makeDetached`. Keep "Missing run context rejected at compile time" on `run`'s stream and `start`.
+- [ ] 9.3 Example `packages/examples/ag-ui`: `sse` becomes `<R>(frames) => Effect<HttpServerResponse, never, R>`, capturing the handler's context (design 9); `runAgent = Runner.run(assistant)` outside the layer; `POST /agent` provides `AuthContext` and returns `yield* sse(...)`; the GET events route uses the same helper. The system prompt and the email tool read `AuthContext` directly, so drop `CurrentUser` and `CurrentUserLayer` from `auth.ts`, and `makeDetached` keeps `dependencies: [AuthContext]` with no layer. Update the example's `AGENTS.md` (route notes, file notes, manual check 2's wording) and run its manual checks.
+  - Code and `AGENTS.md` done 2026-10-26 (`pnpm tsc` and `pnpm lint` pass). The manual checks were not run: no `ANTHROPIC_API_KEY` was available in this session. Run them before ticking this task.
+- [x] 9.4 Example `packages/examples/tanstack`: `runAgent = Runner.run(assistant)` outside the layer, and the handler closes over its context the same way.
+- [x] 9.5 Docs. README: the quick start route, "Running over AG-UI" (the runner table, the `make` paragraph, the options snippet), the "Run info" snippet, "Authentication and run context" (the snippet with `Runner.run` in the handler and the `sse` helper; the "Dependencies are requirements" and "provide the layer yourself" bullets) and the module reference row. `packages/effentic/AGENTS.md`: the `Runner.ts` note (`run` alone is request-scoped and captures nothing; `dependencies` only on `makeDetached` and `workflow`).
+
 ## 7. Wrap-up
 
 - [x] 7.1 Run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check` and fix every finding. Run `openspec validate typed-run-context --strict`.
+- [x] 7.2 After group 9, run the same four commands and `openspec validate typed-run-context --strict` again, and fix every finding.

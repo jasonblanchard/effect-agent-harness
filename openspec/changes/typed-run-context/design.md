@@ -3,7 +3,7 @@
 See proposal.md for why. The current state that shapes the approach:
 
 - **The context is opaque end to end.** `RunOptions.context` is `unknown`. The pipeline copies it into `Agent.RunInfo.context`, which `Agent.CurrentRun` exposes. The workflow payload declares it `Schema.optional(Schema.Unknown)`. The example decodes it again in `currentPrincipal` and calls `orDie`.
-- **Runners capture services when they're built.** `make` and `makeDetached` take `Effect.context<Agent.Requirements<Tools, R> | Thread.Thread | …>()` once and provide it to every run. `workflow` returns a layer with those requirements. Nothing per run can reach the agent except `RunInfo`.
+- **Runners capture services when they're built.** `make` and `makeDetached` take `Effect.context<Agent.Requirements<Tools, R> | Thread.Thread | …>()` once and provide it to every run. `workflow` returns a layer with those requirements. Nothing per run can reach the agent except `RunInfo`. `make`'s capture exists only because `HttpServerResponse.stream` takes a stream with no requirements and the body is consumed after the handler has returned; the handler's own context holds the same services, because a route's requirements are provided by the router's layer (`router.add` leaves the handler's `R` on the `HttpRouter.use` layer).
 - **The input fingerprint ignores the context.** The `input` checkpoint memoises `JSON.stringify` of the encoded AG-UI input only (`Runner.ts`, `pipeline`). `RunInputMismatch` therefore never compares contexts.
 - **Re-execution takes the context from the caller.** A detached run doesn't store its context. `makeDetached`'s doc tells callers to pass the same one again. A workflow persists it in the payload, because the engine persists the payload.
 - **Failures before the claim aren't reported to the store.** `pipeline` checks the input, then claims, and only `claimed` routes terminal events through `endRun`. Errors before the claim still become `RUN_ERROR` via `failInBand`.
@@ -16,6 +16,7 @@ See proposal.md for why. The current state that shapes the approach:
 - The route hands the run its trusted context the Effect way, by providing a service, and the compiler checks it did.
 - Per-run services are built by an ordinary `Layer`, with Effect's own composition for dependencies between them.
 - Agents and evals don't change: an agent requires `CurrentUser` like any other service.
+- A request-scoped run captures nothing. The route closes over its services per request, with `Effect.context` and `Stream.provideContext`, the way any stream is handed across a boundary that demands no requirements.
 
 **Non-Goals:**
 
@@ -40,24 +41,24 @@ An ordinary tag means the route provides it with `provideService`, and a per-run
 
 Alternatives: a plain schema with a separate tag (two things to keep in step); requiring a RunContext for every runner (one kind of declaration, but a schema nobody reads for request-scoped and detached runs, and an odd error for a plain service under an option named like a tool's `dependencies`). That was the first choice; it was reversed once the option was renamed `dependencies` (decision 2).
 
-### 2. Per-run dependencies are provided through the Effect context
+### 2. Per-run dependencies are provided through the Effect context; only runners that capture declare them
 
-A runner that declares `dependencies: [AuthContext]` leaves those services as requirements on each run, instead of capturing them when it's built. It's the same idea as a tool's `dependencies`, which are required per call instead of when the handler layer is built, so it has the same name:
+A runner that forks or persists a run (`makeDetached`, `workflow`) captures its services when it's built, so it must declare which services come from the caller per run instead: `dependencies: [AuthContext]`. It leaves those as requirements on `start`. It's the same idea as a tool's `dependencies`, which are required per call instead of when the handler layer is built, so it has the same name:
 
-- `Runner.make`'s function returns `Stream<AgUi.Event, never, AuthContext>`;
-- `Runner.run`'s stream requires them alongside everything else;
-- `makeDetached`'s `start` returns `Effect<void, never, AuthContext>`.
+- `makeDetached`'s `start` returns `Effect<void, never, AuthContext>`;
+- `workflow`'s `start` returns `Effect<void, never, AuthContext | WorkflowEngine>`.
 
-The route provides them: `runAgent(input).pipe(Stream.provideService(AuthContext, principal))`, or `Stream.provideContext(yield* Effect.context<AuthContext>())` to forward what auth middleware provided. A runner without `contexts` has no extra requirements, as today.
+A request-scoped run captures nothing, so it declares nothing. `Runner.run(agent)` is a plain function; its stream requires every service the run needs, `AuthContext` among them, and the route provides them inside its handler: the per-request one with `Stream.provideService(AuthContext, principal)`, or `Stream.provideContext(yield* Effect.context<AuthContext>())` to forward what auth middleware provided, and the rest by closing over the handler's context (decision 9). TypeScript then has nothing to tell apart: whatever the handler hasn't provided when it captures is captured.
 
-The list is still needed: TypeScript can't tell which of the agent's or the layer's requirements the caller means to provide per run, so `dependencies` names them. Everything else is captured when the runner is built.
+The list is still needed where a capture happens: TypeScript can't tell which of the agent's or the layer's requirements the caller means to provide per run, so `dependencies` names them, and everything else is captured when the runner is built.
 
 There is no runtime check of a provided value. A service is as trustworthy as any other in Effect: the type says what it holds.
 
 Alternatives:
 
+- `Runner.make`, capturing when the route is defined, with `dependencies` naming what to leave out. This was the first version of this change. It needs a type-level subtraction (`Exclude<Requirements, DependencyServices>`) and a `Dependencies` type parameter on the request-scoped runner, only to tell the compiler which of the agent's or the layer's requirements the route provides per run. Capturing per request, in the route, makes that distinction unnecessary, and `make` with it.
 - A `context` argument keyed by tag key (`{ "app/Auth": principal }`), checked against each schema in the runner. This was implemented first. It worked, but it duplicated what Effect's context already does: callers built a map of string keys, the runner needed a rest-tuple type to make the argument required, and a runtime check (`RunContextInvalid`) to cover casts.
-- `make`'s function returning `Effect<Stream<AgUi.Event>, never, AuthContext>`, which captures from the route's context. With middleware that's one `yield*`, but a route without middleware wraps it in `provideService` anyway, and a run is no longer a plain stream.
+- `make`'s function returning `Effect<Stream<AgUi.Event>, never, AuthContext>`, which captures from the route's context. With middleware that's one `yield*`, but a route without middleware wraps it in `provideService` anyway, and a run is no longer a plain stream. Decision 9 keeps the run a plain stream and puts the capture in the route's own transport helper.
 
 ### 3. A workflow is started from its input, with the context read from the caller
 
@@ -97,34 +98,60 @@ Alternative: build the layer when the runner is built and read the tags lazily. 
 
 ### 7. Options and types
 
-`Options` gains `dependencies` (a readonly tuple of service keys) and `layer`. Both are optional. `WorkflowOptions` narrows `dependencies` to RunContexts. The services a tuple of keys names are read from each key's `Identifier` (`DependencyServices<Dependencies>`), not `InstanceType`, which is `any` for these classes.
+`Options` has `clientSystem` and `layer`, both optional; it is what `run` takes. `DetachedOptions` extends it with `dependencies` (a readonly tuple of service keys), for `makeDetached`. `WorkflowOptions` extends `DetachedOptions`, narrows `dependencies` to RunContexts and adds `name`. The services a tuple of keys names are read from each key's `Identifier` (`DependencyServices<Dependencies>`), not `InstanceType`, which is `any` for these classes.
 
-Each runner function gains type parameters `Dependencies` and the layer's `ROut`, `E` and `RIn`. `Runner.Requirements<Tools, R, Dependencies, ROut, RIn>` is what a runner captures:
+Every runner function gains the layer's type parameters `ROut`, `E` and `RIn`; the detached and workflow runners also gain `Dependencies`. `Runner.Requirements<Tools, R, Dependencies, ROut, RIn>` is what a runner that captures needs from outside:
 
 `Exclude<Agent.Requirements<Tools, R>, ROut | DependencyServices<Dependencies>> | Exclude<RIn, DependencyServices<Dependencies>> | Thread.Thread | Checkpoint.Checkpoint`
 
 `Checkpoint` is always required from outside, because the input check uses it before the per-run services exist; a layer that provided it would otherwise remove it from the requirements.
 
-- `run`'s stream requires `Requirements | DependencyServices`.
-- `make` captures `Requirements`; its streams require `DependencyServices`.
+- `run`'s stream requires `Requirements<Tools, R, readonly [], ROut, RIn>`: the agent's requirements minus what the layer provides, plus the layer's own, plus the stores. Nothing is subtracted, because nothing is captured.
 - `makeDetached` captures `Requirements | EventLog`; `start` requires `DependencyServices`.
 - `workflow`'s layer requires `Requirements` minus `Checkpoint`, plus `EventLog` and the engine; `start` requires `DependencyServices | WorkflowEngine`.
 
-`RunOptions` and `WorkflowPayload` are removed. Runners take just the input.
+`RunOptions`, `WorkflowPayload` and `make` are removed. Runners take just the input.
 
 ### 8. `RunInfo` loses `context`
 
 `Agent.RunInfo` keeps `runId`, `threadId` and `props`. `Agent.run` and `Agent` need no new type parameter: per-run services arrive as ordinary requirements (see Context). An eval provides `CurrentUser` around `Agent.run`. A permanent type test pins the tool-dependency behaviour the proposal records.
+
+### 9. A request-scoped run is captured by the route
+
+`Runner.run(agent, options)` is called once, outside any Effect, and returns a plain function. The route calls it in its handler, provides the per-request service, and closes over its own context in whatever builds the response body. The example's SSE helper is the whole mechanism:
+
+```ts
+const sse = <R>(frames: Stream.Stream<string, unknown, R>): Effect.Effect<HttpServerResponse.HttpServerResponse, never, R> =>
+  Effect.map(Effect.context<R>(), (context) =>
+    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
+      contentType: Sse.contentType,
+    }),
+  );
+
+const runAgent = Runner.run(assistant); // nothing captured
+
+// in the POST /agent handler
+return yield* sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
+```
+
+`R` is whatever the stream still needs. The handler requires it, and `router.add` records it on the route layer as a per-request requirement (`Request<"Requires", R>`), which `toWebHandler` and `serve` satisfy from the app layer's *outputs*, building them once. So the services that fed `make` through `Layer.provide` are now merged in with `Layer.provideMerge` (or `Layer.mergeAll(Routes, Services)`); `Layer.provide` would hide them and leave the web handler asking for a per-request context. The library ships no such helper: how a response body is built belongs to the transport, and the README shows this one. Checked on 2026-10-26 with the example's `agent.ts`, which calls the web handler with a request alone, and with `Sse.test.ts`'s route.
+
+At runtime the captured context also holds the request's `Scope` and `HttpServerRequest`. That's harmless: the run reads only the services it requires, and the per-run layer is built inside the attempt stream's own `Stream.unwrap` scope, which takes precedence over a `Scope` in the provided context, so the layer still lives as long as the attempt (decision 6), not the request. `make` captured the router layer's `Scope` the same way. `run` keeps releasing a cancelled run's claim when the consumer stops.
+
+The example's agent reads `AuthContext` directly, in its system prompt and its email tool, and provides it on both routes; it has no per-run layer and no `CurrentUser`. The README's auth section shows a layer that looks the user up, and the tests cover `layer` on every runner.
 
 ## Risks / Trade-offs
 
 - [A replayed attempt can see different service values from the first attempt] → Completed steps replay from their checkpoints, so only steps not yet run see the new values. A computed system prompt is memoised as `system`, so it keeps the first attempt's text even if it reads a per-run service; only tool handlers see the new values. The README states that services are resolved again on every attempt, and that a layer reading external state should expect this.
 - [A route that re-executes with a different context isn't caught] → Decision 4. The detached runner's doc and the spec say to provide the same services. A workflow can't hit this, because the context comes from the payload.
 - [The context is implicit at the call site] → It's a requirement in the run's type until provided, so it can't be forgotten; that's how every other Effect dependency works.
-- [Type complexity: every runner carries more type parameters] → Defaults keep the no-context case unchanged at call sites. Type tests cover the requirements arithmetic.
+- [Type complexity: the detached and workflow runners carry more type parameters] → Defaults keep the no-context case unchanged at call sites, and `run` carries none for dependencies. Type tests cover the requirements arithmetic.
+- [A route captures its whole request context into a run's stream] → Only the services the run requires are read, and the per-run layer's scope is the stream's, not the request's (decision 9).
+- [The example shows no per-run layer] → Its agent reads the principal directly, the simplest correct shape; the README shows a layer, and the tests exercise one on every runner.
 - [Two RunContexts with the same tag key] → They collapse into one service and one payload field. The docs say keys must be unique, as for any Effect service.
 
 ## Migration Plan
 
-- Library callers: replace `{ context: value }` with a service (a RunContext for a workflow), `dependencies`, `layer`, and `provideService` around the run; read services instead of `CurrentRun.context`. Start workflow runs with `start(input)` instead of `workflow.execute`.
+- Library callers: replace `{ context: value }` with a service (a RunContext for a workflow), `layer`, `dependencies` on detached and workflow runners, and `provideService` around the run; read services instead of `CurrentRun.context`. Start workflow runs with `start(input)` instead of `workflow.execute`.
+- `Runner.make(agent, { dependencies, layer })` callers: call `Runner.run(agent, { layer })` once outside the route, use it inside the handler, provide the per-request service, and close over the handler's context before building the response (decision 9).
 - Workflow executions in flight when this ships were persisted with `context: unknown`. The new payload schema may reject them on decode. Drain them first, or register the new workflow under a new `name`.
