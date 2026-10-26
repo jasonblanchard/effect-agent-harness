@@ -19,7 +19,7 @@ An agent definition SHALL consist of a tool set, an optional system prompt and a
 - **THEN** the first run's system prompt names Ada, the second's names Grace, and the definition is unchanged
 
 ### Requirement: Run from a prompt to step events
-Given a run's info and a prompt, the run SHALL produce an event stream that never fails. The run info SHALL consist of a run id, a thread id, optional properties supplied by the client and an optional context supplied by the server. The prompt SHALL NOT contain the agent's system prompt; the run adds it. Each model step SHALL begin with a step-started event carrying the step number and that step's assistant message id. The stream SHALL end with exactly one terminal event: finished (with an outcome) or failed (with the error's message and code), and SHALL emit nothing after it.
+Given a run's info and a prompt, the run SHALL produce an event stream that never fails. The run info SHALL consist of a run id, a thread id and optional properties supplied by the client. The prompt SHALL NOT contain the agent's system prompt; the run adds it. Each model step SHALL begin with a step-started event carrying the step number and that step's assistant message id. The stream SHALL end with exactly one terminal event: finished (with an outcome) or failed (with the error's message and code), and SHALL emit nothing after it.
 
 #### Scenario: Text-only reply
 - **WHEN** the model replies with text and finish reason `stop`
@@ -123,11 +123,11 @@ Message ids and approval ids SHALL be generated through the id generator service
 - **THEN** its step-finished entries carry the same ids as in the original execution
 
 ### Requirement: The current run is available to the system prompt and tool handlers
-While it computes the system prompt and while it executes each tool handler, the run SHALL make its run info available as the current run, exactly as the run was given it. A tool SHALL be able to read the current run by declaring it as a dependency. Running an agent SHALL NOT require the caller to provide the current run.
+While it computes the system prompt and while it executes each tool handler, the run SHALL make its run info (run id, thread id and properties) available as the current run, exactly as the run was given it. A tool SHALL be able to read the current run by declaring it as a dependency. Running an agent SHALL NOT require the caller to provide the current run. Trusted per-run data, such as the verified principal, SHALL reach the agent as services it requires, not through the current run.
 
 #### Scenario: Tool handler reads the context
-- **WHEN** a run is given the context `{ userId: "u1" }` and the model calls a tool whose handler reads the current run
-- **THEN** the handler sees run info with that context and the run's run id and thread id
+- **WHEN** a run is given run id "r1", thread id "t1" and properties `{ locale: "fr" }`, and the model calls a tool whose handler reads the current run
+- **THEN** the handler sees run id "r1", thread id "t1" and properties `{ locale: "fr" }`, and the run info has no context field
 
 #### Scenario: Eval supplies the run info
 - **WHEN** an eval runs an agent directly with literal run info and mock services, without any AG-UI input

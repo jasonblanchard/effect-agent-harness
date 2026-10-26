@@ -48,14 +48,17 @@ export const define = <Tools extends Record<string, Tool.Any>, R = never>(option
 // Run
 // -----------------------------------------------------------------------------
 
-/** Which run is executing, as the system prompt and tool handlers see it through {@link CurrentRun}. */
+/**
+ * Which run is executing, as the system prompt and tool handlers see it
+ * through {@link CurrentRun}. Trusted per-run data, such as the verified
+ * principal, is not here: the agent requires it as an ordinary service, which
+ * a runner builds per run from its declared `Runner.RunContext`s.
+ */
 export interface RunInfo {
   readonly runId: string;
   readonly threadId: string;
   /** Set by the client (AG-UI `forwardedProps`), so untrusted: choose between known values, don't interpolate. */
   readonly props?: unknown;
-  /** Set by whoever started the run, never by the client: e.g. the verified principal. Must be JSON-encodable. */
-  readonly context?: unknown;
 }
 
 export interface RunInput extends RunInfo {

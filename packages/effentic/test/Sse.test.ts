@@ -2,6 +2,7 @@ import { HttpAgent, randomUUID } from "@ag-ui/client";
 import { EventType } from "@ag-ui/core";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Stream } from "effect";
+import { expectTypeOf } from "vitest";
 import * as EffectSse from "effect/encoding/Sse";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { Tool } from "effect/ai";
@@ -52,8 +53,7 @@ describe("Sse.encode", () => {
   it.effect("encodes each event as one SSE data frame, in order", () =>
     Effect.gen(function* () {
       const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
-      const runAgent = yield* Runner.make(weatherAgent).pipe(Effect.provide(layer));
-      const frames = yield* Stream.runCollect(Sse.encode(runAgent(input)));
+      const frames = yield* Stream.runCollect(Sse.encode(Runner.run(weatherAgent)(input))).pipe(Effect.provide(layer));
       expect(parseSse(frames.join(""))).toEqual([
         { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
         { type: EventType.STEP_STARTED, stepName: "step-1" },
@@ -87,7 +87,33 @@ describe("Sse.encodeStored", () => {
   );
 });
 
-describe("Runner.make", () => {
+describe("Runner.run", () => {
+  it.effect("returns a stream the route closes over and consumes after its handler has returned", () =>
+    Effect.gen(function* () {
+      const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
+      // Made outside any Effect: nothing is captured until a request runs it.
+      const runAgent = Runner.run(weatherAgent);
+      // As a request handler does: it provides its own context to the stream and returns it.
+      const handler = Effect.gen(function* () {
+        const stream = runAgent(input);
+        return stream.pipe(Stream.provideContext(yield* Effect.context<Stream.Services<typeof stream>>()));
+      });
+      const stream = yield* handler.pipe(Effect.provide(layer));
+      expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUi.Event, never, never>>();
+      const events = yield* Stream.runCollect(stream);
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.STEP_STARTED,
+        EventType.TEXT_MESSAGE_START,
+        EventType.TEXT_MESSAGE_CONTENT,
+        EventType.TEXT_MESSAGE_CONTENT,
+        EventType.TEXT_MESSAGE_END,
+        EventType.STEP_FINISHED,
+        EventType.RUN_FINISHED,
+      ]);
+    }),
+  );
+
   it.effect("stops the run when the consumer stops reading", () =>
     Effect.gen(function* () {
       // The model stream never ends on its own, so its finalizer only runs if the
@@ -99,8 +125,9 @@ describe("Runner.make", () => {
           Stream.ensuring(Effect.sync(() => (interrupted = true))),
         ),
       ]);
-      const runAgent = yield* Runner.make(weatherAgent).pipe(Effect.provide(layer));
-      const events = yield* Stream.runCollect(runAgent(input).pipe(Stream.take(3)));
+      const events = yield* Stream.runCollect(Runner.run(weatherAgent)(input).pipe(Stream.take(3))).pipe(
+        Effect.provide(layer),
+      );
       expect(events.map((e) => e.type)).toEqual([
         EventType.RUN_STARTED,
         EventType.STEP_STARTED,
@@ -120,30 +147,33 @@ afterEach(async () => {
   await Promise.all(disposers.splice(0).map((dispose) => dispose()));
 });
 
-const makeHandler = <Tools extends Record<string, Tool.Any>>(
-  agent: Agent.Agent<Tools>,
-  layer: Layer.Layer<Agent.Requirements<Tools> | Thread.Thread>,
-) => {
-  const AgentRoute = HttpRouter.use((router) =>
-    Effect.gen(function* () {
-      const runAgent = yield* Runner.make(agent);
-      yield* router.add(
-        "POST",
-        "/agent",
-        HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-          Effect.map((input) =>
-            HttpServerResponse.stream(Sse.encode(runAgent(input)).pipe(Stream.encodeText), {
-              contentType: Sse.contentType,
-            }),
-          ),
-          Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
-        ),
-      );
+/** The response body is consumed after the handler has returned, so it closes over the handler's context. */
+const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
+  Effect.map(Effect.context<R>(), (context) =>
+    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
+      contentType: Sse.contentType,
     }),
-  ).pipe(Layer.provide(layer));
-  const { handler, dispose } = HttpRouter.toWebHandler(AgentRoute, { disableLogger: true });
-  disposers.push(dispose);
-  return handler;
+  );
+
+/** The agent's route. The handler requires what the run's stream needs; the router's layer provides it. */
+const agentRoute = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>) => {
+  const runAgent = Runner.run(agent);
+  return HttpRouter.use((router) =>
+    router.add(
+      "POST",
+      "/agent",
+      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
+        Effect.flatMap((input) => sse(Sse.encode(runAgent(input)))),
+        Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
+      ),
+    ),
+  );
+};
+
+/** Keeps a web handler's `dispose` for `afterEach`. */
+const track = <Handler>(app: { readonly handler: Handler; readonly dispose: () => Promise<void> }): Handler => {
+  disposers.push(app.dispose);
+  return app.handler;
 };
 
 describe("HttpAgent against a caller-owned SSE route", () => {
@@ -157,7 +187,9 @@ describe("HttpAgent against a caller-owned SSE route", () => {
       [...text("0", "It is 18°C in Paris."), finish("stop")],
       [...text("0", "Still 18°C."), finish("stop")],
     ]);
-    const handler = makeHandler(weatherAgent, layer);
+    const handler = track(
+      HttpRouter.toWebHandler(agentRoute(weatherAgent).pipe(Layer.provideMerge(layer)), { disableLogger: true }),
+    );
     const agent = new HttpAgent({
       url: "http://localhost/agent",
       threadId: "main-conversation",
@@ -225,9 +257,13 @@ describe("HttpAgent tool approval", () => {
       [...text("0", "Sent."), finish("stop")],
     ]);
     const handlers = countingApprovalLayer();
-    const handler = makeHandler(
-      Agent.define({ toolkit: ApprovalToolkit }),
-      Layer.mergeAll(model.layer, handlers.layer, evalLayers, Thread.layerMemory),
+    const handler = track(
+      HttpRouter.toWebHandler(
+        agentRoute(Agent.define({ toolkit: ApprovalToolkit })).pipe(
+          Layer.provideMerge(Layer.mergeAll(model.layer, handlers.layer, evalLayers, Thread.layerMemory)),
+        ),
+        { disableLogger: true },
+      ),
     );
     const agent = new HttpAgent({
       url: "http://localhost/agent",

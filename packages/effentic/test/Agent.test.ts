@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Layer, Schema, Stream } from "effect";
 import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
+import type { LanguageModel } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import {
@@ -506,12 +507,10 @@ describe("Agent.CurrentRun", () => {
         runId: "r1",
         threadId: "t1",
         props: { locale: "fr" },
-        context: { userId: "u1" },
         prompt: userPrompt,
       }).pipe(Stream.runDrain, Effect.provide([model.layer, handlers.layer, evalLayers]));
-      expect(handlers.seen).toEqual([
-        { runId: "r1", threadId: "t1", props: { locale: "fr" }, context: { userId: "u1" } },
-      ]);
+      expect(handlers.seen).toEqual([{ runId: "r1", threadId: "t1", props: { locale: "fr" } }]);
+      expect(handlers.seen[0]).not.toHaveProperty("context");
     }),
   );
 
@@ -533,10 +532,59 @@ describe("Agent.CurrentRun", () => {
       yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }))({
         runId: "r1",
         threadId: "t1",
-        context: { userId: "u1" },
+        props: { locale: "fr" },
         prompt,
       }).pipe(Stream.runDrain, Effect.provide([model.layer, handlers.layer, evalLayers]));
-      expect(handlers.seen).toEqual([{ runId: "r1", threadId: "t1", context: { userId: "u1" } }]);
+      expect(handlers.seen).toEqual([{ runId: "r1", threadId: "t1", props: { locale: "fr" } }]);
+    }),
+  );
+});
+
+class CurrentUser extends Context.Service<CurrentUser, { readonly userId: string }>()("test/CurrentUser") {}
+
+const WhoIsUser = Tool.make("who-is-user", {
+  parameters: Schema.Struct({}),
+  success: Schema.String,
+  dependencies: [CurrentUser],
+});
+const UserToolkit = Toolkit.make(WhoIsUser);
+const userToolkitLayer = UserToolkit.toLayer({
+  "who-is-user": () =>
+    Effect.gen(function* () {
+      return (yield* CurrentUser).userId;
+    }),
+});
+
+describe("Agent per-run services", () => {
+  it("requires a tool's dependency as an ordinary service", () => {
+    type RequirementsOf<A> = A extends Agent.Agent<infer Tools, infer R> ? Agent.Requirements<Tools, R> : never;
+    const agent = Agent.define({ toolkit: UserToolkit });
+    expectTypeOf<CurrentUser>().toExtend<RequirementsOf<typeof agent>>();
+    // The handler layer builds without the dependency: handlers read it per call.
+    expectTypeOf(userToolkitLayer).toEqualTypeOf<Layer.Layer<Tool.HandlersFor<typeof UserToolkit.tools>>>();
+    const run = Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      Stream.runDrain,
+      Effect.provide([userToolkitLayer, evalLayers]),
+    );
+    // Still required once the handlers are provided: nothing provides it but the caller.
+    expectTypeOf<Effect.Services<typeof run>>().toEqualTypeOf<LanguageModel.LanguageModel | CurrentUser>();
+  });
+
+  it.effect("gives the handler the CurrentUser provided around Agent.run", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([
+        [...toolCall("c1", "who-is-user", {}), finish("tool-calls")],
+        [...text("0", "You are u1."), finish("stop")],
+      ]);
+      const events = yield* Agent.run(Agent.define({ toolkit: UserToolkit }))({
+        runId: "r1",
+        threadId: "t1",
+        prompt: userPrompt,
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide([model.layer, userToolkitLayer, evalLayers, Layer.succeed(CurrentUser)({ userId: "u1" })]),
+      );
+      expect(byTag(Array.from(events), "ToolResult").map((event) => event.encodedResult)).toEqual(["u1"]);
     }),
   );
 });

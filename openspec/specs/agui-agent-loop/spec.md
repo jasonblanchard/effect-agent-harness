@@ -301,7 +301,7 @@ A run on a thread with pending approval requests SHALL carry a resume entry for 
 - **THEN** the run is rejected with `UnansweredInterrupt` naming the other one, and neither answer is committed
 
 ### Requirement: Run info from the AG-UI input and the caller
-The agent SHALL run each AG-UI run with run info taken from its input and from the caller: the input's `runId` and `threadId`, the input's `forwardedProps` as the run's properties, unchanged, and as its context the value the caller passed when starting the run, unchanged. Nothing in the AG-UI input SHALL become the run's context. An input without `forwardedProps` SHALL run with no properties, and a run started without a context SHALL run with no context.
+The agent SHALL run each AG-UI run with run info taken from its input: the input's `runId` and `threadId`, and the input's `forwardedProps` as the run's properties, unchanged. The trusted context the caller provides for the run SHALL reach the agent only as its declared run contexts' services and the services built from them. Nothing in the AG-UI input, including its `forwardedProps` and its own `context` field, SHALL become one of those services. An input without `forwardedProps` SHALL run with no properties.
 
 #### Scenario: Forwarded properties reach the system prompt
 - **WHEN** an agent's system prompt reads the properties of the current run and a run arrives with `forwardedProps: { locale: "fr" }`
@@ -312,15 +312,15 @@ The agent SHALL run each AG-UI run with run info taken from its input and from t
 - **THEN** the system prompt is computed with no properties
 
 #### Scenario: Caller's context reaches tools
-- **WHEN** a caller starts a run with the context `{ userId: "u1" }` and the model calls a tool that reads the current run
-- **THEN** the handler sees the context `{ userId: "u1" }`
+- **WHEN** a caller provides the "app/Auth" service `{ userId: "u1" }` to a run on a runner whose layer builds `CurrentUser` from "app/Auth", and the model calls a tool that requires `CurrentUser`
+- **THEN** the handler sees the `CurrentUser` for `userId: "u1"`
 
 #### Scenario: The client cannot set the context
-- **WHEN** a caller starts a run with the context `{ userId: "u1" }` and the input's `forwardedProps` is `{ context: { userId: "u2" }, userId: "u2" }`
-- **THEN** the run's context is `{ userId: "u1" }`, and the client's values appear only in the run's properties
+- **WHEN** a caller provides the "app/Auth" service `{ userId: "u1" }` and the input's `forwardedProps` is `{ "app/Auth": { userId: "u2" }, userId: "u2" }`
+- **THEN** the tool sees the `CurrentUser` for `userId: "u1"`, and the client's values appear only in the run's properties
 
 ### Requirement: A run id names one input on its thread
-Everything the runner stores for a run SHALL be scoped by the input's thread id as well as its run id, because the client chooses both and the caller authorises only the thread. Before loading or committing anything, the runner SHALL memoise the input under the thread id and run id. If a run is executed again on the same thread with the same run id and a different input, it SHALL end with `RUN_ERROR` code `RunInputMismatch` without committing anything, calling the model or running a tool.
+Everything the runner stores for a run SHALL be scoped by the input's thread id as well as its run id, because the client chooses both and the caller authorises only the thread. Before loading or committing anything, the runner SHALL memoise the input under the thread id and run id. If a run is executed again on the same thread with the same run id and a different input, it SHALL end with `RUN_ERROR` code `RunInputMismatch` without committing anything, calling the model or running a tool. The run-context services SHALL NOT be part of the memoised input: re-executing a run with different ones SHALL NOT be detected, and the caller SHALL provide the ones the run was first started with.
 
 #### Scenario: Run id reused on another thread
 - **WHEN** run "r1" on thread "t1" calls `get-weather`, and then a run with run id "r1" and a different message is started on thread "t2" with the same ledger-backed checkpoint store
@@ -333,6 +333,10 @@ Everything the runner stores for a run SHALL be scoped by the input's thread id 
 #### Scenario: Same input executed again
 - **WHEN** a run is interrupted and executed again on the same thread with the same input
 - **THEN** it continues from its stored steps
+
+#### Scenario: Same input with a different context
+- **WHEN** a run is interrupted and executed again on the same thread with the same input and a different "app/Auth" service
+- **THEN** it does not fail with `RunInputMismatch`, and its remaining steps run with the services built from the new one
 
 ### Requirement: One active run per thread
 Every runner SHALL claim the input's thread after checking the input against its run id and before loading the thread, and SHALL release the claim after the run-ended notification and before emitting the terminal event, so a client's next run after `RUN_FINISHED` or `RUN_ERROR` finds the thread free. A run whose claim fails SHALL end with `RUN_ERROR` carrying the claim's error code (`ThreadBusy` when another run is active) without loading or committing anything. A request-scoped run that is cancelled before its terminal event SHALL release its claim. A detached or workflow run that is interrupted SHALL keep its claim, so the thread stays busy until the run is resumed and ends.
