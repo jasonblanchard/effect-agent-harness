@@ -36,7 +36,7 @@ A weather agent served as an AG-UI endpoint, backed by Anthropic:
 
 ```ts
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { Config, Effect, Layer, Schema, Stream } from "effect";
+import { Config, Effect, Layer, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Agent, AgUi, Checkpoint, Runner, Sse, Thread } from "effentic";
@@ -69,19 +69,12 @@ const ModelLayer = AnthropicLanguageModel.layer({ model: "claude-haiku-5-5" }).p
 // 4. An AG-UI route
 const runAgent = Runner.run(weather);
 
-// The response body is read after the handler has returned, so it closes over the handler's context.
-const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
-  Effect.map(Effect.context<R>(), (context) =>
-    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
-      contentType: Sse.contentType,
-    }),
-  );
-
 const AgentRoute = HttpRouter.add(
   "POST",
   "/agent",
   HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-    Effect.flatMap((input) => sse(Sse.encode(runAgent(input)))),
+    // `Sse.response` closes over the handler's context: the body is read after the handler has returned.
+    Effect.flatMap((input) => Sse.response(Sse.encode(runAgent(input)))),
     Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
   ),
   // The handler's services come from the app layer's output: merge them in rather than hide them.
@@ -184,7 +177,7 @@ Pick a runner by what should happen when the client goes away:
 | `Runner.makeDetached` | does nothing; the run continues   | the above + `EventLog`, `Scope`                                        |
 | `Runner.workflow`     | does nothing; an engine owns it   | the above (minus `Checkpoint`) + `WorkflowEngine`                      |
 
-`Runner.run` is a plain function: nothing is captured, and each stream requires the agent's services. A route calls it inside its handler and closes over the handler's context before handing the stream to the response, as the quick start's `sse` does, because the body is read after the handler has returned. With `effect/http`, keep those services in the app layer's output (`Layer.provideMerge`): the web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument.
+`Runner.run` is a plain function: nothing is captured, and each stream requires the agent's services. A route calls it inside its handler and returns `Sse.response(Sse.encode(stream))`. Because the body is read after the handler has returned, `Sse.response` closes over the handler's context, so whatever the stream still needs becomes a requirement of the handler. It also sets `text/event-stream` and `cache-control: no-cache`; `headers` and `status` are merged over them. With `effect/http`, keep those services in the app layer's output (`Layer.provideMerge`): the web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument. For the same reason, a per-request service the route forgets to provide, such as the principal, is not reported at the route but where the web handler is built or called. On another transport, close over the context yourself (`Stream.provideContext(yield* Effect.context())`) and use `Sse.encode` and `Sse.contentType`.
 
 Guarantees for every runner:
 
@@ -319,8 +312,8 @@ const AgentRoute = HttpRouter.add(
     const principal = yield* authenticate; // verify the bearer token: signature, expiry, audience
     const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
     yield* threadOwners.authorize(input.threadId, principal); // see below
-    // `sse` as in the quick start: it closes over the handler's context, which holds UserDirectory and the rest.
-    return yield* sse(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
+    // It closes over the handler's context, which holds UserDirectory and the rest.
+    return yield* Sse.response(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
   }).pipe(/* Unauthorized → 401, Forbidden → 403, decode errors → 400 */),
 );
 ```
@@ -505,9 +498,7 @@ yield *
         Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
       );
       const events = yield* log.subscribe(threadId, runId, headers["last-event-id"]);
-      return HttpServerResponse.stream(Sse.encodeStored(events).pipe(Stream.encodeText), {
-        contentType: Sse.contentType,
-      });
+      return yield* Sse.response(Sse.encodeStored(events));
     }).pipe(
       Effect.catchTag("InvalidCursor", (error) =>
         Effect.succeed(HttpServerResponse.text(error.message, { status: 400 })),
@@ -621,4 +612,4 @@ Everything is exported from `"effentic"` as namespaces.
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                   |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                     |
 | `Messages`   | `history`, `History`: reading a thread back; `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`: the building blocks the runners use |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`                                                                                                                                                    |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                        |

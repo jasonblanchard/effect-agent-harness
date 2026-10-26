@@ -87,6 +87,58 @@ describe("Sse.encodeStored", () => {
   );
 });
 
+describe("Sse.response", () => {
+  const frames = Sse.encode(
+    Stream.fromIterable<AgUi.Event>([{ type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" }]),
+  );
+
+  it.effect("streams SSE without caching by default", () =>
+    Effect.gen(function* () {
+      const response = HttpServerResponse.toWeb(yield* Sse.response(frames));
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      expect(response.headers.get("cache-control")).toBe("no-cache");
+    }),
+  );
+
+  it.effect("merges the caller's status and headers over the defaults", () =>
+    Effect.gen(function* () {
+      const extra = HttpServerResponse.toWeb(yield* Sse.response(frames, { headers: { "x-run": "r1" } }));
+      expect(extra.headers.get("x-run")).toBe("r1");
+      expect(extra.headers.get("content-type")).toBe("text/event-stream");
+      expect(extra.headers.get("cache-control")).toBe("no-cache");
+      const overridden = HttpServerResponse.toWeb(
+        yield* Sse.response(frames, { status: 201, headers: { "cache-control": "no-store" } }),
+      );
+      expect(overridden.status).toBe(201);
+      expect(overridden.headers.get("cache-control")).toBe("no-store");
+    }),
+  );
+
+  it.effect("gives the body the services of the context it was built in", () =>
+    Effect.gen(function* () {
+      const { layer } = services([[...text("0", "Hello"), finish("stop")]]);
+      const runAgent = Runner.run(weatherAgent);
+      const built = Sse.response(Sse.encode(runAgent(input)));
+      // The effect requires what the run needs; the response it builds requires nothing.
+      expectTypeOf<Effect.Services<typeof built>>().toEqualTypeOf<Stream.Services<ReturnType<typeof runAgent>>>();
+      expectTypeOf<Effect.Services<ReturnType<typeof Sse.response<never>>>>().toEqualTypeOf<never>();
+      // Read after the effect that built it has returned, outside the layer.
+      const response = yield* built.pipe(Effect.provide(layer));
+      const body = yield* Effect.promise(() => HttpServerResponse.toWeb(response).text());
+      expect(parseSse(body).map((event) => event.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.STEP_STARTED,
+        EventType.TEXT_MESSAGE_START,
+        EventType.TEXT_MESSAGE_CONTENT,
+        EventType.TEXT_MESSAGE_END,
+        EventType.STEP_FINISHED,
+        EventType.RUN_FINISHED,
+      ]);
+    }),
+  );
+});
+
 describe("Runner.run", () => {
   it.effect("returns a stream the route closes over and consumes after its handler has returned", () =>
     Effect.gen(function* () {
@@ -147,14 +199,6 @@ afterEach(async () => {
   await Promise.all(disposers.splice(0).map((dispose) => dispose()));
 });
 
-/** The response body is consumed after the handler has returned, so it closes over the handler's context. */
-const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
-  Effect.map(Effect.context<R>(), (context) =>
-    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
-      contentType: Sse.contentType,
-    }),
-  );
-
 /** The agent's route. The handler requires what the run's stream needs; the router's layer provides it. */
 const agentRoute = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>) => {
   const runAgent = Runner.run(agent);
@@ -163,7 +207,7 @@ const agentRoute = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<T
       "POST",
       "/agent",
       HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.flatMap((input) => sse(Sse.encode(runAgent(input)))),
+        Effect.flatMap((input) => Sse.response(Sse.encode(runAgent(input)))),
         Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
       ),
     ),

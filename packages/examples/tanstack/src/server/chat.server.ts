@@ -1,5 +1,5 @@
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
+import { Config, DateTime, Effect, Layer, Schema } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { modelMessagesToUIMessages } from "@tanstack/ai";
@@ -42,21 +42,6 @@ const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, Eve
 
 const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 
-// A plain function: nothing is captured until a request runs it.
-const runAgent = Runner.run(assistant);
-
-// The response body is consumed after the handler has returned, so it closes
-// over the handler's context. Whatever the stream still needs is a requirement
-// of the handler, which the web handler provides from the app layer's
-// services (`Layer.provideMerge` below keeps them in the layer's output).
-const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
-  Effect.map(Effect.context<R>(), (context) =>
-    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
-      contentType: Sse.contentType,
-      headers: { "cache-control": "no-cache" },
-    }),
-  );
-
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const thread = yield* Thread.Thread;
@@ -96,7 +81,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       "/api/chat",
       Effect.gen(function* () {
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return yield* sse(Sse.encode(runAgent(input)));
+        return yield* Sse.response(Sse.encode(Runner.run(assistant)(input)));
       }).pipe(
         Effect.catch((error) =>
           Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 })),

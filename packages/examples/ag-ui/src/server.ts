@@ -41,18 +41,6 @@ const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-e
 // Swap these for durable implementations in production.
 const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
 
-// The response body is consumed after the handler has returned, so it closes
-// over the handler's context. Whatever the stream still needs is a requirement
-// of the handler, which the web handler provides from the app layer's
-// services (`Layer.provideMerge` below keeps them in the layer's output).
-const sse = <R>(frames: Stream.Stream<string, unknown, R>) =>
-  Effect.map(Effect.context<R>(), (context) =>
-    HttpServerResponse.stream(frames.pipe(Stream.provideContext(context), Stream.encodeText), {
-      contentType: Sse.contentType,
-      headers: { "cache-control": "no-cache" },
-    }),
-  );
-
 const invalidInput = (error: { readonly message: string }) =>
   Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 }));
 
@@ -74,7 +62,9 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return yield* sse(Sse.encode(Runner.run(assistant)(input).pipe(Stream.provideService(AuthContext, principal))));
+        return yield* Sse.response(
+          Sse.encode(Runner.run(assistant)(input).pipe(Stream.provideService(AuthContext, principal))),
+        );
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
@@ -112,7 +102,7 @@ const AgentRoutes = HttpRouter.use((router) =>
         // Fails before the response starts if the cursor was never issued, so
         // the client gets a 400 instead of a stream that never yields.
         const events = yield* log.subscribe(threadId, runId, lastEventId);
-        return yield* sse(Sse.encodeStored(events));
+        return yield* Sse.response(Sse.encodeStored(events));
       }).pipe(
         Effect.catchTags({
           Unauthorized: unauthorized,
