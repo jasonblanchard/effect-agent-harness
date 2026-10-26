@@ -31,15 +31,23 @@ The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only t
 - **THEN** decoding succeeds and returns `forwardedProps` unchanged
 
 ### Requirement: Runner without service requirements
-The package SHALL provide a way to capture the agent's services (language model, tool handlers, thread store, checkpoint store, and any services the agent's system prompt declares) once and obtain a request-scoped runner. The runner SHALL accept, for each run, the run's input and an optional context. Each run's event stream SHALL then have no outstanding service requirements, so it can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service. The stream SHALL require the agent's services (language model, tool handlers, thread store, checkpoint store, and any services the agent's system prompt or tools declare, such as the trusted context the caller provides per run), less the services the run's per-run layer provides, plus that layer's own requirements. The caller SHALL be able to provide them where it consumes the stream, for example by providing the per-request ones and closing over its own context, so that the stream requires nothing and can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+
+#### Scenario: Nothing captured when the function is made
+- **WHEN** the run function is made outside any Effect, before any service exists
+- **THEN** making it requires nothing, and each stream it returns requires the services the run needs
 
 #### Scenario: Stream used as a response body
-- **WHEN** a caller captures the runner while its route is being set up and calls it for each request
-- **THEN** each returned event stream can be consumed without providing any further services
+- **WHEN** a route calls the run inside its request handler, provides the request's principal to the stream and then provides the handler's own context to it
+- **THEN** the stream requires nothing further and can be consumed after the handler has returned
 
 #### Scenario: Context per request
-- **WHEN** a caller captures the runner once and calls it for two requests with the contexts `{ userId: "u1" }` and `{ userId: "u2" }`
-- **THEN** each run sees only its own context
+- **WHEN** a route provides the "app/Auth" services `{ userId: "u1" }` and `{ userId: "u2" }` to the runs of two requests
+- **THEN** each run's tools see only the services built from its own run context
+
+#### Scenario: Per-run services are built per run
+- **WHEN** an agent requires `CurrentUser`, and the run's layer provides it from "app/Auth"
+- **THEN** the run's stream requires "app/Auth" and not `CurrentUser`, and `CurrentUser` is built for each run
 
 ### Requirement: Cancellation when the consumer stops
 For the request-scoped runner, when the consumer of a run's event stream stops reading, for example because a client disconnects or calls `abortRun()`, the run SHALL stop and any model request or tool execution still in progress SHALL be cancelled. The detached runner SHALL NOT be affected by any consumer stopping.
@@ -68,7 +76,7 @@ The package SHALL provide a pure transform from a stream of AG-UI events to Serv
 - **THEN** each frame has an `id:` line equal to its cursor
 
 ### Requirement: Detached runner
-The package SHALL provide a runner that starts a run, given its input and an optional context, in a scope the caller or a workflow engine owns, returns before the run completes, and appends every AG-UI event of the run to the event log under the thread id and run id. Observing the run SHALL be done by subscribing to the event log.
+The package SHALL provide a runner that starts a run, given its input, in a scope the caller or a workflow engine owns, returns before the run completes, and appends every AG-UI event of the run to the event log under the thread id and run id. Starting a run SHALL require the runner's declared run contexts, read when the run is started, so a service the caller provides around the start reaches the run. Observing the run SHALL be done by subscribing to the event log.
 
 #### Scenario: Start and observe
 - **WHEN** a caller starts a run detached and then subscribes to the event log for that thread id and run id
@@ -79,11 +87,15 @@ The package SHALL provide a runner that starts a run, given its input and an opt
 - **THEN** it receives every event after c exactly once and the terminal event
 
 #### Scenario: Context reaches the run
-- **WHEN** a caller starts a detached run with the context `{ userId: "u1" }`
-- **THEN** the run's system prompt and tool handlers see that context
+- **WHEN** a caller starts a detached run with the "app/Auth" service `{ userId: "u1" }` provided, on a runner whose layer builds `CurrentUser` from it
+- **THEN** the run's system prompt and tool handlers see the `CurrentUser` for `userId: "u1"`
+
+#### Scenario: Layer failure in the log
+- **WHEN** a detached run's per-run layer fails with `UserNotFound`
+- **THEN** the event log holds `RUN_STARTED` then `RUN_ERROR` with code `UserNotFound`
 
 ### Requirement: Re-executing a detached run
-Starting a detached run again with the same thread id and run id SHALL NOT re-append events for steps that are replayed from the checkpoint store. Before appending any new event it SHALL close every text message, tool call and step left open in the log by an earlier attempt, and it SHALL NOT append a second `RUN_STARTED` to a log that already has one. If the log already ends with a terminal event, starting again SHALL do nothing. The caller SHALL pass the same context it passed the first time; the run does not store it.
+Starting a detached run again with the same thread id and run id SHALL NOT re-append events for steps that are replayed from the checkpoint store. Before appending any new event it SHALL close every text message, tool call and step left open in the log by an earlier attempt, and it SHALL NOT append a second `RUN_STARTED` to a log that already has one. If the log already ends with a terminal event, starting again SHALL do nothing. The caller SHALL provide the same run-context services it provided the first time; the run does not store them. Starting again SHALL resolve the run's per-run services again from them.
 
 #### Scenario: Resume after a crash mid-step
 - **WHEN** an earlier attempt appended `TEXT_MESSAGE_START` and content for step 2 and stopped, and the run is started again with a ledger-backed checkpoint store
@@ -91,10 +103,10 @@ Starting a detached run again with the same thread id and run id SHALL NOT re-ap
 
 #### Scenario: Already finished
 - **WHEN** the log for the thread id and run id ends with `RUN_FINISHED`
-- **THEN** starting again appends nothing and calls no model
+- **THEN** starting again appends nothing, calls no model and does not build the per-run layer
 
 ### Requirement: Workflow-backed runner
-The package SHALL provide the run as an `effect/workflow` workflow named by a name the caller must supply, whose payload is the run's input together with its optional context, and whose idempotency key is made from the thread id and the run id, using workflow activities as the checkpoint store, so a durable engine persists and replays runs. Executing it twice with the same thread id and run id SHALL join the same execution; the same run id on another thread SHALL be a separate execution. A resumed execution SHALL see the context from its payload. Workflows for different agents registered with one engine under different names SHALL each run their own agent.
+The package SHALL provide the run as an `effect/workflow` workflow named by a name the caller must supply, whose payload is the run's input together with, when the runner declares dependencies, their services' values, which SHALL be run contexts so they can be encoded, and whose idempotency key is made from the thread id and the run id, using workflow activities as the checkpoint store, so a durable engine persists and replays runs. The package SHALL provide a way to start a run from its input alone, reading the declared run contexts' services from the caller and returning before the run completes, and a way to get a run's execution id from its input and the same run-context services. The payload's run-context values SHALL be encoded and decoded with the declared run contexts' schemas, so a value that does not match them fails to start an execution. Starting it twice with the same thread id and run id SHALL join the same execution; the same run id on another thread SHALL be a separate execution. A resumed execution SHALL see the run-context values from its payload, and SHALL resolve its per-run services again from them. Workflows for different agents registered with one engine under different names SHALL each run their own agent.
 
 #### Scenario: Run inside the in-memory engine
 - **WHEN** a run is executed through the workflow runner with the in-memory workflow engine
@@ -109,6 +121,18 @@ The package SHALL provide the run as an `effect/workflow` workflow named by a na
 - **THEN** the "weather" run's model calls start with "Be helpful." and the "brief" run's with "Be brief."
 
 #### Scenario: Context in the payload
-- **WHEN** a run is executed through the workflow runner with the context `{ userId: "u1" }`
-- **THEN** its tool handlers see that context
+- **WHEN** a run is started through the workflow runner with the "app/Auth" service `{ userId: "u1" }` provided
+- **THEN** its tool handlers see the `CurrentUser` built for `userId: "u1"`
+
+#### Scenario: Context the schema rejects
+- **WHEN** a workflow run is started with an "app/Auth" service whose `userId` fails its run context's schema
+- **THEN** starting the run fails, and no event is appended to the event log
+
+#### Scenario: Execution id from the input
+- **WHEN** a run is started through the workflow runner and its execution id is then asked for with the same input and run-context services
+- **THEN** the id is the one the engine gave the execution
+
+#### Scenario: Replay resolves the services again
+- **WHEN** a workflow execution is replayed after its first step completed
+- **THEN** the per-run layer is built again for the replay, and the first step is not executed again
 
