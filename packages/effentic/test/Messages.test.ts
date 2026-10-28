@@ -62,6 +62,31 @@ const approvalResponse = (approvalId: string): Thread.Entry => ({
   }),
 });
 
+/** An assistant entry holding frontend calls, marked as `Agent.run` marks them. */
+const frontendCalls = (id: string, ...callIds: Array<string>): Thread.Entry => ({
+  id,
+  message: Prompt.makeMessage("assistant", {
+    content: callIds.map((callId) =>
+      Prompt.makePart("tool-call", {
+        id: callId,
+        name: "pick-file",
+        params: {},
+        providerExecuted: false,
+        options: { effentic: { frontend: true } },
+      }),
+    ),
+  }),
+});
+
+/** A client tool message answering `toolCallId`, under a TanStack-style id. */
+const answer = (toolCallId: string, content: unknown, error?: string): AgUi.Message => ({
+  id: `tool-${toolCallId}`,
+  role: "tool",
+  toolCallId,
+  content,
+  ...(error === undefined ? {} : { error }),
+});
+
 /** Messages as `{ role, parts }`, dropping Effect's internal fields. */
 const simplify = (prompt: Prompt.Prompt) =>
   prompt.content.map((message) => ({
@@ -393,6 +418,147 @@ describe("Messages.resume", () => {
     const answered = [...stored, ...answer(stored, [{ interruptId: "a1", status: "cancelled" }])];
     expect(answer(answered, [{ interruptId: "a1", status: "resolved", payload: { approved: true } }])).toEqual([]);
     expect(answer(answered, [])).toEqual([]);
+  });
+});
+
+describe("Messages.answers", () => {
+  const stored = [user("u1", "Pick a file"), frontendCalls("m1", "c1")];
+
+  const resultOf = (result: Result.Result<Messages.Answers, Messages.UnansweredToolCall>) =>
+    Result.isSuccess(result) ? simplify(Prompt.fromMessages(result.success.entries.map((e) => e.message))) : result;
+
+  it("commits the client's result for a pending frontend call under its message id", () => {
+    const result = Messages.answers(stored, [answer("c1", '{"name":"a.txt"}')]);
+    expect(Result.isSuccess(result) && result.success.entries.map((entry) => entry.id)).toEqual(["tool-c1"]);
+    expect(resultOf(result)).toEqual([
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: { name: "a.txt" }, isFailure: false }] },
+    ]);
+  });
+
+  it("keeps text that is not JSON as it is", () => {
+    expect(resultOf(Messages.answers(stored, [answer("c1", "a.txt")]))).toEqual([
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "a.txt", isFailure: false }] },
+    ]);
+  });
+
+  it("commits a failed result for an answer with an error", () => {
+    expect(resultOf(Messages.answers(stored, [answer("c1", "null", "Permission denied")]))).toEqual([
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "Permission denied", isFailure: true }] },
+    ]);
+  });
+
+  it("keeps the text of content parts and names the calls whose other parts were dropped", () => {
+    const result = Messages.answers(stored, [
+      answer("c1", [
+        { type: "text", text: "a.txt" },
+        { type: "image", source: { type: "url", value: "https://example.com/a.png" } },
+      ]),
+    ]);
+    expect(resultOf(result)).toEqual([
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "a.txt", isFailure: false }] },
+    ]);
+    expect(Result.isSuccess(result) && result.success.droppedParts).toEqual(["c1"]);
+  });
+
+  it("uses the first of several answers to one call", () => {
+    const result = Messages.answers(stored, [answer("c1", '"first"'), { ...answer("c1", '"second"'), id: "x" }]);
+    expect(resultOf(result)).toEqual([
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "first", isFailure: false }] },
+    ]);
+  });
+
+  it("ignores answers to server calls, answered calls and unknown calls", () => {
+    // c2 is a server call a crashed run left without a result; c1 is already answered.
+    const thread = [...stored, toolResult("t1", "c1", "a.txt"), assistantCall("m2", "c2")];
+    const result = Messages.answers(thread, [answer("c1", '"again"'), answer("c2", '{"temp":99}'), answer("c9", "?")]);
+    expect(result).toEqual(Result.succeed({ entries: [], droppedParts: [] }));
+  });
+
+  it("rejects a run that leaves a pending call unanswered, naming every one", () => {
+    const thread = [user("u1", "Pick two"), frontendCalls("m1", "c1", "c2")];
+    const result = Messages.answers(thread, [answer("c1", '"a.txt"')]);
+    expect(Result.isFailure(result) && result.failure).toMatchObject({
+      _tag: "UnansweredToolCall",
+      toolCallIds: ["c2"],
+    });
+    expect(Result.isFailure(Messages.answers(thread, [clientMessage("u2", "user", "Never mind")]))).toBe(true);
+  });
+
+  it("is empty when no frontend call is pending", () => {
+    expect(Messages.answers([user("u1", "hi"), assistantText("a1", "hello")], [])).toEqual(
+      Result.succeed({ entries: [], droppedParts: [] }),
+    );
+  });
+});
+
+describe("Messages frontend calls across a run", () => {
+  const stored = [
+    { ...user("u1", "Pick a file"), runId: "r1" },
+    { ...frontendCalls("m1", "c1"), runId: "r1" },
+  ];
+  const client: Array<AgUi.Message> = [
+    clientMessage("u1", "user", "Pick a file"),
+    { id: "m1", role: "assistant", toolCalls: [{ id: "c1", function: { name: "pick-file", arguments: "{}" } }] },
+    answer("c1", '"a.txt"'),
+    clientMessage("u2", "user", "Thanks"),
+  ];
+
+  it("finds the answer in the delta, and only ingest's user message besides it", () => {
+    const delta = Messages.delta(stored, client, "r2");
+    expect(delta).toEqual(Result.succeed(client.slice(2)));
+    const ingested = Messages.ingest(Result.getOrThrow(delta));
+    expect(ingested.map((entry) => entry.id)).toEqual(["u2"]);
+  });
+
+  it("does not take an already stored answer again", () => {
+    const answered = Messages.answers(stored, client.slice(2));
+    const thread = [...stored, ...Result.getOrThrow(answered).entries, user("u2", "Thanks")];
+    const delta = Result.getOrThrow(Messages.delta(thread, [...client, clientMessage("u3", "user", "More")], "r3"));
+    expect(delta.map((message) => message.id)).toEqual(["u3"]);
+    expect(Messages.answers(thread, delta)).toEqual(Result.succeed({ entries: [], droppedParts: [] }));
+  });
+
+  it("projects an answered frontend call with its real result", () => {
+    const answered = Result.getOrThrow(Messages.answers(stored, client.slice(2)));
+    expect(simplify(Messages.project([...stored, ...answered.entries]))).toEqual([
+      { role: "user", parts: [{ type: "text", text: "Pick a file" }] },
+      { role: "assistant", parts: [{ type: "tool-call", id: "c1" }] },
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "a.txt", isFailure: false }] },
+    ]);
+  });
+
+  it("drops the answer when compaction removed the pending call", () => {
+    const compacted = [system("s", "Summary: the user asked for a file"), stored[0]!];
+    expect(Messages.answers(compacted, client.slice(2))).toEqual(Result.succeed({ entries: [], droppedParts: [] }));
+    expect(Messages.ingest(client.slice(2)).map((entry) => entry.id)).toEqual(["u2"]);
+  });
+
+  it("reads a pending call back with the run that left it, and the read is accepted", () => {
+    const read = Messages.history(stored);
+    expect(read.pendingToolCalls).toEqual({ runId: "r1", toolCallIds: ["c1"] });
+    expect(read.messages.map((message) => [message.id, message.role])).toEqual([
+      ["u1", "user"],
+      ["m1", "assistant"],
+    ]);
+    const next = [...read.messages, answer("c1", '"a.txt"'), clientMessage("u2", "user", "Thanks")];
+    const delta = Result.getOrThrow(Messages.delta(stored, next, "r2"));
+    expect(Result.isSuccess(Messages.answers(stored, delta))).toBe(true);
+  });
+
+  it("reads no pending call once it is answered, with the result after its call", () => {
+    const answered = Result.getOrThrow(Messages.answers(stored, client.slice(2)));
+    const read = Messages.history([...stored, ...answered.entries.map((entry) => ({ ...entry, runId: "r2" }))]);
+    expect(read.pendingToolCalls).toBeUndefined();
+    expect(read.messages.map((message) => [message.id, message.role])).toEqual([
+      ["u1", "user"],
+      ["m1", "assistant"],
+      ["tool-c1", "tool"],
+    ]);
+    // Without a recorded run.
+    expect(Messages.history([frontendCalls("m1", "c1")]).pendingToolCalls).toEqual({
+      runId: undefined,
+      toolCallIds: ["c1"],
+    });
   });
 });
 

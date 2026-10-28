@@ -24,6 +24,7 @@ The same agent runs in a unit test with none of these (in-memory or passthrough 
 - [Threads](#threads)
 - [Authentication and run context](#authentication-and-run-context)
 - [Tool approvals](#tool-approvals)
+- [Frontend tools](#frontend-tools)
 - [Durable runs](#durable-runs)
 - [Reconnecting to a run](#reconnecting-to-a-run)
 - [Testing and evals](#testing-and-evals)
@@ -163,8 +164,8 @@ Tool tips:
 1. Build the per-run services from the dependencies the caller provided. See [Authentication and run context](#authentication-and-run-context).
 2. Check the input against what was stored for its run id (`RunInputMismatch` if it differs), and claim the thread (`ThreadBusy` if another run is active). See [Threads](#threads).
 3. Load the thread from the `Thread` store.
-4. Take the new messages from the client, plus its answers to the previous run's interrupts (every open one must be answered).
-5. Run the agent with the run's info (below) and its per-run services, committing each finished step to the thread.
+4. Take the new messages from the client, plus its answers to the previous run's interrupts and its results for the frontend calls it was left (every open one must be answered).
+5. Run the agent with the run's info (below), the client's frontend tools and its per-run services, committing each finished step to the thread.
 6. Report the run's end to the store (`runEnded`) and release the thread, then emit the terminal event.
 
 AG-UI events are emitted throughout.
@@ -181,7 +182,7 @@ Pick a runner by what should happen when the client goes away:
 
 Guarantees for every runner:
 
-- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, an error from the per-run layer, a provider error such as `RateLimitError`, …).
+- **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, an error from the per-run layer, a provider error such as `RateLimitError`, …).
 - **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, tool calls and steps are always closed, including when a run fails mid-message.
 
 What a client sees for a tool-using reply:
@@ -234,9 +235,10 @@ Nothing in the AG-UI input can set a per-run dependency. See [Authentication and
 The server owns the history. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
 
 - `user` messages that have text;
-- `system` / `developer` messages, and only with `clientSystem: "allow"`.
+- `system` / `developer` messages, and only with `clientSystem: "allow"`;
+- `tool` messages answering a [frontend call](#frontend-tools) the previous run left to the client.
 
-Assistant and tool messages from the client are always ignored, so a client cannot invent a model turn or a tool result.
+Assistant messages from the client are always ignored, and so are tool messages for anything but a pending frontend call, so a client cannot invent a model turn or a server tool's result.
 
 Ids line up because the server mints them. Every assistant step and tool result is stored under the same id it was sent to the client with (`messageId` in `TEXT_MESSAGE_*` / `TOOL_CALL_RESULT`). A client message is matched against the store by that id. A `tool` message is also matched by its `toolCallId`, because some clients (TanStack AI) send tool results back under ids of their own. Client messages the store doesn't know are ignored, such as the text of a step that was cancelled before it committed.
 
@@ -262,6 +264,7 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 
 - **the latest entries the client has seen**, with their ids. The client's new messages are those after the last one whose id `load` returns. If none of its ids are returned, the run fails with `HistoryMismatch`.
 - **every assistant entry with an unanswered approval request.** `resume` answers are matched against these, and an answer to a request that isn't loaded is ignored.
+- **every assistant entry with a pending frontend call**, with its tool-call parts' `options` intact (they mark the call as the client's). The client's results are matched against these, and a result for a call that isn't loaded is ignored.
 - **nothing new after what the client has seen.** Write a summary as a `system` entry, or put it before the latest entries the client has seen. A user, assistant or tool entry the client never saw, placed after them, makes its next run fail with `HistoryDiverged`.
 
 In practice: summarise older history into a system entry, and keep the tail from the last user message on.
@@ -271,12 +274,13 @@ In practice: summarise older history into a system entry, and keep the tail from
 A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `Messages.history` turns a thread back into what its runs' events showed, for the client to restore:
 
 ```ts
-const { messages, interrupts } = yield * Effect.map(thread.load(threadId), Messages.history);
+const { messages, interrupts, pendingToolCalls } = yield * Effect.map(thread.load(threadId), Messages.history);
 // messages: the AG-UI user, assistant and tool messages, with the ids and content the events carried
 // interrupts: { runId, pending } for approvals still open (as RUN_FINISHED carried them), or undefined
+// pendingToolCalls: { runId, toolCallIds } for frontend calls still waiting for a result, or undefined
 ```
 
-The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, and answers each of `interrupts.pending` with a `resume` entry in its next run. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. System entries, approval responses and reasoning are not returned; tool results come directly after their calls. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
+The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, answers each of `interrupts.pending` with a `resume` entry in its next run, and each of `pendingToolCalls.toolCallIds` with a `tool` message. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. System entries, approval responses and reasoning are not returned; tool results come directly after their calls. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
 
 TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effentic rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
@@ -394,6 +398,25 @@ The answered call is executed (or denied) before the model is called again, and 
 A denied call gets the failed result `{ "type": "execution-denied", "reason": "…" }`.
 
 If a `needsApproval` predicate fails or throws, the tool is treated as not needing approval, which matches `effect/ai`.
+
+## Frontend tools
+
+A client can advertise tools of its own in `RunAgentInput.tools` (AG-UI frontend tools): the agent proposes a call, and the application runs it. TanStack AI's `useChat` sends its client tools this way, and `HttpAgent` sends the ones you pass to `runAgent({ tools })`. The server needs no code for them:
+
+- **They're offered to the model next to the agent's tools**, with the name, description and JSON Schema the client sent. If one has the same name as a server tool, the server tool is offered and the client's is ignored, with a logged warning.
+- **A call to one runs nothing on the server.** The call is streamed (`TOOL_CALL_START` / `ARGS` / `END`) but gets no `TOOL_CALL_RESULT`, other calls in the same step still run, and the run ends after that step with a **success** that names the calls left to the client:
+
+  ```json
+  { "type": "RUN_FINISHED", "outcome": { "type": "success", "pendingToolCallIds": ["toolu_…"] } }
+  ```
+
+- **The client answers in its next run's `messages`**, with one `tool` message per call, keyed by `toolCallId`. `error` makes it a failed result. Content that is JSON text is stored as the parsed value, any other text as itself, and a list of content parts as its text; other parts (images, files) are dropped with a logged warning, and the call is still answered. To decline a call, answer it saying so.
+- **Every pending call must be answered.** A run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredToolCall`, and nothing it sent is committed. A client that abandons the thread answers nothing, which is fine.
+- **A step can mix kinds.** If the model calls a server tool, a frontend tool and a tool that needs approval in one step, the server call runs and the run ends with the approval interrupt. AG-UI's interrupt outcome carries no `pendingToolCallIds`, so the client finds the frontend call in the stream. The next run must carry both the `resume` entry and the `tool` message (if both are missing, `UnansweredInterrupt` is reported); the approved call then runs before the model is called with every result.
+
+The agent marks each frontend call on its stored assistant entry (in the tool-call part's `options`, removed before the model sees it). Only a marked call that has no result can be answered by the client. A server call left open by a crashed run can't be.
+
+**Advertised tools are untrusted input.** Their descriptions and schemas reach the model exactly as the client sent them, like a client system message. Only accept them from clients you'd let instruct the model.
 
 ## Durable runs
 
@@ -603,13 +626,13 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                                                                                                                              |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `StepLimitExceeded`, `ModelStreamError`                                                                |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                            |
-| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                       |
-| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                               |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                   |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                     |
-| `Messages`   | `history`, `History`: reading a thread back; `delta`, `ingest`, `resume`, `malformedAnswers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`: the building blocks the runners use |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                        |
+| Module       | Main exports                                                                                                                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `StepLimitExceeded`, `ModelStreamError`                                            |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                             |
+| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                        |
+| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                    |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                      |
+| `Messages`   | `history`, `History`: reading a thread back; `delta`, `ingest`, `resume`, `malformedAnswers`, `answers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the building blocks the runners use |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                         |

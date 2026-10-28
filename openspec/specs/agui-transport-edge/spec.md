@@ -12,11 +12,11 @@ The package SHALL NOT start servers, register routes, or depend on an HTTP serve
 - **THEN** an `HttpAgent` pointed at that route can run a multi-turn conversation that includes tool calls
 
 ### Requirement: Lenient run input decoding
-The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only the fields the agent uses: `threadId`, `runId`, the `messages` fields needed for ingestion, and `resume` entries (`interruptId`, `status`, optional `payload`). It SHALL keep an optional `forwardedProps` value of any shape without checking it. It SHALL accept and ignore any other fields, and it SHALL fail on input whose required fields are missing or malformed, so the caller can reject it before starting a run.
+The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only the fields the agent uses: `threadId`, `runId`, the `messages` fields needed for ingestion, `resume` entries (`interruptId`, `status`, optional `payload`), and `tools` entries (`name`, optional `description`, `parameters`). It SHALL keep an optional `forwardedProps` value of any shape without checking it, and each tool's `parameters` without checking it against JSON Schema. It SHALL accept and ignore any other fields, and it SHALL fail on input whose required fields are missing or malformed, so the caller can reject it before starting a run.
 
 #### Scenario: Extra fields
 - **WHEN** the input includes `tools`, `context`, `state`, `forwardedProps` and `protocolVersion`
-- **THEN** decoding succeeds and returns only the fields the agent reads, including `forwardedProps`
+- **THEN** decoding succeeds and returns only the fields the agent reads, including `tools` and `forwardedProps`
 
 #### Scenario: Missing runId
 - **WHEN** the input has no `runId`
@@ -29,6 +29,14 @@ The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only t
 #### Scenario: Forwarded properties of any shape
 - **WHEN** the input's `forwardedProps` is a string, an array or a nested object
 - **THEN** decoding succeeds and returns `forwardedProps` unchanged
+
+#### Scenario: Tool without a name
+- **WHEN** an entry in `tools` has no `name`
+- **THEN** decoding fails
+
+#### Scenario: No tools
+- **WHEN** the input has no `tools` field, or an empty one
+- **THEN** decoding succeeds and the run has no frontend tools
 
 ### Requirement: Runner without service requirements
 The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service. The stream SHALL require the agent's services (language model, tool handlers, thread store, checkpoint store, and any services the agent's system prompt or tools declare, such as the trusted context the caller provides per run), less the services the run's per-run layer provides, plus that layer's own requirements. The caller SHALL be able to provide them where it consumes the stream, for example by providing the per-request ones and closing over its own context, so that the stream requires nothing and can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
@@ -153,4 +161,3 @@ The package SHALL provide the run as an `effect/workflow` workflow named by a na
 #### Scenario: Replay resolves the services again
 - **WHEN** a workflow execution is replayed after its first step completed
 - **THEN** the per-run layer is built again for the replay, and the first step is not executed again
-

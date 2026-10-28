@@ -18,10 +18,12 @@ import {
   countingWeatherLayer,
   evalLayers,
   finish,
+  PickFile,
   runAgUi,
   scriptedModel,
   type Step,
   text,
+  toolAnswer,
   toolCall,
   verify,
   WeatherToolkit,
@@ -583,6 +585,158 @@ describe("Runner.run approvals", () => {
   );
 });
 
+describe("Runner.run frontend tools", () => {
+  const withTools = (runInput: AgUi.RunAgentInput): AgUi.RunAgentInput => ({ ...runInput, tools: [PickFile] });
+  const pickStep: Step = [...toolCall("c_pick", "pick-file", {}), finish("tool-calls")];
+  const clientAfterPickTurn: ReadonlyArray<AgUi.Message> = [
+    userMessage("u1", "Pick a file"),
+    { id: "id-1", role: "assistant", toolCalls: [{ id: "c_pick", function: { name: "pick-file", arguments: "{}" } }] },
+  ];
+  const picked = toolAnswer("c_pick", { name: "a.txt" });
+
+  it.effect("ends with the pending call and takes the client's result in the next run", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([pickStep, [...text("0", "You picked a.txt."), finish("stop")]]);
+      const runs = yield* runAgUi(approvalAgent, [
+        withTools(input("r1", [userMessage("u1", "Pick a file")])),
+        // Straight after the first run, so it also shows the thread was released.
+        withTools(input("r2", [...clientAfterPickTurn, picked])),
+      ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      const [first, second] = runs;
+      yield* Effect.promise(() => verify([...first!, ...second!]));
+      expect(first!.at(-1)).toEqual({
+        type: EventType.RUN_FINISHED,
+        threadId: "t1",
+        runId: "r1",
+        outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
+      });
+      expect(first!.filter((e) => e.type === EventType.TOOL_CALL_RESULT)).toEqual([]);
+      expect(second!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(model.prompts).toHaveLength(2);
+      expect(partTypes(model.prompts[1]!)).toEqual(["text", "tool-call", "tool-result"]);
+      expect(model.prompts[1]!.content.at(-1)).toMatchObject({
+        content: [{ type: "tool-result", id: "c_pick", result: { name: "a.txt" }, isFailure: false }],
+      });
+    }),
+  );
+
+  it.effect("rejects a run that leaves the call unanswered, and accepts the answer in a later run", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([pickStep, [...text("0", "Got it."), finish("stop")]]);
+      yield* Effect.gen(function* () {
+        yield* runAgUi(approvalAgent, [withTools(input("r1", [userMessage("u1", "Pick a file")]))]);
+        const before = yield* loadThread;
+
+        const [rejected] = yield* runAgUi(approvalAgent, [
+          withTools(input("r2", [...clientAfterPickTurn, userMessage("u2", "Never mind.")])),
+        ]);
+        expect(types(rejected!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(rejected![1]).toMatchObject({ code: "UnansweredToolCall" });
+        expect(yield* loadThread).toEqual(before);
+
+        const [answered] = yield* runAgUi(approvalAgent, [withTools(input("r3", [...clientAfterPickTurn, picked]))]);
+        expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      expect(model.prompts).toHaveLength(2);
+    }),
+  );
+
+  describe("a step with server, frontend and approval calls", () => {
+    const mixedStep: Step = [
+      ...toolCall("c_weather", "get-weather", { location: "Paris" }),
+      ...toolCall("c_pick", "pick-file", {}),
+      ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
+      finish("tool-calls"),
+    ];
+    const clientAfterMixedTurn: ReadonlyArray<AgUi.Message> = [
+      userMessage("u1", "Weather, a file and an email"),
+      {
+        id: "id-1",
+        role: "assistant",
+        toolCalls: [
+          { id: "c_weather", function: { name: "get-weather", arguments: '{"location":"Paris"}' } },
+          { id: "c_pick", function: { name: "pick-file", arguments: "{}" } },
+          { id: "c_email", function: { name: "send-email", arguments: '{"to":"ada@example.com","body":"Hi"}' } },
+        ],
+      },
+      toolAnswer("c_weather", { temperature: 18 }),
+    ];
+
+    /** Runs the mixed step, then a second run built by `next` from the first run's interrupt id. */
+    const mixed = (next: (interruptId: string) => AgUi.RunAgentInput) =>
+      Effect.gen(function* () {
+        const model = scriptedModel([mixedStep, [...text("0", "All done."), finish("stop")]]);
+        const handlers = countingApprovalLayer();
+        const runs = yield* Effect.gen(function* () {
+          const [first] = yield* runAgUi(approvalAgent, [
+            withTools(input("r1", [userMessage("u1", "Weather, a file and an email")])),
+          ]);
+          const outcome = (first!.at(-1) as { outcome: { interrupts: ReadonlyArray<{ id: string }> } }).outcome;
+          const before = yield* loadThread;
+          const [second] = yield* runAgUi(approvalAgent, [next(outcome.interrupts[0]!.id)]);
+          return { first: first!, second: second!, before, after: yield* loadThread };
+        }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
+        return { ...runs, prompts: model.prompts, ...handlers };
+      });
+    const approve = (interruptId: string): AgUi.RunAgentInput["resume"] => [
+      { interruptId, status: "resolved", payload: { approved: true } },
+    ];
+
+    it.effect("runs the approved call once both answers arrive, and calls the model with every result", () =>
+      Effect.gen(function* () {
+        const { first, second, prompts, emails, weatherCalls } = yield* mixed((id) =>
+          withTools(input("r2", [...clientAfterMixedTurn, picked], approve(id))),
+        );
+        yield* Effect.promise(() => verify([...first, ...second]));
+        expect(first.at(-1)).toMatchObject({ outcome: { type: "interrupt" } });
+        expect("pendingToolCallIds" in (first.at(-1) as { outcome: object }).outcome).toBe(false);
+        expect(weatherCalls).toEqual(["Paris"]);
+        expect(emails).toEqual(["ada@example.com"]);
+        expect(prompts).toHaveLength(2);
+        const results = prompts[1]!.content.flatMap((message) =>
+          message.role === "tool"
+            ? message.content.flatMap((part) => (part.type === "tool-result" ? [[part.id, part.result]] : []))
+            : [],
+        );
+        expect(results).toEqual([
+          ["c_weather", { temperature: 18 }],
+          ["c_pick", { name: "a.txt" }],
+          ["c_email", { sent: true }],
+        ]);
+        expect(partTypes(prompts[1]!)).toEqual([
+          "text",
+          "tool-call",
+          "tool-call",
+          "tool-call",
+          "tool-result",
+          "tool-result",
+          "tool-result",
+        ]);
+      }),
+    );
+
+    it.effect("rejects a run that approves the email but leaves the frontend call unanswered", () =>
+      Effect.gen(function* () {
+        const { second, emails, prompts, before, after } = yield* mixed((id) =>
+          withTools(input("r2", clientAfterMixedTurn, approve(id))),
+        );
+        expect(types(second)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(second[1]).toMatchObject({ code: "UnansweredToolCall" });
+        expect(emails).toEqual([]);
+        expect(prompts).toHaveLength(1);
+        expect(after).toEqual(before);
+      }),
+    );
+
+    it.effect("reports the unanswered interrupt first when both are left open", () =>
+      Effect.gen(function* () {
+        const { second } = yield* mixed(() => withTools(input("r2", clientAfterMixedTurn)));
+        expect(second[1]).toMatchObject({ type: EventType.RUN_ERROR, code: "UnansweredInterrupt" });
+      }),
+    );
+  });
+});
+
 describe("Runner thread history", () => {
   const read = Effect.map(loadThread, Messages.history);
   const emailStep: Step = [
@@ -873,6 +1027,43 @@ describe("Runner.makeDetached", () => {
       // Reconnecting after a cursor yields every later event exactly once.
       const c = stored[2]!.cursor;
       expect(yield* subscribe(c)).toEqual(stored.slice(3));
+    }).pipe(Effect.provide(shared())),
+  );
+
+  it.effect("logs a frontend call's pending id and releases the thread for the answering run", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const model = scriptedModel([
+        [...toolCall("c_pick", "pick-file", {}), finish("tool-calls")],
+        [...text("0", "Thanks."), finish("stop")],
+      ]);
+      const runner = yield* Runner.makeDetached(weatherAgent).pipe(
+        Effect.provide([model.layer, countingWeatherLayer().layer]),
+        Effect.provideService(Scope.Scope, scope),
+      );
+      yield* runner.start({ ...run1, tools: [PickFile] });
+      const events = (yield* subscribe()).map((s) => s.event);
+      yield* Effect.promise(() => verify(events));
+      expect(events.at(-1)).toMatchObject({
+        type: EventType.RUN_FINISHED,
+        outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
+      });
+
+      const [answered] = yield* runAgUi(weatherAgent, [
+        {
+          ...input("r2", [
+            userMessage("u1", "Weather in Paris?"),
+            {
+              id: "id-1",
+              role: "assistant",
+              toolCalls: [{ id: "c_pick", function: { name: "pick-file", arguments: "{}" } }],
+            },
+            toolAnswer("c_pick", "a.txt"),
+          ]),
+          tools: [PickFile],
+        },
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+      expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
     }).pipe(Effect.provide(shared())),
   );
 

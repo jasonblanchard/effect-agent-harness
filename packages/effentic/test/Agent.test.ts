@@ -12,6 +12,7 @@ import {
   countingWeatherLayer,
   evalLayers,
   finish,
+  PickFile,
   scriptedModel,
   type Step,
   text,
@@ -96,7 +97,7 @@ describe("Agent.run", () => {
         "Finished",
       ]);
       expect(events[0]).toEqual({ _tag: "StepStarted", step: 1, messageId: "id-1", replayed: false });
-      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
       const [finished] = byTag(events, "StepFinished");
       expect(finished!.entries).toEqual([
         {
@@ -221,7 +222,7 @@ describe("Agent.run", () => {
       const [result] = byTag(events, "ToolResult");
       expect(result).toMatchObject({ isFailure: true, encodedResult: { type: "execution-interrupted" } });
       expect((result!.encodedResult as { reason: string }).reason).toContain('"length"');
-      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
     }),
   );
 
@@ -298,6 +299,7 @@ describe("Agent.run approvals", () => {
         outcome: {
           _tag: "Interrupted",
           approvals: [{ approvalId: requested!.approvalId, toolCallId: "c_email", toolName: "send-email" }],
+          pendingToolCalls: [],
         },
       });
       const [finished] = byTag(events, "StepFinished");
@@ -395,12 +397,192 @@ describe("Agent.run approvals", () => {
         threadId: "t1",
         prompt: answered(true),
       }).pipe(Stream.runCollect, Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]));
-      expect(Array.from(events).at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+      expect(Array.from(events).at(-1)).toEqual({
+        _tag: "Finished",
+        outcome: { _tag: "Success", pendingToolCalls: [] },
+      });
+    }),
+  );
+});
+
+describe("Agent.run frontend tools", () => {
+  const approvalAgent = Agent.define({ toolkit: ApprovalToolkit });
+  const pickCall = toolCall("c_pick", "pick-file", { accept: "text/plain" });
+
+  const runFrontend = (
+    steps: ReadonlyArray<Step>,
+    options?: {
+      readonly frontendTools?: ReadonlyArray<Agent.FrontendTool>;
+      readonly prompt?: Prompt.Prompt;
+    },
+  ) =>
+    Effect.gen(function* () {
+      const model = scriptedModel(steps);
+      const handlers = countingApprovalLayer();
+      const events = yield* Agent.run(approvalAgent)({
+        runId: "r1",
+        threadId: "t1",
+        prompt: options?.prompt ?? userPrompt,
+        frontendTools: options?.frontendTools ?? [PickFile],
+      }).pipe(Stream.runCollect, Effect.provide([model.layer, handlers.layer, evalLayers]));
+      return { events: Array.from(events), prompts: model.prompts, tools: model.tools, ...handlers };
+    });
+
+  const toolCallsOf = (prompt: Prompt.Prompt) =>
+    prompt.content.flatMap((message) =>
+      message.role === "assistant" ? message.content.filter((part) => part.type === "tool-call") : [],
+    );
+
+  it.effect("offers the advertised tools next to the agent's", () =>
+    Effect.gen(function* () {
+      const { tools } = yield* runFrontend([[...text("0", "Hi"), finish("stop")]]);
+      expect(tools[0]!.map((tool) => tool.name)).toEqual(["get-weather", "send-email", "pick-file"]);
+      const pickFile = tools[0]!.find((tool) => tool.name === "pick-file")!;
+      expect(pickFile.description).toBe(PickFile.description);
+      expect(Tool.getJsonSchema(pickFile)).toEqual(PickFile.parameters);
+    }),
+  );
+
+  it.effect("offers the agent's tool when a frontend tool has its name", () =>
+    Effect.gen(function* () {
+      const { tools, weatherCalls, events } = yield* runFrontend(
+        [
+          [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+          [...text("0", "18°C"), finish("stop")],
+        ],
+        { frontendTools: [{ name: "get-weather", description: "The client's", parameters: { type: "object" } }] },
+      );
+      const offered = tools[0]!.filter((tool) => tool.name === "get-weather");
+      expect(offered.map((tool) => tool.description)).toEqual(["Get current weather for a location"]);
+      expect(weatherCalls).toEqual(["Paris"]);
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
+    }),
+  );
+
+  it.effect("leaves a frontend call pending and marks it on the step's entry", () =>
+    Effect.gen(function* () {
+      const { events, prompts } = yield* runFrontend([[...pickCall, finish("tool-calls")]]);
+      expect(prompts).toHaveLength(1);
+      expect(byTag(events, "ToolResult")).toEqual([]);
+      const [finished] = byTag(events, "StepFinished");
+      expect(finished!.entries).toHaveLength(1);
+      const [call] = toolCallsOf(Prompt.fromMessages([finished!.entries[0]!.message]));
+      expect(call).toMatchObject({ id: "c_pick", name: "pick-file" });
+      expect(Agent.isFrontendCall(call!)).toBe(true);
+      expect(events.at(-1)).toEqual({
+        _tag: "Finished",
+        outcome: { _tag: "Success", pendingToolCalls: [{ toolCallId: "c_pick", toolName: "pick-file" }] },
+      });
+    }),
+  );
+
+  it.effect("runs the server calls of a step that also calls a frontend tool, then stops", () =>
+    Effect.gen(function* () {
+      const { events, prompts, weatherCalls } = yield* runFrontend([
+        [...pickCall, ...toolCall("c_weather", "get-weather", { location: "Paris" }), finish("tool-calls")],
+      ]);
+      expect(weatherCalls).toEqual(["Paris"]);
+      expect(prompts).toHaveLength(1);
+      expect(byTag(events, "ToolResult").map((event) => event.toolCallId)).toEqual(["c_weather"]);
+      const [finished] = byTag(events, "StepFinished");
+      const [pick, weather] = toolCallsOf(Prompt.fromMessages([finished!.entries[0]!.message]));
+      expect([Agent.isFrontendCall(pick!), Agent.isFrontendCall(weather!)]).toEqual([true, false]);
+      expect(events.at(-1)).toEqual({
+        _tag: "Finished",
+        outcome: { _tag: "Success", pendingToolCalls: [{ toolCallId: "c_pick", toolName: "pick-file" }] },
+      });
+    }),
+  );
+
+  it.effect("answers a frontend call with a failed result when the response finished incomplete", () =>
+    Effect.gen(function* () {
+      const { events } = yield* runFrontend([[...pickCall, finish("length")]]);
+      const [result] = byTag(events, "ToolResult");
+      expect(result).toMatchObject({
+        toolCallId: "c_pick",
+        isFailure: true,
+        encodedResult: { type: "execution-interrupted" },
+      });
+      expect(events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
+    }),
+  );
+
+  it.effect("lists a pending frontend call on the interrupted outcome", () =>
+    Effect.gen(function* () {
+      const { events, emails } = yield* runFrontend([[...pickCall, ...emailCall, finish("tool-calls")]]);
+      expect(emails).toEqual([]);
+      const [requested] = byTag(events, "ApprovalRequested");
+      expect(events.at(-1)).toEqual({
+        _tag: "Finished",
+        outcome: {
+          _tag: "Interrupted",
+          approvals: [{ approvalId: requested!.approvalId, toolCallId: "c_email", toolName: "send-email" }],
+          pendingToolCalls: [{ toolCallId: "c_pick", toolName: "pick-file" }],
+        },
+      });
+    }),
+  );
+
+  it.effect("never sends the frontend mark to the model", () =>
+    Effect.gen(function* () {
+      const first = yield* runFrontend([[...pickCall, finish("tool-calls")]]);
+      const [finished] = byTag(first.events, "StepFinished");
+      const prompt = Prompt.fromMessages([
+        ...userPrompt.content,
+        finished!.entries[0]!.message,
+        Prompt.makeMessage("tool", {
+          content: [
+            Prompt.makePart("tool-result", {
+              id: "c_pick",
+              name: "pick-file",
+              result: { name: "a.txt" },
+              isFailure: false,
+              providerExecuted: false,
+            }),
+          ],
+        }),
+      ]);
+      const { prompts } = yield* runFrontend([[...text("0", "You picked a.txt"), finish("stop")]], { prompt });
+      const [call] = toolCallsOf(prompts[0]!);
+      expect(call).toMatchObject({ id: "c_pick", name: "pick-file" });
+      expect(call!.options).toEqual({});
+      expect(partTypes(prompts[0]!)).toEqual(["text", "tool-call", "tool-result"]);
     }),
   );
 });
 
 describe("Agent.run replay", () => {
+  it.effect("leaves the same frontend call pending when a finished run is executed again", () =>
+    Effect.gen(function* () {
+      const attempt = (steps: ReadonlyArray<Step>) =>
+        Effect.gen(function* () {
+          const model = scriptedModel(steps);
+          const events = yield* Agent.run(weatherAgent)({
+            runId: "r1",
+            threadId: "t1",
+            prompt: userPrompt,
+            frontendTools: [PickFile],
+          }).pipe(Stream.runCollect, Effect.provide([model.layer, countingWeatherLayer().layer]));
+          return { events: Array.from(events), prompts: model.prompts };
+        });
+      const first = yield* attempt([[...toolCall("c_pick", "pick-file", {}), finish("tool-calls")]]);
+      const second = yield* attempt([]);
+      expect(second.prompts).toEqual([]);
+      const replayedSteps = byTag(second.events, "StepFinished");
+      expect(replayedSteps.every((event) => event.replayed)).toBe(true);
+      expect(replayedSteps[0]!.entries).toEqual(byTag(first.events, "StepFinished")[0]!.entries);
+      expect(second.events.at(-1)).toEqual(first.events.at(-1));
+      expect(first.events.at(-1)).toEqual({
+        _tag: "Finished",
+        outcome: { _tag: "Success", pendingToolCalls: [{ toolCallId: "c_pick", toolName: "pick-file" }] },
+      });
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+      ),
+    ),
+  );
+
   it.effect("replays completed steps of a run executed again", () =>
     Effect.gen(function* () {
       const weather = countingWeatherLayer();
@@ -440,7 +622,7 @@ describe("Agent.run replay", () => {
       expect(replayed.every((e) => "replayed" in e && e.replayed)).toBe(true);
       expect(replayed.map((e) => ({ ...e, replayed: false }))).toEqual(original);
       expect(second.events.filter((e) => e._tag === "ModelPart" && e.step === 1)).toEqual([]);
-      expect(second.events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success" } });
+      expect(second.events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
     }).pipe(
       Effect.provide(
         Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),

@@ -1,6 +1,7 @@
 import { Cause, Context, Effect, Option, Predicate, Queue, Schema, Stream } from "effect";
-import { IdGenerator, LanguageModel, Prompt } from "effect/ai";
-import type { Response, Tool, Toolkit } from "effect/ai";
+import { IdGenerator, LanguageModel, Prompt, Tool } from "effect/ai";
+import type { Response, Toolkit } from "effect/ai";
+import type { JsonSchema } from "effect";
 import * as Checkpoint from "./Checkpoint.ts";
 import type * as Thread from "./Thread.ts";
 
@@ -64,6 +65,20 @@ export interface RunInfo {
 export interface RunInput extends RunInfo {
   /** The conversation, without the agent's system prompt: the run adds it. */
   readonly prompt: Prompt.Prompt;
+  /**
+   * Tools the client runs itself (AG-UI frontend tools), offered to the model
+   * next to the agent's own. A call to one is left pending for the client to
+   * answer in a later run. Set by the client, so untrusted.
+   */
+  readonly frontendTools?: ReadonlyArray<FrontendTool> | undefined;
+}
+
+/** A tool the client advertised and runs itself. */
+export interface FrontendTool {
+  readonly name: string;
+  readonly description?: string | undefined;
+  /** A JSON Schema for the call's arguments, sent to the model as given. */
+  readonly parameters: unknown;
 }
 
 /**
@@ -121,10 +136,21 @@ export interface Approval {
   readonly toolName: string;
 }
 
+/** A call to a frontend tool, left for the client to run and answer. */
+export interface PendingToolCall {
+  readonly toolCallId: string;
+  readonly toolName: string;
+}
+
+/** Both outcomes list the frontend calls the run left pending, in call order. */
 export type Outcome =
-  | { readonly _tag: "Success" }
+  | { readonly _tag: "Success"; readonly pendingToolCalls: ReadonlyArray<PendingToolCall> }
   /** The run stopped because these tool calls wait for the user's approval. */
-  | { readonly _tag: "Interrupted"; readonly approvals: ReadonlyArray<Approval> };
+  | {
+      readonly _tag: "Interrupted";
+      readonly approvals: ReadonlyArray<Approval>;
+      readonly pendingToolCalls: ReadonlyArray<PendingToolCall>;
+    };
 
 export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded, { readonly brand: unique symbol }>()(
   "StepLimitExceeded",
@@ -196,7 +222,9 @@ interface Decision {
 /**
  * Runs the agent on a prompt: model steps, with the tool calls of each step
  * executed after the model call, until the model stops calling tools, a tool
- * needs approval, or the step limit is reached. Every model call starts with
+ * needs approval, the model calls a frontend tool, or the step limit is
+ * reached. A frontend call gets no result: the step's assistant entry marks it
+ * as the client's (see {@link isFrontendCall}) and the outcome lists it. Every model call starts with
  * the agent's system prompt, resolved once before anything else runs. The
  * run's info is available as {@link CurrentRun} throughout.
  *
@@ -214,10 +242,31 @@ export const run =
   (input: RunInput): Stream.Stream<Event, never, Requirements<Tools, R>> =>
     Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
       const emit = (event: Event) => Queue.offer(queue, event);
-      const { prompt: _, ...info } = input;
+      const { prompt: _, frontendTools = [], ...info } = input;
       return Effect.gen(function* () {
         const checkpoint = yield* Checkpoint.Checkpoint;
         const toolkit = yield* agent.toolkit;
+        // The model is offered the agent's tools plus the client's. A server tool wins a name clash.
+        const frontend = new Map<string, Tool.Any>();
+        for (const tool of frontendTools) {
+          if (Object.hasOwn(toolkit.tools, tool.name)) {
+            yield* Effect.logWarning("effentic: frontend tool ignored, a server tool has its name", tool.name);
+          } else if (!frontend.has(tool.name)) {
+            frontend.set(
+              tool.name,
+              Tool.dynamic(tool.name, {
+                description: tool.description,
+                parameters: tool.parameters as JsonSchema.JsonSchema,
+              }),
+            );
+          }
+        }
+        // Typed as the agent's toolkit: frontend tools have no handlers and need no services, and since
+        // tool calls are not resolved by the model call, `handle` is never called for one.
+        const modelToolkit = {
+          tools: { ...toolkit.tools, ...Object.fromEntries(frontend) },
+          handle: toolkit.handle,
+        } as Toolkit.WithHandler<Tools>;
         const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
           Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
         );
@@ -300,8 +349,8 @@ export const run =
               yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
               const parts: Array<Response.AnyPart> = [];
               yield* LanguageModel.streamText({
-                prompt: withSystem(stripApprovals(prompt)),
-                toolkit: agent.toolkit,
+                prompt: withSystem(forModel(prompt)),
+                toolkit: modelToolkit,
                 disableToolCallResolution: true,
               }).pipe(
                 Stream.runForEach((streamed) => {
@@ -376,16 +425,20 @@ export const run =
           }
 
           const complete = finishReason === "tool-calls" || finishReason === "stop";
-          const modelPrompt = stripApprovals(prompt);
+          const modelPrompt = forModel(prompt);
+          // Left to the client. A step cut short answers them like any other call.
+          const pending = complete ? toolCalls.filter((call) => frontend.has(call.name)) : [];
+          const pendingIds = new Set(pending.map((call) => call.id));
+          const executed = toolCalls.filter((call) => !pendingIds.has(call.id));
           const tools = yield* Effect.forEach(
-            toolCalls,
+            executed,
             (call) => (complete ? executeTool(call, modelPrompt, undefined) : interruptTool(call, finishReason)),
             { concurrency: "unbounded" },
           );
 
           const approvals: Array<Approval> = [];
           const toolEntries: Array<Thread.Entry> = [];
-          for (const [i, call] of toolCalls.entries()) {
+          for (const [i, call] of executed.entries()) {
             const { value, replayed } = tools[i]!;
             if (value._tag === "ApprovalRequested") {
               approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
@@ -410,7 +463,9 @@ export const run =
               id: messageId,
               message: Prompt.makeMessage("assistant", {
                 content: [
-                  ...assistantMessage.content,
+                  ...assistantMessage.content.map((part) =>
+                    part.type === "tool-call" && pendingIds.has(part.id) ? markFrontend(part) : part,
+                  ),
                   ...approvals.map((a) =>
                     Prompt.toolApprovalRequestPart({ approvalId: a.approvalId, toolCallId: a.toolCallId }),
                   ),
@@ -427,11 +482,12 @@ export const run =
             replayed: model.replayed && tools.every((t) => t.replayed),
           });
 
+          const pendingToolCalls = pending.map((call) => ({ toolCallId: call.id, toolName: call.name }));
           if (approvals.length > 0) {
-            return yield* emit({ _tag: "Finished", outcome: { _tag: "Interrupted", approvals } });
+            return yield* emit({ _tag: "Finished", outcome: { _tag: "Interrupted", approvals, pendingToolCalls } });
           }
-          if (finishReason !== "tool-calls" || toolCalls.length === 0) {
-            return yield* emit({ _tag: "Finished", outcome: { _tag: "Success" } });
+          if (pendingToolCalls.length > 0 || finishReason !== "tool-calls" || toolCalls.length === 0) {
+            return yield* emit({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls } });
           }
           if (step + 1 > agent.maxSteps) {
             return yield* new StepLimitExceeded({ maxSteps: agent.maxSteps });
@@ -595,17 +651,58 @@ export const orderToolResults = (prompt: Prompt.Prompt): Prompt.Prompt => {
   return Prompt.fromMessages(messages);
 };
 
+// -----------------------------------------------------------------------------
+// Frontend calls
+// -----------------------------------------------------------------------------
+
+/** The options key of effentic's own marks on stored parts. Removed before the model is called. */
+const MARK = "effentic";
+
+/** The call, marked as the client's to answer. */
+const markFrontend = (part: Prompt.ToolCallPart): Prompt.ToolCallPart =>
+  Prompt.makePart("tool-call", {
+    id: part.id,
+    name: part.name,
+    params: part.params,
+    providerExecuted: part.providerExecuted,
+    options: { ...part.options, [MARK]: { frontend: true } },
+  });
+
 /**
- * Removes approval requests and responses, which providers reject, and drops
- * messages left empty. By the time the model is called every approval in the
- * prompt has been resolved.
+ * Whether a stored tool call is a frontend call: one the run left for the
+ * client, whose `tool` message is the only result a client may write.
  */
-export const stripApprovals = (prompt: Prompt.Prompt): Prompt.Prompt =>
+export const isFrontendCall = (part: Prompt.ToolCallPart): boolean => {
+  const mark = part.options[MARK];
+  return Predicate.hasProperty(mark, "frontend") && mark.frontend === true;
+};
+
+const unmark = (part: Prompt.AssistantMessagePart): Prompt.AssistantMessagePart => {
+  if (part.type !== "tool-call" || !(MARK in part.options)) {
+    return part;
+  }
+  const { [MARK]: _, ...options } = part.options;
+  return Prompt.makePart("tool-call", {
+    id: part.id,
+    name: part.name,
+    params: part.params,
+    providerExecuted: part.providerExecuted,
+    options,
+  });
+};
+
+/**
+ * The prompt as the model receives it: approval requests and responses, which
+ * providers reject, and the marks on frontend calls are removed, and messages
+ * left empty are dropped. By the time the model is called every approval in
+ * the prompt has been resolved.
+ */
+export const forModel = (prompt: Prompt.Prompt): Prompt.Prompt =>
   Prompt.fromMessages(
     prompt.content.flatMap((message): Array<Prompt.Message> => {
       switch (message.role) {
         case "assistant": {
-          const content = message.content.filter((part) => part.type !== "tool-approval-request");
+          const content = message.content.filter((part) => part.type !== "tool-approval-request").map(unmark);
           return content.length === 0 ? [] : [Prompt.makeMessage("assistant", { content, options: message.options })];
         }
         case "tool": {

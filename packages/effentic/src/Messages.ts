@@ -7,9 +7,10 @@ import type * as Thread from "./Thread.ts";
 
 // -----------------------------------------------------------------------------
 // The server owns the thread. A run takes from the client only what is
-// new (`delta`, `ingest`) and its answers to the previous run's interrupts
-// (`resume`), and builds the model prompt from the store (`project`). A
-// client that lost its state reads the thread back (`history`).
+// new (`delta`, `ingest`), its answers to the previous run's interrupts
+// (`resume`) and its results for the frontend calls it was left (`answers`),
+// and builds the model prompt from the store (`project`). A client that lost
+// its state reads the thread back (`history`).
 // -----------------------------------------------------------------------------
 
 /** The client's history shares no message with the stored thread. */
@@ -107,7 +108,8 @@ export interface IngestOptions {
  * The entries to commit for a client delta: user messages with text, keyed by
  * the client's message id, and (only if allowed) system instructions. Every
  * other role is dropped: the server writes assistant and tool turns itself,
- * so a client cannot fabricate them.
+ * so a client cannot fabricate them. The one exception, a tool message
+ * answering a frontend call, is taken by {@link answers}.
  */
 export const ingest = (messages: ReadonlyArray<AgUi.Message>, options?: IngestOptions): ReadonlyArray<Thread.Entry> =>
   messages.flatMap((message): Array<Thread.Entry> => {
@@ -226,6 +228,128 @@ const pendingApprovals = (stored: ReadonlyArray<Thread.Entry>): ReadonlyArray<Pe
 };
 
 // -----------------------------------------------------------------------------
+// Frontend calls
+// -----------------------------------------------------------------------------
+
+/**
+ * The run leaves a frontend call of the previous run unanswered. AG-UI
+ * requires a thread that continues to answer every such call first, so the
+ * run is rejected; a client that declines a call answers it saying so.
+ */
+export class UnansweredToolCall extends Schema.TaggedError<UnansweredToolCall, { readonly brand: unique symbol }>()(
+  "UnansweredToolCall",
+  { toolCallIds: Schema.Array(Schema.String) },
+) {
+  override get message(): string {
+    return `The run does not answer the pending frontend tool calls: ${this.toolCallIds.join(", ")}`;
+  }
+}
+
+/** What {@link answers} commits. */
+export interface Answers {
+  /** One tool-result entry per pending frontend call, keyed by the client's message id. */
+  readonly entries: ReadonlyArray<Thread.Entry>;
+  /** The calls whose answer held content parts other than text, which were dropped. */
+  readonly droppedParts: ReadonlyArray<string>;
+}
+
+/**
+ * The results the client sent for the frontend calls in `stored` that have
+ * none yet: for each, the first `tool` message in `delta` with its
+ * `toolCallId`. A message with `error` is a failed result holding the error.
+ * Otherwise string content that parses as JSON is the parsed value, any other
+ * string is itself, and a list of content parts is its text parts joined; other
+ * parts are dropped (`droppedParts`), and the call is still answered. If any
+ * pending call has no answer, the result is `UnansweredToolCall` naming each
+ * of them. Tool messages for anything else are left to {@link ingest}, which
+ * drops them, so a client can only answer the calls the run left to it.
+ */
+export const answers = (
+  stored: ReadonlyArray<Thread.Entry>,
+  delta: ReadonlyArray<AgUi.Message>,
+): Result.Result<Answers, UnansweredToolCall> => {
+  const pending = pendingFrontendCalls(stored);
+  const sent = new Map<string, AgUi.Message>();
+  for (const message of delta) {
+    if (message.role === "tool" && message.toolCallId !== undefined && !sent.has(message.toolCallId)) {
+      sent.set(message.toolCallId, message);
+    }
+  }
+  const unanswered = pending.filter((call) => !sent.has(call.toolCallId));
+  if (unanswered.length > 0) {
+    return Result.fail(new UnansweredToolCall({ toolCallIds: unanswered.map((call) => call.toolCallId) }));
+  }
+  const droppedParts: Array<string> = [];
+  const entries = pending.map(({ toolCallId, toolName }): Thread.Entry => {
+    const message = sent.get(toolCallId)!;
+    const decoded = message.error === undefined ? resultOf(message.content) : { result: message.error, dropped: false };
+    if (decoded.dropped) {
+      droppedParts.push(toolCallId);
+    }
+    return {
+      id: message.id,
+      message: Prompt.makeMessage("tool", {
+        content: [
+          Prompt.makePart("tool-result", {
+            id: toolCallId,
+            name: toolName,
+            result: decoded.result,
+            isFailure: message.error !== undefined,
+            providerExecuted: false,
+          }),
+        ],
+      }),
+    };
+  });
+  return Result.succeed({ entries, droppedParts });
+};
+
+/** A tool message's content as a stored result, and whether parts other than text were dropped. */
+const resultOf = (content: unknown): { readonly result: unknown; readonly dropped: boolean } => {
+  if (typeof content === "string") {
+    try {
+      return { result: JSON.parse(content), dropped: false };
+    } catch {
+      return { result: content, dropped: false };
+    }
+  }
+  if (Array.isArray(content)) {
+    return { result: textOf(content), dropped: content.some((part) => !isTextPart(part)) };
+  }
+  return { result: content ?? "", dropped: false };
+};
+
+interface PendingFrontendCall {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  /** The assistant entry holding the call. */
+  readonly entry: Thread.Entry;
+}
+
+/** The frontend calls in `stored` that have no result yet, in commit order. */
+const pendingFrontendCalls = (stored: ReadonlyArray<Thread.Entry>): ReadonlyArray<PendingFrontendCall> => {
+  const calls: Array<PendingFrontendCall> = [];
+  const answered = new Set<string>();
+  for (const entry of stored) {
+    const { message } = entry;
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type === "tool-call" && Agent.isFrontendCall(part)) {
+          calls.push({ toolCallId: part.id, toolName: part.name, entry });
+        }
+      }
+    } else if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type === "tool-result") {
+          answered.add(part.id);
+        }
+      }
+    }
+  }
+  return calls.filter((call) => !answered.has(call.toolCallId));
+};
+
+// -----------------------------------------------------------------------------
 // Reading a thread back
 // -----------------------------------------------------------------------------
 
@@ -245,6 +369,15 @@ export interface History {
    * if the store did not record it). `undefined` when none are open.
    */
   readonly interrupts: { readonly runId: string | undefined; readonly pending: ReadonlyArray<Interrupt> } | undefined;
+  /**
+   * The frontend calls still waiting for the client's result, in call order,
+   * and the run that left them (`undefined` if the store did not record it).
+   * The calls are in `messages`, with no tool message after them. `undefined`
+   * when none are pending.
+   */
+  readonly pendingToolCalls:
+    | { readonly runId: string | undefined; readonly toolCallIds: ReadonlyArray<string> }
+    | undefined;
 }
 
 /**
@@ -296,8 +429,8 @@ const shown = (entry: Thread.Entry): ShownMessage | undefined => {
 };
 
 /**
- * The thread as its runs' events showed it, for a client that has lost its
- * state (a reload, another device) to restore. Serve it from a route of your
+ * The thread as its runs' events showed it, with its open interrupts and
+ * pending frontend calls, for a client that has lost its state (a reload, another device) to restore. Serve it from a route of your
  * own, e.g. `Effect.map(thread.load(threadId), Messages.history)`, authorised
  * like the run route. A client that sends the messages back, with new user
  * messages after them, is matched against the store as if it had streamed
@@ -337,6 +470,7 @@ export const history = (entries: ReadonlyArray<Thread.Entry>): History => {
   const ordered = rest.flatMap((message) => [message, ...(results.get(message.id) ?? [])]);
 
   const pending = pendingApprovals(entries);
+  const frontend = pendingFrontendCalls(entries);
   const toolNames = new Map<string, string>();
   for (const { message } of entries) {
     if (message.role === "assistant") {
@@ -363,6 +497,14 @@ export const history = (entries: ReadonlyArray<Thread.Entry>): History => {
               }),
             ),
           },
+    pendingToolCalls:
+      frontend.length === 0
+        ? undefined
+        : {
+            // One active run per thread, so every pending call is the last run's.
+            runId: frontend.at(-1)!.entry.runId,
+            toolCallIds: frontend.map((call) => call.toolCallId),
+          },
   };
 };
 
@@ -379,6 +521,9 @@ export const INCOMPLETE_TOOL_CALL_RESULT = "Tool call did not complete";
  * aborted mid-step can leave exactly that in the store; such calls are
  * answered with a failed result, so one broken run does not break the thread.
  * Calls waiting for approval are left alone: the run resolves them first.
+ * A frontend call is answered before the thread is projected (see
+ * {@link answers}), so it never gets this failed result in a run that
+ * reached the projection.
  */
 export const project = (entries: ReadonlyArray<Thread.Entry>): Prompt.Prompt => {
   const ordered = Agent.orderToolResults(Prompt.fromMessages(entries.map((entry) => entry.message)));

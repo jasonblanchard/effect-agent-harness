@@ -92,11 +92,25 @@ export const ResumeEntry = Schema.Struct({
 });
 export type ResumeEntry = typeof ResumeEntry.Type;
 
+/**
+ * A frontend tool the client advertises: the model may call it, and the
+ * client runs it and answers in the next run's `messages`. Set by the client,
+ * so untrusted: its description and schema reach the model as sent.
+ */
+export const FrontendTool = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+  /** A JSON Schema for the call's arguments, passed through unchecked. */
+  parameters: Schema.Unknown,
+});
+export type FrontendTool = typeof FrontendTool.Type;
+
 export const RunAgentInput = Schema.Struct({
   threadId: Schema.String,
   runId: Schema.String,
   messages: Schema.Array(Message),
   resume: Schema.optional(Schema.Array(ResumeEntry)),
+  tools: Schema.optional(Schema.Array(FrontendTool)),
   /** Passed through unchecked as the run's `props`. Set by the client, so untrusted. */
   forwardedProps: Schema.optional(Schema.Unknown),
 });
@@ -216,8 +230,9 @@ export const toolCallResult = (messageId: string, toolCallId: string, content: s
 /**
  * Projects a run's `Agent.Event`s onto AG-UI: `RUN_STARTED`, then text
  * messages, tool calls and results inside `STEP_STARTED` / `STEP_FINISHED`,
- * ending with `RUN_FINISHED` (success or the approval interrupt) or
- * `RUN_ERROR`. Spans still open when a step ends or the run fails are closed,
+ * ending with `RUN_FINISHED` (success, with `pendingToolCallIds` naming the
+ * frontend calls left to the client, or the approval interrupt) or
+ * `RUN_ERROR`. A frontend call gets no `TOOL_CALL_RESULT`. Spans still open when a step ends or the run fails are closed,
  * so the sequence is always valid AG-UI.
  *
  * Replayed events are dropped: they were already published by the attempt
@@ -268,9 +283,17 @@ export const fold =
             return events;
           }
           case "Finished": {
-            return event.outcome._tag === "Success"
-              ? [runFinished(input)]
-              : [runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
+            if (event.outcome._tag === "Interrupted") {
+              // AG-UI's interrupt outcome carries no pending calls: the client finds them in the stream.
+              return [runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
+            }
+            const pendingToolCallIds = event.outcome.pendingToolCalls.map((call) => call.toolCallId);
+            return [
+              runFinished(
+                input,
+                pendingToolCallIds.length === 0 ? { type: "success" } : { type: "success", pendingToolCallIds },
+              ),
+            ];
           }
           case "Failed": {
             const events = current?.close() ?? [];

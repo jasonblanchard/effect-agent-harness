@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { fetchServerSentEvents, useChat, type UIMessage } from "@tanstack/ai-react";
 import { Schema } from "effect";
 import { useEffect, useState, type FormEvent } from "react";
+import { getBrowserTime } from "../tools/browser-time.tool.ts";
 
 export const Route = createFileRoute("/")({
   // The thread id lives in the URL (`/?thread=…`), so a reload continues the thread.
@@ -26,10 +27,12 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
   // loads it on mount (`GET /api/chat?threadId=…`), open approvals included,
   // and still sends its whole history on every run. Don't set `history`:
   // paging makes the client send only new messages, which the server rejects.
+  // `tools` are frontend tools: the browser runs them and answers in the next run.
   const { messages, sendMessage, isLoading, error, stop, interrupts, resumeInterruptsUnsafe } = useChat({
     connection: fetchServerSentEvents("/api/chat"),
     threadId,
     persistence: true,
+    tools: [getBrowserTime],
   });
   const [input, setInput] = useState("");
 
@@ -69,7 +72,10 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
     <main className="chat">
       <header>
         <h1>effentic × TanStack AI</h1>
-        <p>Ask about the weather anywhere, or ask it to send an email (it asks you first).</p>
+        <p>
+          Ask about the weather anywhere, what time it is where you are (your browser answers), or ask it to send an
+          email (it asks you first).
+        </p>
       </header>
       <ol className="messages">
         {messages.map((message) => (

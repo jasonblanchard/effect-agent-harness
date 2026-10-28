@@ -14,7 +14,7 @@ import * as Checkpoint from "../src/Checkpoint.ts";
 //
 // Each element of `steps` is the stream returned for one `streamText` call. Part
 // ids mimic Anthropic, which reuses the content block index ("0", "1", ...) on
-// every step.
+// every step. `prompts` and `tools` record what each call received.
 // -----------------------------------------------------------------------------
 
 export type Step =
@@ -23,6 +23,7 @@ export type Step =
 
 export const scriptedModel = (steps: ReadonlyArray<Step>) => {
   const prompts: Array<Prompt.Prompt> = [];
+  const tools: Array<ReadonlyArray<Tool.Any>> = [];
   const layer = Layer.effect(
     LanguageModel.LanguageModel,
     LanguageModel.make({
@@ -30,6 +31,7 @@ export const scriptedModel = (steps: ReadonlyArray<Step>) => {
       streamText: (options) => {
         const step = steps[prompts.length];
         prompts.push(options.prompt);
+        tools.push(options.tools);
         if (step === undefined) {
           return Stream.die(`no scripted step ${prompts.length}`);
         }
@@ -37,7 +39,7 @@ export const scriptedModel = (steps: ReadonlyArray<Step>) => {
       },
     }),
   );
-  return { layer, prompts };
+  return { layer, prompts, tools };
 };
 
 export const text = (id: string, ...deltas: Array<string>): Array<Response.StreamPartEncoded> => [
@@ -132,6 +134,36 @@ export const countingApprovalLayer = () => {
   });
   return { layer, weatherCalls, emails };
 };
+
+// -----------------------------------------------------------------------------
+// Frontend tools
+// -----------------------------------------------------------------------------
+
+/** A frontend tool as a client advertises it in `RunAgentInput.tools`. */
+export const PickFile: AgUi.FrontendTool = {
+  name: "pick-file",
+  description: "Ask the user to pick a file",
+  parameters: { type: "object", properties: { accept: { type: "string" } } },
+};
+
+export const GetLocation: AgUi.FrontendTool = {
+  name: "get-location",
+  description: "Read the browser's location",
+  parameters: { type: "object", properties: {} },
+};
+
+/** A client `tool` message answering a frontend call, as TanStack AI sends it (its own id, JSON text content). */
+export const toolAnswer = (
+  toolCallId: string,
+  content: unknown,
+  options?: { readonly id?: string; readonly error?: string },
+): AgUi.Message => ({
+  id: options?.id ?? `tool-${toolCallId}`,
+  role: "tool",
+  toolCallId,
+  content: typeof content === "string" ? content : JSON.stringify(content),
+  ...(options?.error === undefined ? {} : { error: options.error }),
+});
 
 // -----------------------------------------------------------------------------
 // Evals

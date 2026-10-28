@@ -9,6 +9,8 @@ import {
   countingApprovalLayer,
   evalLayers,
   finish,
+  GetLocation,
+  PickFile,
   scriptedModel,
   type Step,
   text,
@@ -37,7 +39,7 @@ describe("AgUi.RunAgentInput", () => {
         runId: "r1",
         protocolVersion: "1.0",
         state: {},
-        tools: [{ name: "x", description: "y" }],
+        tools: [{ name: "x", description: "y", parameters: { type: "object" }, extra: true }],
         context: [],
         forwardedProps: { locale: "fr" },
         messages: [
@@ -49,8 +51,9 @@ describe("AgUi.RunAgentInput", () => {
           },
         ],
       });
-      expect(Object.keys(input).sort()).toEqual(["forwardedProps", "messages", "runId", "threadId"]);
+      expect(Object.keys(input).sort()).toEqual(["forwardedProps", "messages", "runId", "threadId", "tools"]);
       expect(input.forwardedProps).toEqual({ locale: "fr" });
+      expect(input.tools).toEqual([{ name: "x", description: "y", parameters: { type: "object" } }]);
       expect(input.messages.map((m) => m.role)).toEqual(["activity", "assistant"]);
     }),
   );
@@ -63,6 +66,24 @@ describe("AgUi.RunAgentInput", () => {
       }
       const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
       expect("forwardedProps" in without).toBe(false);
+    }),
+  );
+
+  it.effect("fails on a tool without a name", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], tools: [{ parameters: {} }] }),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+    }),
+  );
+
+  it.effect("decodes no tools and an empty tools list", () =>
+    Effect.gen(function* () {
+      const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
+      expect(without.tools).toBeUndefined();
+      const empty = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], tools: [] });
+      expect(empty.tools).toEqual([]);
     }),
   );
 
@@ -125,10 +146,10 @@ const agent = Agent.define({ toolkit: ApprovalToolkit });
 const prompt = Prompt.make([{ role: "user", content: "What is the weather in Paris?" }]);
 
 /** Runs the core on a scripted model and projects it onto AG-UI; every sequence is verified. */
-const foldRun = (steps: ReadonlyArray<Step>) =>
+const foldRun = (steps: ReadonlyArray<Step>, frontendTools?: ReadonlyArray<AgUi.FrontendTool>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt }).pipe(
+    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt, frontendTools }).pipe(
       AgUi.fold({ threadId: "t1", runId: "r1" }),
       Stream.runCollect,
       Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),
@@ -268,6 +289,60 @@ describe("AgUi.fold", () => {
           ],
         },
       });
+    }),
+  );
+
+  it.effect("ends a frontend call with a success outcome naming it, and gives it no result", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([[...toolCall("c_pick", "pick-file", {}), finish("tool-calls")]], [PickFile]);
+      expect(types(events)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.STEP_STARTED,
+        EventType.TOOL_CALL_START,
+        EventType.TOOL_CALL_ARGS,
+        EventType.TOOL_CALL_END,
+        EventType.STEP_FINISHED,
+        EventType.RUN_FINISHED,
+      ]);
+      expect(events.at(-1)).toEqual({
+        type: EventType.RUN_FINISHED,
+        threadId: "t1",
+        runId: "r1",
+        outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
+      });
+    }),
+  );
+
+  it.effect("names two frontend calls in the order they were made", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun(
+        [[...toolCall("c_pick", "pick-file", {}), ...toolCall("c_loc", "get-location", {}), finish("tool-calls")]],
+        [PickFile, GetLocation],
+      );
+      expect(events.at(-1)).toMatchObject({ outcome: { type: "success", pendingToolCallIds: ["c_pick", "c_loc"] } });
+    }),
+  );
+
+  it.effect("leaves pendingToolCallIds off a success with nothing pending and off an interrupt", () =>
+    Effect.gen(function* () {
+      const plain = yield* foldRun([[...text("0", "Hi"), finish("stop")]], [PickFile]);
+      expect(plain.at(-1)).toMatchObject({ outcome: { type: "success" } });
+      expect("pendingToolCallIds" in (plain.at(-1) as { outcome: object }).outcome).toBe(false);
+
+      const mixed = yield* foldRun(
+        [
+          [
+            ...toolCall("c_pick", "pick-file", {}),
+            ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
+            finish("tool-calls"),
+          ],
+        ],
+        [PickFile],
+      );
+      const outcome = (mixed.at(-1) as { outcome: { type: string } }).outcome;
+      expect(outcome.type).toBe("interrupt");
+      expect("pendingToolCallIds" in outcome).toBe(false);
+      expect(mixed.filter((e) => e.type === EventType.TOOL_CALL_RESULT)).toEqual([]);
     }),
   );
 

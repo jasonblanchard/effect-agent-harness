@@ -199,12 +199,12 @@ const resolveServices = <ROut, E, RIn>(
  * 2. check that the input is the one the run id was first used with
  *    (memoised as the `input` checkpoint; the dependencies are not part of
  *    it), and claim the thread, so it has one active run;
- * 3. load the thread, take the client's delta and its `resume` answers, and
- *    commit them;
+ * 3. load the thread, take the client's delta, its `resume` answers and its
+ *    results for pending frontend calls, and commit them;
  * 4. project the thread, memoised as the `prompt` checkpoint so a resumed run
  *    uses the projection the crashed attempt used;
- * 5. run the agent with the run's info (the input's ids and `forwardedProps`)
- *    and the per-run services, committing each step's entries as it finishes;
+ * 5. run the agent with the run's info (the input's ids and `forwardedProps`),
+ *    the client's frontend tools and the per-run services, committing each step's entries as it finishes;
  * 6. tell the store the run ended, however it ended, and release the thread
  *    before the terminal event is emitted, so the client's next run finds it
  *    free;
@@ -214,7 +214,7 @@ const resolveServices = <ROut, E, RIn>(
  * id the client reuses on another thread replays nothing.
  *
  * Failures, including those before the model is called (the per-run layer's
- * errors, `ThreadError`, `HistoryMismatch`, `UnansweredInterrupt`,
+ * errors, `ThreadError`, `HistoryMismatch`, `UnansweredInterrupt`, `UnansweredToolCall`,
  * `RunInputMismatch`, `ThreadBusy`), end the stream with `RUN_ERROR`, so it
  * never fails. A run that never claimed the thread is not reported to the
  * store. Nor is an interrupted run (e.g. a cancelled request), since it has
@@ -241,6 +241,8 @@ const pipeline =
           const stored = yield* thread.load(threadId);
           const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages, runId));
           const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
+          // After `resume`, so a run that leaves both kinds open reports the unanswered interrupt.
+          const answered = yield* Effect.fromResult(Messages.answers(stored, delta));
           const malformed = Messages.malformedAnswers(input.resume ?? []);
           if (malformed.length > 0) {
             yield* Effect.logWarning(
@@ -248,8 +250,18 @@ const pipeline =
               malformed,
             );
           }
+          if (answered.droppedParts.length > 0) {
+            yield* Effect.logWarning(
+              "effentic: content parts other than text were dropped from frontend tool results",
+              answered.droppedParts,
+            );
+          }
           // Answers to the previous run come before anything new the client says.
-          const added = [...responses, ...Messages.ingest(delta, { clientSystem: options?.clientSystem })];
+          const added = [
+            ...responses,
+            ...answered.entries,
+            ...Messages.ingest(delta, { clientSystem: options?.clientSystem }),
+          ];
           yield* thread.commit(threadId, runId, added);
           const prompt = yield* checkpoint.memo(
             { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
@@ -261,6 +273,7 @@ const pipeline =
             threadId,
             props: input.forwardedProps,
             prompt: prompt.value,
+            frontendTools: input.tools,
           }).pipe(
             Stream.tap((event) =>
               event._tag === "StepFinished" ? thread.commit(threadId, runId, event.entries) : Effect.void,
