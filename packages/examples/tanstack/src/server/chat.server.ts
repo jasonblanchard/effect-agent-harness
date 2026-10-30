@@ -45,6 +45,7 @@ const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const thread = yield* Thread.Thread;
+    const runAgent = Runner.run(assistant);
 
     // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
     // true`). On mount, the page restores the thread's messages and its open
@@ -81,7 +82,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       "/api/chat",
       Effect.gen(function* () {
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return yield* Sse.response(Sse.encode(Runner.run(assistant)(input)));
+        return yield* runAgent(input).pipe(Sse.encode, Sse.response);
       }).pipe(
         Effect.catch((error) =>
           Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 })),

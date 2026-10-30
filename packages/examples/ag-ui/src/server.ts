@@ -55,6 +55,8 @@ const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401
 
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
+    const runAgent = Runner.run(assistant);
+
     // POST /agent: the run streams back as SSE, and ends if the client disconnects.
     yield* router.add(
       "POST",
@@ -62,9 +64,7 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return yield* Sse.response(
-          Sse.encode(Runner.run(assistant)(input).pipe(Stream.provideService(AuthContext, principal))),
-        );
+        return yield* runAgent(input).pipe(Stream.provideService(AuthContext, principal), Sse.encode, Sse.response);
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
