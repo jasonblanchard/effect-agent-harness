@@ -1,4 +1,3 @@
-import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit, Stream } from "effect";
 import { AiError, Prompt } from "effect/ai";
@@ -167,12 +166,18 @@ const modelFailure = AiError.make({
 });
 
 describe("verify", () => {
+  it("rejects an event the AG-UI schema does not declare", async () => {
+    await expect(
+      verify([{ ...AgUi.runStarted({ threadId: "t1", runId: "r1" }), extra: true } as AgUi.Event]),
+    ).rejects.toThrow(/extra/);
+  });
+
   it("rejects sequences the AG-UI client would reject", async () => {
     await expect(
       verify([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" } as AgUi.Event,
-        { type: EventType.TEXT_MESSAGE_START, messageId: "m1", role: "assistant" } as AgUi.Event,
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1" } as AgUi.Event,
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+        { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
+        { type: "RUN_FINISHED", threadId: "t1", runId: "r1" },
       ]),
     ).rejects.toThrow(/text messages are still active/);
   });
@@ -183,14 +188,14 @@ describe("AgUi.fold", () => {
     Effect.gen(function* () {
       const events = yield* foldRun([[...text("0", "Hel", "lo"), finish("stop")]]);
       expect(events).toEqual([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
-        { type: EventType.STEP_STARTED, stepName: "step-1" },
-        { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
-        { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
-        { type: EventType.STEP_FINISHED, stepName: "step-1" },
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1", protocolVersion: "1.0" },
+        { type: "STEP_STARTED", stepName: "step-1" },
+        { type: "TEXT_MESSAGE_START", messageId: "id-1", role: "assistant" },
+        { type: "TEXT_MESSAGE_CONTENT", messageId: "id-1", delta: "Hel" },
+        { type: "TEXT_MESSAGE_CONTENT", messageId: "id-1", delta: "lo" },
+        { type: "TEXT_MESSAGE_END", messageId: "id-1" },
+        { type: "STEP_FINISHED", stepName: "step-1" },
+        { type: "RUN_FINISHED", threadId: "t1", runId: "r1", outcome: { type: "success" } },
       ]);
     }),
   );
@@ -206,40 +211,40 @@ describe("AgUi.fold", () => {
         [...text("0", "It is 18°C."), finish("stop")],
       ]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.TOOL_CALL_RESULT,
-        EventType.STEP_FINISHED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+        "STEP_FINISHED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
-      expect(events.filter((e) => e.type === EventType.STEP_STARTED || e.type === EventType.STEP_FINISHED)).toEqual([
+      expect(events.filter((e) => e.type === "STEP_STARTED" || e.type === "STEP_FINISHED")).toEqual([
         AgUi.stepStarted("step-1"),
         AgUi.stepFinished("step-1"),
         AgUi.stepStarted("step-2"),
         AgUi.stepFinished("step-2"),
       ]);
-      const toolStart = events.find((e) => e.type === EventType.TOOL_CALL_START);
+      const toolStart = events.find((e) => e.type === "TOOL_CALL_START");
       expect(toolStart).toEqual({
-        type: EventType.TOOL_CALL_START,
+        type: "TOOL_CALL_START",
         toolCallId: "toolu_1",
         toolCallName: "get-weather",
         parentMessageId: "id-1",
       });
-      const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
+      const result = events.find((e) => e.type === "TOOL_CALL_RESULT");
       expect(result).toEqual({
-        type: EventType.TOOL_CALL_RESULT,
+        type: "TOOL_CALL_RESULT",
         messageId: "id-2",
         toolCallId: "toolu_1",
         content: '{"temperature":18}',
@@ -257,16 +262,16 @@ describe("AgUi.fold", () => {
         [...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }), finish("tool-calls")],
       ]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
       expect(events.at(-1)).toEqual({
-        type: EventType.RUN_FINISHED,
+        type: "RUN_FINISHED",
         threadId: "t1",
         runId: "r1",
         outcome: {
@@ -296,16 +301,16 @@ describe("AgUi.fold", () => {
     Effect.gen(function* () {
       const events = yield* foldRun([[...toolCall("c_pick", "pick-file", {}), finish("tool-calls")]], [PickFile]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
       expect(events.at(-1)).toEqual({
-        type: EventType.RUN_FINISHED,
+        type: "RUN_FINISHED",
         threadId: "t1",
         runId: "r1",
         outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
@@ -342,7 +347,7 @@ describe("AgUi.fold", () => {
       const outcome = (mixed.at(-1) as { outcome: { type: string } }).outcome;
       expect(outcome.type).toBe("interrupt");
       expect("pendingToolCallIds" in outcome).toBe(false);
-      expect(mixed.filter((e) => e.type === EventType.TOOL_CALL_RESULT)).toEqual([]);
+      expect(mixed.filter((e) => e.type === "TOOL_CALL_RESULT")).toEqual([]);
     }),
   );
 
@@ -352,12 +357,12 @@ describe("AgUi.fold", () => {
         Stream.fromIterable(text("0", "partial").slice(0, 2)).pipe(Stream.concat(Stream.fail(modelFailure))),
       ]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.RUN_ERROR,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "RUN_ERROR",
       ]);
       expect(events.at(-1)).toMatchObject({ code: "UnknownError" });
     }),
@@ -373,28 +378,26 @@ describe("AgUi.fold", () => {
         ],
       ]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TOOL_CALL_START,
-        EventType.TOOL_CALL_ARGS,
-        EventType.TOOL_CALL_END,
-        EventType.RUN_ERROR,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "RUN_ERROR",
       ]);
-      expect(events.at(-1)).toEqual({ type: EventType.RUN_ERROR, message: "overloaded", code: "ModelStreamError" });
+      expect(events.at(-1)).toEqual({ type: "RUN_ERROR", message: "overloaded", code: "ModelStreamError" });
     }),
   );
 
   it.effect("answers a tool call of an incomplete response with a failed result and finishes", () =>
     Effect.gen(function* () {
       const events = yield* foldRun([[...toolCall("c1", "get-weather", { location: "Paris" }), finish("length")]]);
-      const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
+      const result = events.find((e) => e.type === "TOOL_CALL_RESULT");
       expect(result).toMatchObject({ toolCallId: "c1" });
       expect(JSON.parse((result as { content: string }).content)).toMatchObject({ type: "execution-interrupted" });
       expect((result as { content: string }).content).toContain("length");
-      expect(types(events).indexOf(EventType.TOOL_CALL_END)).toBeLessThan(
-        types(events).indexOf(EventType.TOOL_CALL_RESULT),
-      );
-      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(types(events).indexOf("TOOL_CALL_END")).toBeLessThan(types(events).indexOf("TOOL_CALL_RESULT"));
+      expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
     }),
   );
 
@@ -402,13 +405,13 @@ describe("AgUi.fold", () => {
     Effect.gen(function* () {
       const events = yield* foldRun([[...text("0", "hi").slice(0, 2), finish("stop")]]);
       expect(types(events)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
     }),
   );
@@ -416,7 +419,7 @@ describe("AgUi.fold", () => {
   it.effect("uses one message id for every text block in a step", () =>
     Effect.gen(function* () {
       const events = yield* foldRun([[...text("0", "a"), ...text("1", "b"), finish("stop")]]);
-      const starts = events.filter((e) => e.type === EventType.TEXT_MESSAGE_START);
+      const starts = events.filter((e) => e.type === "TEXT_MESSAGE_START");
       expect(starts).toHaveLength(2);
       expect(new Set(starts.map((e) => (e as { messageId: string }).messageId))).toEqual(new Set(["id-1"]));
     }),
@@ -429,11 +432,11 @@ describe("AgUi.fold", () => {
         [finish("stop")],
       ]);
       expect(events.slice(2, 6)).toEqual([
-        { type: EventType.TOOL_CALL_START, toolCallId: "call_1", toolCallName: "get-weather", parentMessageId: "id-1" },
-        { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_1", delta: '{"location":"Paris"}' },
-        { type: EventType.TOOL_CALL_END, toolCallId: "call_1" },
+        { type: "TOOL_CALL_START", toolCallId: "call_1", toolCallName: "get-weather", parentMessageId: "id-1" },
+        { type: "TOOL_CALL_ARGS", toolCallId: "call_1", delta: '{"location":"Paris"}' },
+        { type: "TOOL_CALL_END", toolCallId: "call_1" },
         {
-          type: EventType.TOOL_CALL_RESULT,
+          type: "TOOL_CALL_RESULT",
           messageId: "id-2",
           toolCallId: "call_1",
           content: '{"temperature":18}',

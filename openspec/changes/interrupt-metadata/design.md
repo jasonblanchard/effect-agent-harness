@@ -1,6 +1,6 @@
 ## Context
 
-`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `@ag-ui/core` `Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `run`/`make` stream it, and `makeDetached` and `workflow` publish it to the `EventLog`. `Interrupt.metadata` is already an optional, open `Record<string, any>` in `@ag-ui/core`; effentic never sets it.
+`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `AgUiSchema.Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `run`/`make` stream it, and `makeDetached` and `workflow` publish it to the `EventLog`. `Interrupt.metadata` is already an optional, open `Metadata` (`Record<string, Schema.Json>`) in `AgUiSchema`, so the hook's values must be JSON; effentic never sets it.
 
 TanStack AI 1.0's client (read from the installed 1.0.0 source) treats an interrupt as resolvable only when `metadata["tanstack:interruptBinding"]` holds a binding of a version it knows. The minimal form is:
 
@@ -56,7 +56,7 @@ readonly interruptMetadata?: (
 - **Why `fold`:** it's the single point all runners share, so stored and live events can't drift apart.
 - **What the hook sees:** the interrupt exactly as the library built it, so hashes over `responseSchema` match what the client receives.
 - **What it can change:** only `metadata` is set from the result. The hook can't touch `id`, `reason` or the outcome.
-- **Merging:** the library sets no metadata of its own today, so the result becomes `metadata` as is. If the library ever adds keys of its own, they win over the hook's, merged by key the way `@ag-ui/core`'s `mergeMetadata` does.
+- **Merging:** the library sets no metadata of its own today, so the result becomes `metadata` as is. If the library ever adds keys of its own, they win over the hook's, merged by key.
 
 ### A throwing hook degrades, never fails the stream
 

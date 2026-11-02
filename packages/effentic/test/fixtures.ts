@@ -5,6 +5,7 @@ import { AiError, IdGenerator, LanguageModel, Tool, Toolkit } from "effect/ai";
 import type { Prompt, Response } from "effect/ai";
 import type * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
+import * as AgUiSchema from "../src/AgUiSchema.ts";
 import * as Runner from "../src/Runner.ts";
 import { from, lastValueFrom, toArray } from "rxjs";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -176,9 +177,20 @@ export const evalLayers = Layer.mergeAll(Checkpoint.layerNone, counterIds());
 // AG-UI client verification
 // -----------------------------------------------------------------------------
 
-/** Runs events through `@ag-ui/client`'s verifier; rejects if the sequence is invalid. */
-export const verify = (events: ReadonlyArray<BaseEvent>): Promise<Array<BaseEvent>> =>
-  lastValueFrom(from(events).pipe(verifyEvents(), toArray()));
+const decodeEvent = Schema.decodeUnknownSync(AgUiSchema.Event);
+
+/**
+ * Checks each event against the AG-UI schema (no undeclared fields), then runs
+ * the sequence through `@ag-ui/client`'s verifier; rejects if either fails.
+ * The client types `type` as its `EventType` enum, whose values are the wire
+ * strings our events carry, hence the cast.
+ */
+export const verify = async (events: ReadonlyArray<AgUi.Event>): Promise<Array<BaseEvent>> => {
+  for (const event of events) {
+    decodeEvent(event, { onExcessProperty: "error" });
+  }
+  return lastValueFrom(from(events as ReadonlyArray<BaseEvent>).pipe(verifyEvents(), toArray()));
+};
 
 /**
  * Runs each input through `Runner.run`, one after another, and returns each

@@ -193,9 +193,6 @@ importers:
 
   packages/effentic:
     dependencies:
-      '@ag-ui/core':
-        specifier: ^1.0.3
-        version: 1.0.3(zod@3.25.76)
       effect:
         specifier: 'catalog:'
         version: 4.0.5
@@ -224,9 +221,6 @@ importers:
       '@ag-ui/client':
         specifier: ^1.0.3
         version: 1.0.3
-      '@ag-ui/core':
-        specifier: ^1.0.3
-        version: 1.0.3(zod@3.25.76)
       '@effect/ai-anthropic':
         specifier: 4.0.5
         version: 4.0.5(effect@4.0.5)

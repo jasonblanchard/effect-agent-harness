@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "@ag-ui/client": "^1.0.3",
-    "@ag-ui/core": "^1.0.3",
     "@effect/ai-anthropic": "4.0.5",
     "effect": "catalog:",
     "effentic": "workspace:*"

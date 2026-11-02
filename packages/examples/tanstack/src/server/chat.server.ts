@@ -59,9 +59,20 @@ const ChatRoutes = HttpRouter.use((router) =>
         const { threadId } = yield* HttpServerRequest.schemaSearchParams(HydrateQuery);
         const { messages, interrupts } = Messages.history(yield* thread.load(threadId));
         return yield* HttpServerResponse.json({
-          // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent).
+          // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent)
+          // and `toolCalls` is a mutable array.
           messages: modelMessagesToUIMessages(
-            messages.map((message) => ({ ...message, content: message.content ?? null })),
+            messages.map((message) => {
+              if (message.role !== "assistant") {
+                return message;
+              }
+              const { toolCalls, ...rest } = message;
+              return {
+                ...rest,
+                content: message.content ?? null,
+                ...(toolCalls === undefined ? {} : { toolCalls: [...toolCalls] }),
+              };
+            }),
           ),
           interrupts: interrupts === undefined ? null : interrupts,
           activeRun: null,

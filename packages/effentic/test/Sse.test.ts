@@ -1,5 +1,4 @@
 import { HttpAgent, randomUUID } from "@ag-ui/client";
-import { EventType } from "@ag-ui/core";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Stream } from "effect";
 import { expectTypeOf } from "vitest";
@@ -55,14 +54,14 @@ describe("Sse.encode", () => {
       const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
       const frames = yield* Stream.runCollect(Sse.encode(Runner.run(weatherAgent)(input))).pipe(Effect.provide(layer));
       expect(parseSse(frames.join(""))).toEqual([
-        { type: EventType.RUN_STARTED, threadId: "t1", runId: "r1", protocolVersion: "1.0" },
-        { type: EventType.STEP_STARTED, stepName: "step-1" },
-        { type: EventType.TEXT_MESSAGE_START, messageId: "id-1", role: "assistant" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "Hel" },
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "id-1", delta: "lo" },
-        { type: EventType.TEXT_MESSAGE_END, messageId: "id-1" },
-        { type: EventType.STEP_FINISHED, stepName: "step-1" },
-        { type: EventType.RUN_FINISHED, threadId: "t1", runId: "r1", outcome: { type: "success" } },
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1", protocolVersion: "1.0" },
+        { type: "STEP_STARTED", stepName: "step-1" },
+        { type: "TEXT_MESSAGE_START", messageId: "id-1", role: "assistant" },
+        { type: "TEXT_MESSAGE_CONTENT", messageId: "id-1", delta: "Hel" },
+        { type: "TEXT_MESSAGE_CONTENT", messageId: "id-1", delta: "lo" },
+        { type: "TEXT_MESSAGE_END", messageId: "id-1" },
+        { type: "STEP_FINISHED", stepName: "step-1" },
+        { type: "RUN_FINISHED", threadId: "t1", runId: "r1", outcome: { type: "success" } },
       ]);
     }),
   );
@@ -88,9 +87,7 @@ describe("Sse.encodeStored", () => {
 });
 
 describe("Sse.response", () => {
-  const frames = Sse.encode(
-    Stream.fromIterable<AgUi.Event>([{ type: EventType.RUN_STARTED, threadId: "t1", runId: "r1" }]),
-  );
+  const frames = Sse.encode(Stream.fromIterable<AgUi.Event>([{ type: "RUN_STARTED", threadId: "t1", runId: "r1" }]));
 
   it.effect("streams SSE without caching by default", () =>
     Effect.gen(function* () {
@@ -127,13 +124,13 @@ describe("Sse.response", () => {
       const response = yield* built.pipe(Effect.provide(layer));
       const body = yield* Effect.promise(() => HttpServerResponse.toWeb(response).text());
       expect(parseSse(body).map((event) => event.type)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
     }),
   );
@@ -154,14 +151,14 @@ describe("Runner.run", () => {
       expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUi.Event, never, never>>();
       const events = yield* Stream.runCollect(stream);
       expect(events.map((e) => e.type)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
     }),
   );
@@ -180,11 +177,7 @@ describe("Runner.run", () => {
       const events = yield* Stream.runCollect(Runner.run(weatherAgent)(input).pipe(Stream.take(3))).pipe(
         Effect.provide(layer),
       );
-      expect(events.map((e) => e.type)).toEqual([
-        EventType.RUN_STARTED,
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-      ]);
+      expect(events.map((e) => e.type)).toEqual(["RUN_STARTED", "STEP_STARTED", "TEXT_MESSAGE_START"]);
       expect(interrupted).toBe(true);
     }),
   );

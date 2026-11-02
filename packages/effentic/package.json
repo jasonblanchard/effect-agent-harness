@@ -14,10 +14,10 @@
     "tsc": "tsc",
     "lint": "oxlint --deny-warnings -c ../../.oxlintrc.json",
     "format": "oxfmt -c ../../.oxfmtrc.json",
-    "format:check": "oxfmt -c ../../.oxfmtrc.json --check"
+    "format:check": "oxfmt -c ../../.oxfmtrc.json --check",
+    "generate:schema": "node scripts/generate-schema.ts && oxfmt -c ../../.oxfmtrc.json src/AgUiSchema.ts"
   },
   "dependencies": {
-    "@ag-ui/core": "^1.0.3",
     "effect": "catalog:"
   },
   "devDependencies": {

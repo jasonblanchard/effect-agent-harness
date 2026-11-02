@@ -1,4 +1,4 @@
-import type { AssistantMessage, Interrupt, ToolMessage, UserMessage } from "@ag-ui/core";
+import type { AssistantMessage, Interrupt, ToolMessage, UserMessage } from "./AgUiSchema.ts";
 import { Option, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import * as Agent from "./Agent.ts";

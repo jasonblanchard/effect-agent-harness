@@ -25,7 +25,7 @@ effentic's approval interrupts are plain AG-UI interrupts, and some clients won'
 ## Impact
 
 - `packages/effentic/src/Runner.ts`: `Options.interruptMetadata`, passed through to the projection in every runner.
-- `packages/effentic/src/AgUi.ts`: `fold` takes the hook and applies it when it builds the interrupt outcome. The interrupt type is `@ag-ui/core`'s `Interrupt`, which already has an optional `metadata`, so no type changes.
+- `packages/effentic/src/AgUi.ts`: `fold` takes the hook and applies it when it builds the interrupt outcome. The interrupt type is `AgUiSchema.Interrupt`, which already has an optional `metadata` (`Record<string, Schema.Json>`), so no type changes.
 - `packages/effentic/test`: tests for the default, the attached metadata, a hook that throws, and a detached run's stored log. Every sequence goes through `verify`.
 - `packages/examples/tanstack`: the server passes the hook, and `src/routes/index.tsx` switches to the bound interrupt API. Its `AGENTS.md` and manual checks are updated.
 - `packages/effentic/AGENTS.md`: the `Runner` and `AgUi` module notes.

@@ -1,4 +1,4 @@
-import { EventType, PROTOCOL_VERSION } from "@ag-ui/core";
+import { PROTOCOL_VERSION } from "./AgUiSchema.ts";
 import type {
   Interrupt,
   RunErrorEvent,
@@ -14,7 +14,7 @@ import type {
   ToolCallEndEvent,
   ToolCallResultEvent,
   ToolCallStartEvent,
-} from "@ag-ui/core";
+} from "./AgUiSchema.ts";
 import { Schema, Stream } from "effect";
 import type { Response, Tool } from "effect/ai";
 import * as Agent from "./Agent.ts";
@@ -137,11 +137,10 @@ export type Event =
   | ToolCallResultEvent;
 
 /** Whether the event ends a run (`RUN_FINISHED` or `RUN_ERROR`). */
-export const isTerminal = (event: Event): boolean =>
-  event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR;
+export const isTerminal = (event: Event): boolean => event.type === "RUN_FINISHED" || event.type === "RUN_ERROR";
 
 export const runStarted = (input: { readonly threadId: string; readonly runId: string }): RunStartedEvent => ({
-  type: EventType.RUN_STARTED,
+  type: "RUN_STARTED",
   threadId: input.threadId,
   runId: input.runId,
   protocolVersion: PROTOCOL_VERSION,
@@ -151,7 +150,7 @@ export const runFinished = (
   input: { readonly threadId: string; readonly runId: string },
   outcome: RunFinishedOutcome = { type: "success" },
 ): RunFinishedEvent => ({
-  type: EventType.RUN_FINISHED,
+  type: "RUN_FINISHED",
   threadId: input.threadId,
   runId: input.runId,
   outcome,
@@ -164,32 +163,32 @@ export const runInterrupted = (
 ): RunFinishedEvent => runFinished(input, { type: "interrupt", interrupts: [...interrupts] });
 
 export const runError = (message: string, code?: string): RunErrorEvent =>
-  code === undefined ? { type: EventType.RUN_ERROR, message } : { type: EventType.RUN_ERROR, message, code };
+  code === undefined ? { type: "RUN_ERROR", message } : { type: "RUN_ERROR", message, code };
 
 export const stepStarted = (stepName: string): StepStartedEvent => ({
-  type: EventType.STEP_STARTED,
+  type: "STEP_STARTED",
   stepName,
 });
 
 export const stepFinished = (stepName: string): StepFinishedEvent => ({
-  type: EventType.STEP_FINISHED,
+  type: "STEP_FINISHED",
   stepName,
 });
 
 export const textMessageStart = (messageId: string): TextMessageStartEvent => ({
-  type: EventType.TEXT_MESSAGE_START,
+  type: "TEXT_MESSAGE_START",
   messageId,
   role: "assistant",
 });
 
 export const textMessageContent = (messageId: string, delta: string): TextMessageContentEvent => ({
-  type: EventType.TEXT_MESSAGE_CONTENT,
+  type: "TEXT_MESSAGE_CONTENT",
   messageId,
   delta,
 });
 
 export const textMessageEnd = (messageId: string): TextMessageEndEvent => ({
-  type: EventType.TEXT_MESSAGE_END,
+  type: "TEXT_MESSAGE_END",
   messageId,
 });
 
@@ -198,25 +197,25 @@ export const toolCallStart = (
   toolCallName: string,
   parentMessageId: string,
 ): ToolCallStartEvent => ({
-  type: EventType.TOOL_CALL_START,
+  type: "TOOL_CALL_START",
   toolCallId,
   toolCallName,
   parentMessageId,
 });
 
 export const toolCallArgs = (toolCallId: string, delta: string): ToolCallArgsEvent => ({
-  type: EventType.TOOL_CALL_ARGS,
+  type: "TOOL_CALL_ARGS",
   toolCallId,
   delta,
 });
 
 export const toolCallEnd = (toolCallId: string): ToolCallEndEvent => ({
-  type: EventType.TOOL_CALL_END,
+  type: "TOOL_CALL_END",
   toolCallId,
 });
 
 export const toolCallResult = (messageId: string, toolCallId: string, content: string): ToolCallResultEvent => ({
-  type: EventType.TOOL_CALL_RESULT,
+  type: "TOOL_CALL_RESULT",
   messageId,
   toolCallId,
   content,
@@ -320,22 +319,22 @@ export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
   const steps = new Set<string>();
   for (const event of history) {
     switch (event.type) {
-      case EventType.TEXT_MESSAGE_START:
+      case "TEXT_MESSAGE_START":
         text.add(event.messageId);
         break;
-      case EventType.TEXT_MESSAGE_END:
+      case "TEXT_MESSAGE_END":
         text.delete(event.messageId);
         break;
-      case EventType.TOOL_CALL_START:
+      case "TOOL_CALL_START":
         tools.add(event.toolCallId);
         break;
-      case EventType.TOOL_CALL_END:
+      case "TOOL_CALL_END":
         tools.delete(event.toolCallId);
         break;
-      case EventType.STEP_STARTED:
+      case "STEP_STARTED":
         steps.add(event.stepName);
         break;
-      case EventType.STEP_FINISHED:
+      case "STEP_FINISHED":
         steps.delete(event.stepName);
         break;
     }

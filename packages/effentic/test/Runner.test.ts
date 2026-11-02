@@ -1,4 +1,3 @@
-import { EventType } from "@ag-ui/core";
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
 import { expectTypeOf } from "vitest";
@@ -127,7 +126,7 @@ describe("Runner.run", () => {
         input("r2", [...clientHistoryAfterWeatherTurn, userMessage("u2", "And now?")]),
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
 
-      expect(second!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(second!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(model.prompts).toHaveLength(3);
       const prompt = model.prompts[2]!;
       expect(prompt.content.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool", "assistant", "user"]);
@@ -173,7 +172,7 @@ describe("Runner.run", () => {
         input("r2", [userMessage("other", "Hi")]),
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
       expect(model.prompts).toHaveLength(2);
-      expect(types(second!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(second!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(second![1]).toMatchObject({ code: "HistoryMismatch" });
     }),
   );
@@ -191,7 +190,7 @@ describe("Runner.run", () => {
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, failing]),
       );
-      expect(types(events!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(events!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(events![1]).toMatchObject({ code: "ThreadError" });
       expect(model.prompts).toHaveLength(0);
     }),
@@ -241,7 +240,7 @@ describe("Runner.run commits", () => {
       ]);
       yield* Effect.gen(function* () {
         const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
-        expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ModelStreamError" });
+        expect(events!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "ModelStreamError" });
         expect((yield* loadThread).map((e) => e.id)).toEqual(["u1", "id-1", "id-2"]);
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
       expect(spy.log.slice(-2)).toEqual(["runEnded r1: Failed ModelStreamError", "release r1"]);
@@ -276,7 +275,7 @@ describe("Runner.run commits", () => {
         input("r1", [userMessage("u1", "hi")]),
         input("r2", [userMessage("x1", "unrelated")]),
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
-      expect(second!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "HistoryMismatch" });
+      expect(second!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "HistoryMismatch" });
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual([
         "runEnded r1: Success",
         "runEnded r2: Failed HistoryMismatch",
@@ -291,7 +290,7 @@ describe("Runner.run commits", () => {
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ThreadError" });
+      expect(events!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "ThreadError" });
       expect(spy.log).toEqual([
         "claim r1",
         "commit r1: u1",
@@ -309,7 +308,7 @@ describe("Runner.run commits", () => {
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ThreadError" });
+      expect(events!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "ThreadError" });
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual(["runEnded r1: Success"]);
     }),
   );
@@ -319,7 +318,7 @@ describe("Runner.run commits", () => {
       const spy = spyThread();
       const model = scriptedModel([...weatherTurn]);
       yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "Weather in Paris?")])).pipe(
-        Stream.takeUntil((event) => event.type === EventType.TOOL_CALL_RESULT),
+        Stream.takeUntil((event) => event.type === "TOOL_CALL_RESULT"),
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
@@ -335,7 +334,7 @@ describe("Runner.run commits", () => {
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ModelStreamError" });
+      expect(events!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "ModelStreamError" });
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual(["runEnded r1: Failed ModelStreamError"]);
     }),
   );
@@ -357,9 +356,9 @@ describe("Runner one run per thread", () => {
       yield* Effect.gen(function* () {
         const first = yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
           Stream.tap((event) =>
-            event.type === EventType.TEXT_MESSAGE_CONTENT
+            event.type === "TEXT_MESSAGE_CONTENT"
               ? Deferred.succeed(streaming, undefined)
-              : event.type === EventType.RUN_FINISHED
+              : event.type === "RUN_FINISHED"
                 ? // The thread is already free when the client sees the end of the run.
                   Effect.flatMap(Thread.Thread, (thread) => thread.claim("t1", "probe")).pipe(
                     Effect.andThen(Effect.flatMap(Thread.Thread, (thread) => thread.release("t1", "probe"))),
@@ -375,13 +374,13 @@ describe("Runner one run per thread", () => {
         const [busy] = yield* runAgUi(weatherAgent, [
           input("r2", [userMessage("u1", "hi"), userMessage("u2", "again")]),
         ]);
-        expect(types(busy!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(types(busy!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
         expect(busy![1]).toMatchObject({ code: "ThreadBusy" });
         expect(spy.log.filter((line) => line.includes("r2"))).toEqual(["claim r2"]);
 
         yield* Deferred.succeed(release, undefined);
         const firstEvents = Array.from(yield* Fiber.join(first));
-        expect(firstEvents.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+        expect(firstEvents.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
 
         const [retry] = yield* runAgUi(weatherAgent, [
           input("r3", [
@@ -390,7 +389,7 @@ describe("Runner one run per thread", () => {
             userMessage("u2", "again"),
           ]),
         ]);
-        expect(retry!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+        expect(retry!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
       expect(model.prompts).toHaveLength(2);
     }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.layer)));
@@ -404,7 +403,7 @@ describe("Runner one run per thread", () => {
       const [events] = yield* runAgUi(weatherAgent, [
         { threadId: "t2", runId: "r1", messages: [userMessage("u1", "hi")] },
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
-      expect(events!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      expect(events!.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
     }).pipe(Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory))),
   );
 
@@ -415,7 +414,7 @@ describe("Runner one run per thread", () => {
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer]),
       );
-      expect(types(events!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(events!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(events![1]).toMatchObject({ code: "ThreadError" });
       expect(spy.log).toEqual(["claim r1"]);
     }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.layer)));
@@ -455,7 +454,7 @@ describe("Runner.run approvals", () => {
       }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
       // The client sees both runs on one agent; its interrupt bookkeeping must accept them in sequence.
       yield* Effect.promise(() => verify([...runs.first, ...runs.second]));
-      const result = runs.second.find((e) => e.type === EventType.TOOL_CALL_RESULT && e.toolCallId === "c_email");
+      const result = runs.second.find((e) => e.type === "TOOL_CALL_RESULT" && e.toolCallId === "c_email");
       return { ...runs, prompts: model.prompts, emails: handlers.emails, result };
     });
 
@@ -465,7 +464,7 @@ describe("Runner.run approvals", () => {
         { interruptId: id, status: "resolved", payload: { approved: true } },
       ]);
       expect(first.at(-1)).toEqual({
-        type: EventType.RUN_FINISHED,
+        type: "RUN_FINISHED",
         threadId: "t1",
         runId: "r1",
         outcome: {
@@ -481,14 +480,14 @@ describe("Runner.run approvals", () => {
           ],
         },
       });
-      expect(first.filter((e) => e.type === EventType.TOOL_CALL_RESULT)).toEqual([]);
-      expect(types(first)).toContain(EventType.TOOL_CALL_START);
+      expect(first.filter((e) => e.type === "TOOL_CALL_RESULT")).toEqual([]);
+      expect(types(first)).toContain("TOOL_CALL_START");
 
       expect(emails).toEqual(["ada@example.com"]);
       expect(result).toMatchObject({ content: '{"sent":true}' });
-      const firstText = types(second).indexOf(EventType.TEXT_MESSAGE_START);
-      expect(types(second).indexOf(EventType.TOOL_CALL_RESULT)).toBeLessThan(firstText);
-      expect(types(second).slice(0, 2)).toEqual([EventType.RUN_STARTED, EventType.TOOL_CALL_RESULT]);
+      const firstText = types(second).indexOf("TEXT_MESSAGE_START");
+      expect(types(second).indexOf("TOOL_CALL_RESULT")).toBeLessThan(firstText);
+      expect(types(second).slice(0, 2)).toEqual(["RUN_STARTED", "TOOL_CALL_RESULT"]);
       expect(prompts).toHaveLength(2);
       expect(partTypes(prompts[1]!)).toEqual(["text", "tool-call", "tool-result"]);
       expect(prompts[1]!.content.at(-1)).toMatchObject({
@@ -557,7 +556,7 @@ describe("Runner.run approvals", () => {
         const [rejected] = yield* runAgUi(approvalAgent, [
           input("r2", [...clientAfterEmailTurn, userMessage("u2", "Never mind.")]),
         ]);
-        expect(types(rejected!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(types(rejected!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
         expect(rejected![1]).toMatchObject({ code: "UnansweredInterrupt" });
         expect(yield* loadThread).toEqual(before);
 
@@ -566,7 +565,7 @@ describe("Runner.run approvals", () => {
             { interruptId: outcome.interrupts[0]!.id, status: "resolved", payload: { approved: true } },
           ]),
         ]);
-        expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+        expect(answered!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
       expect(model.prompts).toHaveLength(2);
       expect(handlers.emails).toEqual(["ada@example.com"]);
@@ -580,7 +579,7 @@ describe("Runner.run approvals", () => {
         { interruptId: id, status: "cancelled" },
       ]);
       expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"cancelled"}' });
-      expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
     }),
   );
 });
@@ -605,13 +604,13 @@ describe("Runner.run frontend tools", () => {
       const [first, second] = runs;
       yield* Effect.promise(() => verify([...first!, ...second!]));
       expect(first!.at(-1)).toEqual({
-        type: EventType.RUN_FINISHED,
+        type: "RUN_FINISHED",
         threadId: "t1",
         runId: "r1",
         outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
       });
-      expect(first!.filter((e) => e.type === EventType.TOOL_CALL_RESULT)).toEqual([]);
-      expect(second!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(first!.filter((e) => e.type === "TOOL_CALL_RESULT")).toEqual([]);
+      expect(second!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(model.prompts).toHaveLength(2);
       expect(partTypes(model.prompts[1]!)).toEqual(["text", "tool-call", "tool-result"]);
       expect(model.prompts[1]!.content.at(-1)).toMatchObject({
@@ -630,12 +629,12 @@ describe("Runner.run frontend tools", () => {
         const [rejected] = yield* runAgUi(approvalAgent, [
           withTools(input("r2", [...clientAfterPickTurn, userMessage("u2", "Never mind.")])),
         ]);
-        expect(types(rejected!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(types(rejected!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
         expect(rejected![1]).toMatchObject({ code: "UnansweredToolCall" });
         expect(yield* loadThread).toEqual(before);
 
         const [answered] = yield* runAgUi(approvalAgent, [withTools(input("r3", [...clientAfterPickTurn, picked]))]);
-        expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+        expect(answered!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
       expect(model.prompts).toHaveLength(2);
     }),
@@ -720,7 +719,7 @@ describe("Runner.run frontend tools", () => {
         const { second, emails, prompts, before, after } = yield* mixed((id) =>
           withTools(input("r2", clientAfterMixedTurn, approve(id))),
         );
-        expect(types(second)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(types(second)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
         expect(second[1]).toMatchObject({ code: "UnansweredToolCall" });
         expect(emails).toEqual([]);
         expect(prompts).toHaveLength(1);
@@ -731,7 +730,7 @@ describe("Runner.run frontend tools", () => {
     it.effect("reports the unanswered interrupt first when both are left open", () =>
       Effect.gen(function* () {
         const { second } = yield* mixed(() => withTools(input("r2", clientAfterMixedTurn)));
-        expect(second[1]).toMatchObject({ type: EventType.RUN_ERROR, code: "UnansweredInterrupt" });
+        expect(second[1]).toMatchObject({ type: "RUN_ERROR", code: "UnansweredInterrupt" });
       }),
     );
   });
@@ -761,14 +760,10 @@ describe("Runner thread history", () => {
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
 
       // A step's text segments all go out under the step's one message id.
-      const starts = [
-        ...new Set(events.flatMap((e) => (e.type === EventType.TEXT_MESSAGE_START ? [e.messageId] : []))),
-      ];
+      const starts = [...new Set(events.flatMap((e) => (e.type === "TEXT_MESSAGE_START" ? [e.messageId] : [])))];
       const textOf = (messageId: string) =>
-        events.flatMap((e) =>
-          e.type === EventType.TEXT_MESSAGE_CONTENT && e.messageId === messageId ? [e.delta] : [],
-        );
-      const result = events.find((e) => e.type === EventType.TOOL_CALL_RESULT);
+        events.flatMap((e) => (e.type === "TEXT_MESSAGE_CONTENT" && e.messageId === messageId ? [e.delta] : []));
+      const result = events.find((e) => e.type === "TOOL_CALL_RESULT");
       expect(history.messages).toEqual([
         { id: "u1", role: "user", content: "Weather in Paris?" },
         {
@@ -795,7 +790,7 @@ describe("Runner thread history", () => {
         return { events: events!, history: yield* read };
       }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
       const last = events.at(-1);
-      const outcome = last?.type === EventType.RUN_FINISHED ? last.outcome : undefined;
+      const outcome = last?.type === "RUN_FINISHED" ? last.outcome : undefined;
       expect(outcome?.type).toBe("interrupt");
       expect(history.interrupts).toEqual({
         runId: "r1",
@@ -814,7 +809,7 @@ describe("Runner thread history", () => {
         const [second] = yield* runAgUi(weatherAgent, [input("r2", [...messages, userMessage("u2", "And now?")])]);
         return second!;
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
-      expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe("commit r2: u2");
       expect(model.prompts[2]!.content.map((m) => m.role)).toEqual([
         "system",
@@ -842,7 +837,7 @@ describe("Runner thread history", () => {
         ]);
         return second!;
       }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, spy.layer]));
-      expect(second.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(handlers.emails).toEqual(["ada@example.com"]);
       // Only the approval response: nothing from the read history is committed again.
       expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe("commit r2: id-2:response");
@@ -861,7 +856,7 @@ describe("Runner thread history", () => {
         ]);
         return { second: second!, before, after: yield* loadThread };
       }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
-      expect(types(second)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(second)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(second[1]).toMatchObject({ code: "HistoryDiverged" });
       expect(after).toEqual(before);
       expect(model.prompts).toHaveLength(2);
@@ -897,10 +892,10 @@ describe("Runner thread history", () => {
         },
         false,
       );
-      expect(late.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "HistoryDiverged" });
+      expect(late.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "HistoryDiverged" });
 
       const early = yield* run({ id: "sum", message: Prompt.makeMessage("system", { content: "Summary" }) }, true);
-      expect(early.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(early.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
     }),
   );
 });
@@ -923,7 +918,7 @@ describe("Runner.run prompt memo", () => {
 
       const first = yield* attempt(
         [weatherTurn[0]!, Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))],
-        (event) => event.type === EventType.TEXT_MESSAGE_CONTENT && event.messageId === "id-3",
+        (event) => event.type === "TEXT_MESSAGE_CONTENT" && event.messageId === "id-3",
       );
       spy.rewrite("t1", [
         {
@@ -963,7 +958,7 @@ describe("Runner.run run ids", () => {
       expect(model.prompts).toHaveLength(3);
       expect(model.prompts[2]!.content.map((m) => m.role)).toEqual(["system", "user"]);
       expect(JSON.stringify(model.prompts[2])).not.toContain("Paris");
-      expect(other!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(other!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       const t2 = yield* Effect.flatMap(Thread.Thread, (thread) => thread.load("t2"));
       expect(t2.map((entry) => entry.message.role)).toEqual(["user", "assistant"]);
     }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), Thread.layerMemory))),
@@ -979,7 +974,7 @@ describe("Runner.run run ids", () => {
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
 
       expect(model.prompts).toHaveLength(2);
-      expect(types(again!)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(again!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(again![1]).toMatchObject({ code: "RunInputMismatch" });
       expect((yield* loadThread).map((entry) => entry.id)).not.toContain("u2");
       expect(spy.log.filter((line) => line.startsWith("commit")).at(-1)).not.toContain("u2");
@@ -1020,8 +1015,8 @@ describe("Runner.makeDetached", () => {
       const stored = yield* subscribe();
       const events = stored.map((s) => s.event);
       yield* Effect.promise(() => verify(events));
-      expect(events[0]).toMatchObject({ type: EventType.RUN_STARTED, runId: "r1" });
-      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(events[0]).toMatchObject({ type: "RUN_STARTED", runId: "r1" });
+      expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(calls).toEqual(["Paris"]);
 
       // Reconnecting after a cursor yields every later event exactly once.
@@ -1045,7 +1040,7 @@ describe("Runner.makeDetached", () => {
       const events = (yield* subscribe()).map((s) => s.event);
       yield* Effect.promise(() => verify(events));
       expect(events.at(-1)).toMatchObject({
-        type: EventType.RUN_FINISHED,
+        type: "RUN_FINISHED",
         outcome: { type: "success", pendingToolCallIds: ["c_pick"] },
       });
 
@@ -1063,7 +1058,7 @@ describe("Runner.makeDetached", () => {
           tools: [PickFile],
         },
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
-      expect(answered!.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "success" } });
+      expect(answered!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
     }).pipe(Effect.provide(shared())),
   );
 
@@ -1082,7 +1077,7 @@ describe("Runner.makeDetached", () => {
       expect(firstThree).toHaveLength(3);
       yield* Deferred.succeed(release, undefined);
       const all = (yield* subscribe()).map((s) => s.event);
-      expect(all.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      expect(all.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
       yield* Effect.promise(() => verify(all));
     }).pipe(Effect.provide(shared())),
   );
@@ -1097,7 +1092,7 @@ describe("Runner.makeDetached", () => {
         Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never)),
       ]);
       yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
-        Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT && s.event.messageId === "id-3"),
+        Stream.takeUntil((s) => s.event.type === "TEXT_MESSAGE_CONTENT" && s.event.messageId === "id-3"),
         Stream.runDrain,
       );
       yield* Scope.close(crashed, Exit.void);
@@ -1109,18 +1104,18 @@ describe("Runner.makeDetached", () => {
       expect(first.calls.length + second.calls.length).toBe(1);
       expect(second.prompts).toHaveLength(1);
       expect(after.slice(0, 2)).toEqual([
-        { type: EventType.TEXT_MESSAGE_END, messageId: "id-3" },
-        { type: EventType.STEP_FINISHED, stepName: "step-2" },
+        { type: "TEXT_MESSAGE_END", messageId: "id-3" },
+        { type: "STEP_FINISHED", stepName: "step-2" },
       ]);
       expect(types(after.slice(2))).toEqual([
-        EventType.STEP_STARTED,
-        EventType.TEXT_MESSAGE_START,
-        EventType.TEXT_MESSAGE_CONTENT,
-        EventType.TEXT_MESSAGE_END,
-        EventType.STEP_FINISHED,
-        EventType.RUN_FINISHED,
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
-      expect(after[2]).toEqual({ type: EventType.STEP_STARTED, stepName: "step-2" });
+      expect(after[2]).toEqual({ type: "STEP_STARTED", stepName: "step-2" });
       expect(after[3]).toMatchObject({ messageId: "id-4" });
       yield* Effect.promise(() => verify([...before.map((s) => s.event), ...after]));
     }).pipe(Effect.provide(shared())),
@@ -1132,7 +1127,7 @@ describe("Runner.makeDetached", () => {
       yield* start(crashed, [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))]);
       const log = yield* EventLog.EventLog;
       yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
-        Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT),
+        Stream.takeUntil((s) => s.event.type === "TEXT_MESSAGE_CONTENT"),
         Stream.runDrain,
       );
       yield* Scope.close(crashed, Exit.void);
@@ -1141,7 +1136,7 @@ describe("Runner.makeDetached", () => {
       const busy = (model: ReturnType<typeof scriptedModel>) =>
         runAgUi(weatherAgent, [other]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
       const [rejected] = yield* busy(scriptedModel([]));
-      expect(rejected!.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "ThreadBusy" });
+      expect(rejected!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "ThreadBusy" });
 
       yield* start(yield* Scope.make(), [[...text("0", "18°C"), finish("stop")]]);
       yield* subscribe();
@@ -1259,7 +1254,7 @@ describe("Runner.workflow", () => {
         for (const threadId of ["t1", "t2"]) {
           const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe(threadId, "r1")))).map((s) => s.event);
           yield* Effect.promise(() => verify(events));
-          expect(events[0]).toMatchObject({ type: EventType.RUN_STARTED, threadId, runId: "r1" });
+          expect(events[0]).toMatchObject({ type: "RUN_STARTED", threadId, runId: "r1" });
         }
       }).pipe(
         Effect.provide(
@@ -1577,7 +1572,7 @@ describe("Runner run contexts", () => {
         ).pipe(Effect.provide([model.layer, handlers.layer, spy.layer])),
       );
       yield* Effect.promise(() => verify(events));
-      expect(types(events)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+      expect(types(events)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(events.at(-1)).toMatchObject({ code: "UserNotFound" });
       expect(model.prompts).toEqual([]);
       expect(failing.counts).toEqual({ builds: 1, finalized: 1 });
@@ -1590,7 +1585,7 @@ describe("Runner run contexts", () => {
           ),
         ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, spy.layer])),
       );
-      expect(retried.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      expect(retried.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
       // The failed run touched nothing: the store's first call is the retry's claim, and only the retry ended.
       expect(spy.log[0]).toBe("claim r1");
       expect(spy.log.filter((line) => line.startsWith("runEnded"))).toEqual(["runEnded r1: Success"]);
@@ -1617,7 +1612,7 @@ describe("Runner run contexts", () => {
       const firstEvents = yield* Stream.runCollect(
         Runner.run(userAgent, { layer: cancelled.layer })(input("r1", [userMessage("u1", "hi")])).pipe(
           asUser("u1"),
-          Stream.takeUntil((event) => event.type === EventType.TEXT_MESSAGE_CONTENT),
+          Stream.takeUntil((event) => event.type === "TEXT_MESSAGE_CONTENT"),
         ),
       ).pipe(Effect.provide([model.layer, userHandlers().layer, evalLayers, Thread.layerMemory]));
       expect(firstEvents.length).toBeGreaterThan(0);
@@ -1634,7 +1629,7 @@ describe("Runner run contexts", () => {
       yield* Stream.runDrain(
         runner(run1).pipe(
           asUser("u1"),
-          Stream.takeUntil((event) => event.type === EventType.TEXT_MESSAGE_CONTENT),
+          Stream.takeUntil((event) => event.type === "TEXT_MESSAGE_CONTENT"),
         ),
       ).pipe(
         Effect.provide([
@@ -1650,7 +1645,7 @@ describe("Runner run contexts", () => {
           Effect.provide([scriptedModel(whoIsUserTurn("c2")).layer, handlers.layer]),
         ),
       );
-      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED });
+      expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
       expect(handlers.seen).toEqual(["u1@tenant-u1", "u2@tenant-u2"]);
     }).pipe(
       Effect.provide(
@@ -1730,7 +1725,7 @@ describe("Runner run contexts", () => {
         yield* start(yield* Scope.make(), [], userLayer({ fail: true }), userHandlers());
         const events = yield* subscribe;
         yield* Effect.promise(() => verify(events));
-        expect(types(events)).toEqual([EventType.RUN_STARTED, EventType.RUN_ERROR]);
+        expect(types(events)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
         expect(events.at(-1)).toMatchObject({ code: "UserNotFound" });
       }).pipe(Effect.provide(shared())),
     );
@@ -1751,7 +1746,7 @@ describe("Runner run contexts", () => {
           handlers,
         );
         yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
-          Stream.takeUntil((s) => s.event.type === EventType.TEXT_MESSAGE_CONTENT),
+          Stream.takeUntil((s) => s.event.type === "TEXT_MESSAGE_CONTENT"),
           Stream.runDrain,
         );
         yield* Scope.close(crashed, Exit.void);
