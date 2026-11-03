@@ -7,6 +7,7 @@ import * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
+import * as History from "../src/History.ts";
 import * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
@@ -20,6 +21,8 @@ import {
   PickFile,
   runAgUi,
   scriptedModel,
+  serverHistory,
+  serverStores,
   type Step,
   text,
   toolAnswer,
@@ -74,8 +77,8 @@ const spyThread = (
 ) => {
   const dbDown = () => Effect.fail(new Thread.ThreadError({ cause: new Error("db down") }));
   const log: Array<string> = [];
-  const rewritten = new Map<string, ReadonlyArray<Thread.Entry>>();
-  const layer = Layer.effect(
+  const rewritten = new Map<string, ReadonlyArray<Messages.Entry>>();
+  const store = Layer.effect(
     Thread.Thread,
     Effect.gen(function* () {
       const inner = yield* Thread.Thread;
@@ -109,9 +112,12 @@ const spyThread = (
     }),
   ).pipe(Layer.provide(Thread.layerMemory));
   return {
-    layer,
+    /** The server history over the spied store. */
+    layer: serverHistory(store),
+    /** The spied store alone, with no history. */
+    store,
     log,
-    rewrite: (threadId: string, entries: ReadonlyArray<Thread.Entry>) => rewritten.set(threadId, entries),
+    rewrite: (threadId: string, entries: ReadonlyArray<Messages.Entry>) => rewritten.set(threadId, entries),
   };
 };
 
@@ -124,7 +130,7 @@ describe("Runner.run", () => {
       const [, second] = yield* runAgUi(weatherAgent, [
         input("r1", [userMessage("u1", "Weather in Paris?")]),
         input("r2", [...clientHistoryAfterWeatherTurn, userMessage("u2", "And now?")]),
-      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
 
       expect(second!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(model.prompts).toHaveLength(3);
@@ -170,7 +176,7 @@ describe("Runner.run", () => {
       const [, second] = yield* runAgUi(weatherAgent, [
         input("r1", [userMessage("u1", "Weather in Paris?")]),
         input("r2", [userMessage("other", "Hi")]),
-      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
       expect(model.prompts).toHaveLength(2);
       expect(types(second!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(second![1]).toMatchObject({ code: "HistoryMismatch" });
@@ -188,7 +194,7 @@ describe("Runner.run", () => {
         runEnded: () => Effect.void,
       });
       const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
-        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, failing]),
+        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverHistory(failing)]),
       );
       expect(types(events!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(events![1]).toMatchObject({ code: "ThreadError" });
@@ -205,7 +211,7 @@ describe("Runner.run", () => {
           { id: "x1", role: "activity" },
           userMessage("u1", "hi"),
         ]),
-      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
       expect(model.prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
       expect(model.prompts[0]!.content[0]).toMatchObject({ content: "Be helpful." });
     }),
@@ -404,7 +410,7 @@ describe("Runner one run per thread", () => {
         { threadId: "t2", runId: "r1", messages: [userMessage("u1", "hi")] },
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
       expect(events!.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
-    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, Thread.layerMemory))),
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores))),
   );
 
   it.effect("reports a failing claim in-band, and not to the store", () => {
@@ -451,7 +457,7 @@ describe("Runner.run approvals", () => {
           input("r2", [...clientAfterEmailTurn, ...extra], resume(outcome.interrupts[0]!.id)),
         ]);
         return { first: first!, second: second! };
-      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
+      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, serverStores]));
       // The client sees both runs on one agent; its interrupt bookkeeping must accept them in sequence.
       yield* Effect.promise(() => verify([...runs.first, ...runs.second]));
       const result = runs.second.find((e) => e.type === "TOOL_CALL_RESULT" && e.toolCallId === "c_email");
@@ -471,7 +477,7 @@ describe("Runner.run approvals", () => {
           type: "interrupt",
           interrupts: [
             {
-              id: "id-2",
+              id: Agent.approvalIdFor("c_email"),
               reason: "tool-approval",
               toolCallId: "c_email",
               message: "Approve call to send-email?",
@@ -526,7 +532,10 @@ describe("Runner.run approvals", () => {
       expect(logs).toEqual([
         {
           level: "Warn",
-          message: ["effentic: resolved answers that are not approval responses were denied", ["id-2"]],
+          message: [
+            "effentic: resolved answers that are not approval responses were denied",
+            [Agent.approvalIdFor("c_email")],
+          ],
         },
       ]);
     }),
@@ -566,7 +575,7 @@ describe("Runner.run approvals", () => {
           ]),
         ]);
         expect(answered!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
-      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
+      }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, serverStores]));
       expect(model.prompts).toHaveLength(2);
       expect(handlers.emails).toEqual(["ada@example.com"]);
     }),
@@ -600,7 +609,7 @@ describe("Runner.run frontend tools", () => {
         withTools(input("r1", [userMessage("u1", "Pick a file")])),
         // Straight after the first run, so it also shows the thread was released.
         withTools(input("r2", [...clientAfterPickTurn, picked])),
-      ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, serverStores]));
       const [first, second] = runs;
       yield* Effect.promise(() => verify([...first!, ...second!]));
       expect(first!.at(-1)).toEqual({
@@ -635,7 +644,7 @@ describe("Runner.run frontend tools", () => {
 
         const [answered] = yield* runAgUi(approvalAgent, [withTools(input("r3", [...clientAfterPickTurn, picked]))]);
         expect(answered!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
-      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, serverStores]));
       expect(model.prompts).toHaveLength(2);
     }),
   );
@@ -674,7 +683,7 @@ describe("Runner.run frontend tools", () => {
           const before = yield* loadThread;
           const [second] = yield* runAgUi(approvalAgent, [next(outcome.interrupts[0]!.id)]);
           return { first: first!, second: second!, before, after: yield* loadThread };
-        }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, Thread.layerMemory]));
+        }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, serverStores]));
         return { ...runs, prompts: model.prompts, ...handlers };
       });
     const approve = (interruptId: string): AgUi.RunAgentInput["resume"] => [
@@ -737,7 +746,7 @@ describe("Runner.run frontend tools", () => {
 });
 
 describe("Runner thread history", () => {
-  const read = Effect.map(loadThread, Messages.history);
+  const read = Effect.map(loadThread, Messages.restore);
   const emailStep: Step = [
     ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
     finish("tool-calls"),
@@ -757,7 +766,7 @@ describe("Runner thread history", () => {
       const { events, history } = yield* Effect.gen(function* () {
         const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
         return { events: events!, history: yield* read };
-      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]));
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
 
       // A step's text segments all go out under the step's one message id.
       const starts = [...new Set(events.flatMap((e) => (e.type === "TEXT_MESSAGE_START" ? [e.messageId] : [])))];
@@ -788,7 +797,7 @@ describe("Runner thread history", () => {
       const { events, history } = yield* Effect.gen(function* () {
         const [events] = yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Email Ada")])]);
         return { events: events!, history: yield* read };
-      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, Thread.layerMemory]));
+      }).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, serverStores]));
       const last = events.at(-1);
       const outcome = last?.type === "RUN_FINISHED" ? last.outcome : undefined;
       expect(outcome?.type).toBe("interrupt");
@@ -840,7 +849,9 @@ describe("Runner thread history", () => {
       expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       expect(handlers.emails).toEqual(["ada@example.com"]);
       // Only the approval response: nothing from the read history is committed again.
-      expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe("commit r2: id-2:response");
+      expect(spy.log.filter((line) => line.startsWith("commit r2"))[0]).toBe(
+        `commit r2: ${Agent.approvalIdFor("c_email")}:response`,
+      );
     }),
   );
 
@@ -870,7 +881,7 @@ describe("Runner thread history", () => {
 
   it.effect("rejects a store that compacts into an unseen assistant entry after the client's latest", () =>
     Effect.gen(function* () {
-      const run = (summary: Thread.Entry, first: boolean) => {
+      const run = (summary: Messages.Entry, first: boolean) => {
         const spy = spyThread();
         const model = scriptedModel([...weatherTurn, [...text("0", "OK"), finish("stop")]]);
         return Effect.gen(function* () {
@@ -961,7 +972,7 @@ describe("Runner.run run ids", () => {
       expect(other!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
       const t2 = yield* Effect.flatMap(Thread.Thread, (thread) => thread.load("t2"));
       expect(t2.map((entry) => entry.message.role)).toEqual(["user", "assistant"]);
-    }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), Thread.layerMemory))),
+    }).pipe(Effect.provide(Layer.mergeAll(ledger, counterIds(), serverStores))),
   );
 
   it.effect("rejects a run id reused on the same thread with a different input, before committing", () => {
@@ -989,7 +1000,7 @@ describe("Runner.run run ids", () => {
 
 describe("Runner.makeDetached", () => {
   const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
-  const shared = () => Layer.mergeAll(ledger, counterIds(), Thread.layerMemory, EventLog.layerMemory);
+  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, EventLog.layerMemory);
   const run1 = input("r1", [userMessage("u1", "Weather in Paris?")]);
 
   /** Starts `run1` detached in `scope`, against a model scripted with `steps`. */
@@ -1166,12 +1177,7 @@ describe("Runner.workflow", () => {
     Effect.gen(function* () {
       // The reference: the same script through the request-scoped runner.
       const reference = yield* runAgUi(weatherAgent, [run1]).pipe(
-        Effect.provide([
-          scriptedModel(weatherTurn).layer,
-          countingWeatherLayer().layer,
-          evalLayers,
-          Thread.layerMemory,
-        ]),
+        Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, serverStores]),
       );
 
       const model = scriptedModel(weatherTurn);
@@ -1193,7 +1199,7 @@ describe("Runner.workflow", () => {
                 model.layer,
                 weather.layer,
                 counterIds(),
-                Thread.layerMemory,
+                serverStores,
                 EventLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
@@ -1228,7 +1234,7 @@ describe("Runner.workflow", () => {
                 model.layer,
                 countingWeatherLayer().layer,
                 counterIds(),
-                Thread.layerMemory,
+                serverStores,
                 EventLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
@@ -1264,7 +1270,7 @@ describe("Runner.workflow", () => {
                 scriptedModel([...weatherTurn, ...weatherTurn]).layer,
                 weather.layer,
                 counterIds(),
-                Thread.layerMemory,
+                serverStores,
                 EventLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
@@ -1329,7 +1335,7 @@ describe("Runner run info", () => {
     Effect.gen(function* () {
       const { agent, handlers, bySystem } = recordingAgent();
       yield* runOnce(agent, { ...input("r1", [userMessage("u1", "hi")]), forwardedProps: { locale: "fr" } }).pipe(
-        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]),
+        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, serverStores]),
       );
       expect(bySystem).toEqual([{ runId: "r1", threadId: "t1", props: { locale: "fr" } }]);
     }),
@@ -1339,7 +1345,7 @@ describe("Runner run info", () => {
     Effect.gen(function* () {
       const { agent, handlers, bySystem } = recordingAgent();
       yield* runOnce(agent, input("r1", [userMessage("u1", "hi")])).pipe(
-        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, Thread.layerMemory]),
+        Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, serverStores]),
       );
       expect(bySystem).toHaveLength(1);
       expect(bySystem[0]!.props).toBeUndefined();
@@ -1351,9 +1357,7 @@ describe("Runner run info", () => {
       yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Weather in Paris?")])]);
       const stored = yield* loadThread;
       expect(stored.map((entry) => entry.message.role)).toEqual(["user", "assistant", "tool", "assistant"]);
-    }).pipe(
-      Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, Thread.layerMemory]),
-    ),
+    }).pipe(Effect.provide([scriptedModel(weatherTurn).layer, countingWeatherLayer().layer, evalLayers, serverStores])),
   );
 });
 
@@ -1439,7 +1443,9 @@ describe("Runner run contexts", () => {
     const runner = Runner.run(userAgent, { layer: userLayer().layer });
     const unprovided = runner(run1);
     expectTypeOf<StreamRequires<typeof unprovided, AuthContext>>().toEqualTypeOf<true>();
-    expectTypeOf<StreamRequires<typeof unprovided, Thread.Thread>>().toEqualTypeOf<true>();
+    // The history is optional: the stream requires neither it nor a thread store.
+    expectTypeOf<StreamRequires<typeof unprovided, Thread.Thread>>().toEqualTypeOf<false>();
+    expectTypeOf<StreamRequires<typeof unprovided, History.History>>().toEqualTypeOf<false>();
     const provided = unprovided.pipe(asUser("u1"));
     expectTypeOf<StreamRequires<typeof provided, AuthContext>>().toEqualTypeOf<false>();
     expectTypeOf<StreamRequires<typeof provided, CurrentUser>>().toEqualTypeOf<false>();
@@ -1503,7 +1509,7 @@ describe("Runner run contexts", () => {
         scriptedModel([...whoIsUserTurn(), ...whoIsUserTurn()]).layer,
         handlers.layer,
         evalLayers,
-        Thread.layerMemory,
+        serverStores,
       ]),
     );
   });
@@ -1522,7 +1528,7 @@ describe("Runner run contexts", () => {
       yield* Effect.promise(() => verify(events));
       expect(handlers.seen).toEqual(["u1@tenant-u1"]);
       expect(counts).toEqual({ builds: 1, finalized: 1 });
-    }).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory]));
+    }).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, serverStores]));
   });
 
   it.effect("forwards a run context the caller already holds, closing over the rest", () => {
@@ -1540,7 +1546,7 @@ describe("Runner run contexts", () => {
       const events = Array.from(yield* Stream.runCollect(stream));
       yield* Effect.promise(() => verify(events));
       expect(handlers.seen).toEqual(["u1@tenant-u1"]);
-    }).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory]));
+    }).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, serverStores]));
   });
 
   it.effect("takes the context only from the caller, never from the client", () =>
@@ -1553,7 +1559,7 @@ describe("Runner run contexts", () => {
             ...input("r1", [userMessage("u1", "hi")]),
             forwardedProps,
           }).pipe(asUser("u1")),
-        ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, Thread.layerMemory])),
+        ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, evalLayers, serverStores])),
       );
       yield* Effect.promise(() => verify(events));
       expect(handlers.seen).toEqual(["u1@tenant-u1"]);
@@ -1602,9 +1608,7 @@ describe("Runner run contexts", () => {
       const finished = userLayer();
       yield* Stream.runDrain(
         Runner.run(userAgent, { layer: finished.layer })(input("r1", [userMessage("u1", "hi")])).pipe(asUser("u1")),
-      ).pipe(
-        Effect.provide([scriptedModel(whoIsUserTurn()).layer, userHandlers().layer, evalLayers, Thread.layerMemory]),
-      );
+      ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, userHandlers().layer, evalLayers, serverStores]));
       expect(finished.counts).toEqual({ builds: 1, finalized: 1 });
 
       const cancelled = userLayer();
@@ -1614,7 +1618,7 @@ describe("Runner run contexts", () => {
           asUser("u1"),
           Stream.takeUntil((event) => event.type === "TEXT_MESSAGE_CONTENT"),
         ),
-      ).pipe(Effect.provide([model.layer, userHandlers().layer, evalLayers, Thread.layerMemory]));
+      ).pipe(Effect.provide([model.layer, userHandlers().layer, evalLayers, serverStores]));
       expect(firstEvents.length).toBeGreaterThan(0);
       expect(cancelled.counts).toEqual({ builds: 1, finalized: 1 });
     }),
@@ -1652,7 +1656,7 @@ describe("Runner run contexts", () => {
         Layer.mergeAll(
           Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
           counterIds(),
-          Thread.layerMemory,
+          serverStores,
         ),
       ),
     ),
@@ -1664,7 +1668,7 @@ describe("Runner run contexts", () => {
       Layer.mergeAll(
         Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
         counterIds(),
-        Thread.layerMemory,
+        serverStores,
         EventLog.layerMemory,
       );
     const subscribe = Effect.flatMap(EventLog.EventLog, (log) =>
@@ -1772,7 +1776,7 @@ describe("Runner run contexts", () => {
         scriptedModel(steps).layer,
         handlers.layer,
         counterIds(),
-        Thread.layerMemory,
+        serverStores,
         EventLog.layerMemory,
         WorkflowEngine.layerMemory,
       );
@@ -1849,4 +1853,373 @@ describe("Runner run contexts", () => {
       }),
     );
   });
+});
+
+// -----------------------------------------------------------------------------
+// Client history
+// -----------------------------------------------------------------------------
+
+describe("Runner client history", () => {
+  const captureLogs = () => {
+    const logs: Array<{ level: string; message: unknown }> = [];
+    const layer = Logger.layer([
+      Logger.make(({ logLevel, message }) => {
+        logs.push({ level: logLevel, message });
+      }),
+    ]);
+    return { logs, layer };
+  };
+  const textTurn = (reply: string): Step => [...text("0", reply), finish("stop")];
+  const roles = (prompt: Prompt.Prompt) => prompt.content.map((message) => message.role);
+
+  it.effect("runs with no history and no thread store provided", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([textTurn("Hi.")]);
+      const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
+        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
+      );
+      expect(events!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+    }),
+  );
+
+  it.effect("sends the client's history to the model as sent, assistant turns included", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([textTurn("Tomorrow too.")]);
+      yield* runAgUi(weatherAgent, [
+        input("r1", [
+          ...clientHistoryAfterWeatherTurn,
+          { id: "x1", role: "activity", content: "typing" },
+          userMessage("u2", "And tomorrow?"),
+        ]),
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
+      expect(roles(model.prompts[0]!)).toEqual(["system", "user", "assistant", "tool", "assistant", "user"]);
+      expect(partTypes(model.prompts[0]!)).toEqual(["text", "text", "tool-call", "tool-result", "text", "text"]);
+      expect(model.prompts[0]!.content[3]).toMatchObject({
+        content: [{ type: "tool-result", id: "toolu_1", result: { temperature: 18 } }],
+      });
+    }),
+  );
+
+  it.effect("accepts an edited earlier turn and a regenerated last turn", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([textTurn("Sunny."), textTurn("Rainy."), textTurn("Rainy again.")]);
+      const runs = yield* runAgUi(weatherAgent, [
+        input("r1", [userMessage("u1", "Weather in Paris?")]),
+        // The first turn edited.
+        input("r2", [userMessage("u1-edit", "Weather in Rome?")]),
+        // The last answer regenerated: the client drops it and sends the history before it.
+        input("r3", [userMessage("u1-edit", "Weather in Rome?")]),
+      ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
+      for (const events of runs) {
+        expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+      }
+      expect(model.prompts[1]!.content.at(-1)).toMatchObject({ content: [{ text: "Weather in Rome?" }] });
+      expect(roles(model.prompts[2]!)).toEqual(["system", "user"]);
+    }),
+  );
+
+  describe("approvals", () => {
+    const emailStep: Step = [
+      ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
+      finish("tool-calls"),
+    ];
+    const emailTurn: AgUi.Message = {
+      id: "id-1",
+      role: "assistant",
+      toolCalls: [
+        { id: "c_email", function: { name: "send-email", arguments: '{"to":"ada@example.com","body":"Hi"}' } },
+      ],
+    };
+    const interruptId = Agent.approvalIdFor("c_email");
+
+    /** Interrupts r1 for approval, then runs r2 with the client's history after it and `resume`. */
+    const roundTrip = (
+      resume: AgUi.RunAgentInput["resume"],
+      extra: ReadonlyArray<AgUi.Message> = [userMessage("u2", "Go on.")],
+    ) =>
+      Effect.gen(function* () {
+        const model = scriptedModel([emailStep, textTurn("Done.")]);
+        const handlers = countingApprovalLayer();
+        const [first, second] = yield* runAgUi(approvalAgent, [
+          input("r1", [userMessage("u1", "Email Ada")]),
+          input("r2", [userMessage("u1", "Email Ada"), emailTurn, ...extra], resume),
+        ]).pipe(Effect.provide([model.layer, handlers.layer, evalLayers]));
+        yield* Effect.promise(() => verify([...first!, ...second!]));
+        const result = second!.find((e) => e.type === "TOOL_CALL_RESULT" && e.toolCallId === "c_email");
+        return { first: first!, second: second!, prompts: model.prompts, emails: handlers.emails, result };
+      });
+
+    it.effect("runs an approved call once, before any text", () =>
+      Effect.gen(function* () {
+        const { first, second, emails, result, prompts } = yield* roundTrip(
+          [{ interruptId, status: "resolved", payload: { approved: true } }],
+          [],
+        );
+        expect(first.at(-1)).toMatchObject({ outcome: { type: "interrupt", interrupts: [{ id: interruptId }] } });
+        expect(emails).toEqual(["ada@example.com"]);
+        expect(result).toMatchObject({ content: '{"sent":true}' });
+        expect(types(second).slice(0, 2)).toEqual(["RUN_STARTED", "TOOL_CALL_RESULT"]);
+        expect(prompts[1]!.content.at(-1)).toMatchObject({
+          content: [{ type: "tool-result", id: "c_email", result: { sent: true } }],
+        });
+      }),
+    );
+
+    it.effect("denies a cancelled call", () =>
+      Effect.gen(function* () {
+        const { emails, result } = yield* roundTrip([{ interruptId, status: "cancelled" }]);
+        expect(emails).toEqual([]);
+        expect(result).toMatchObject({ content: '{"type":"execution-denied","reason":"cancelled"}' });
+      }),
+    );
+
+    it.effect("sends an unanswered call to the model as failed, without running it", () =>
+      Effect.gen(function* () {
+        const { second, emails, prompts } = yield* roundTrip(undefined);
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(emails).toEqual([]);
+        expect(prompts[1]!.content[2]).toMatchObject({
+          content: [
+            { type: "tool-result", id: "c_email", result: Messages.INCOMPLETE_TOOL_CALL_RESULT, isFailure: true },
+          ],
+        });
+      }),
+    );
+
+    it.effect("ignores an answer to an unknown interrupt", () =>
+      Effect.gen(function* () {
+        const { second, emails } = yield* roundTrip([
+          { interruptId: Agent.approvalIdFor("c_other"), status: "resolved", payload: { approved: true } },
+        ]);
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(emails).toEqual([]);
+      }),
+    );
+
+    it.effect("doesn't run a call the history already answered", () =>
+      Effect.gen(function* () {
+        const { emails, result } = yield* roundTrip(
+          [{ interruptId, status: "resolved", payload: { approved: true } }],
+          [{ id: "t1", role: "tool", toolCallId: "c_email", content: '{"sent":true}' }],
+        );
+        expect(emails).toEqual([]);
+        expect(result).toBeUndefined();
+      }),
+    );
+  });
+
+  describe("frontend calls and repairs", () => {
+    const withTools = (runInput: AgUi.RunAgentInput): AgUi.RunAgentInput => ({ ...runInput, tools: [PickFile] });
+    const pickStep: Step = [...toolCall("c_pick", "pick-file", {}), finish("tool-calls")];
+    const pickTurn: ReadonlyArray<AgUi.Message> = [
+      userMessage("u1", "Pick a file"),
+      {
+        id: "id-1",
+        role: "assistant",
+        toolCalls: [{ id: "c_pick", function: { name: "pick-file", arguments: "{}" } }],
+      },
+    ];
+
+    const answerPick = (answer: ReadonlyArray<AgUi.Message>) =>
+      Effect.gen(function* () {
+        const model = scriptedModel([pickStep, textTurn("OK.")]);
+        const [first, second] = yield* runAgUi(approvalAgent, [
+          withTools(input("r1", [userMessage("u1", "Pick a file")])),
+          withTools(input("r2", [...pickTurn, ...answer])),
+        ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]));
+        expect(first!.at(-1)).toMatchObject({ outcome: { type: "success", pendingToolCallIds: ["c_pick"] } });
+        expect(second!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        return model.prompts[1]!;
+      });
+
+    it.effect("takes the client's result for a frontend call", () =>
+      Effect.gen(function* () {
+        const prompt = yield* answerPick([toolAnswer("c_pick", { name: "a.txt" })]);
+        expect(prompt.content.at(-1)).toMatchObject({
+          content: [{ type: "tool-result", id: "c_pick", result: { name: "a.txt" }, isFailure: false }],
+        });
+      }),
+    );
+
+    it.effect("takes an error result as failed", () =>
+      Effect.gen(function* () {
+        const prompt = yield* answerPick([toolAnswer("c_pick", "", { error: "User declined" })]);
+        expect(prompt.content.at(-1)).toMatchObject({
+          content: [{ type: "tool-result", id: "c_pick", result: "User declined", isFailure: true }],
+        });
+      }),
+    );
+
+    it.effect("sends an unanswered frontend call to the model as failed", () =>
+      Effect.gen(function* () {
+        const prompt = yield* answerPick([userMessage("u2", "Never mind.")]);
+        expect(prompt.content[2]).toMatchObject({
+          content: [{ type: "tool-result", id: "c_pick", result: Messages.INCOMPLETE_TOOL_CALL_RESULT }],
+        });
+      }),
+    );
+
+    it.effect("drops a call with partial arguments and an orphan result, logs them, and runs", () =>
+      Effect.gen(function* () {
+        const capture = captureLogs();
+        const model = scriptedModel([textTurn("Hi.")]);
+        const [events] = yield* runAgUi(weatherAgent, [
+          input("r1", [
+            userMessage("u1", "Weather?"),
+            {
+              id: "m1",
+              role: "assistant",
+              toolCalls: [{ id: "c_cut", function: { name: "get-weather", arguments: '{"locat' } }],
+            },
+            { id: "t_orphan", role: "tool", toolCallId: "c_gone", content: "{}" },
+            userMessage("u2", "Hello?"),
+          ]),
+        ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, capture.layer]));
+        expect(events!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(roles(model.prompts[0]!)).toEqual(["system", "user", "user"]);
+        expect(capture.logs).toEqual([
+          {
+            level: "Warn",
+            message: [
+              "effentic: tool calls whose arguments are not a JSON object were dropped from the client's history",
+              ["c_cut"],
+            ],
+          },
+          {
+            level: "Warn",
+            message: ["effentic: tool messages with no call in the client's history were dropped", ["t_orphan"]],
+          },
+        ]);
+      }),
+    );
+  });
+
+  it.effect("doesn't touch a thread store in its context", () => {
+    const spy = spyThread();
+    return Effect.gen(function* () {
+      const model = scriptedModel([textTurn("Hi.")]);
+      yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
+        Effect.provide([model.layer, countingWeatherLayer().layer]),
+      );
+      expect(spy.log).toEqual([]);
+      expect(yield* loadThread).toEqual([]);
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.store)));
+  });
+
+  it.effect("runs two runs on one thread at once", () =>
+    Effect.gen(function* () {
+      const streaming = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const model = scriptedModel([
+        Stream.fromIterable(text("0", "Hel", "lo")).pipe(
+          Stream.concat(Stream.fromEffectDrain(Deferred.await(release))),
+          Stream.concat(Stream.make(finish("stop"))),
+        ),
+        textTurn("Hi again."),
+      ]);
+      yield* Effect.gen(function* () {
+        const first = yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
+          Stream.tap((event) =>
+            event.type === "TEXT_MESSAGE_CONTENT" ? Deferred.succeed(streaming, undefined) : Effect.void,
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(streaming);
+        const [second] = yield* runAgUi(weatherAgent, [input("r2", [userMessage("u2", "again")])]);
+        expect(second!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        yield* Deferred.succeed(release, undefined);
+        const firstEvents = Array.from(yield* Fiber.join(first));
+        yield* Effect.promise(() => verify(firstEvents));
+        expect(firstEvents.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+      }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
+    }),
+  );
+
+  describe("choosing the history per request", () => {
+    it.effect("serves one run with the server history and one without from one runner", () => {
+      const spy = spyThread();
+      return Effect.gen(function* () {
+        const model = scriptedModel([textTurn("Stored."), textTurn("Not stored.")]);
+        const runner = Runner.run(weatherAgent);
+        yield* Effect.gen(function* () {
+          const server = Array.from(
+            yield* Stream.runCollect(
+              runner(input("r1", [userMessage("u1", "hi")])).pipe(Stream.provide(History.layerServer)),
+            ),
+          );
+          const client = Array.from(yield* Stream.runCollect(runner(input("r2", [userMessage("u9", "hello")]))));
+          yield* Effect.promise(() => verify(server));
+          yield* Effect.promise(() => verify(client));
+        }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer]));
+        expect(spy.log.filter((line) => line.includes("r2"))).toEqual([]);
+        expect(spy.log.filter((line) => line.includes("r1"))).not.toEqual([]);
+        expect((yield* loadThread).map((entry) => entry.id)).toEqual(["u1", "id-1"]);
+      }).pipe(Effect.provide(Layer.mergeAll(evalLayers, spy.store)));
+    });
+
+    it.effect("uses the client history provided inside a server history", () =>
+      Effect.gen(function* () {
+        const model = scriptedModel([textTurn("Hi.")]);
+        yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "hi")])]).pipe(
+          Effect.provide([model.layer, countingWeatherLayer().layer, History.layerClient]),
+        );
+        expect(yield* loadThread).toEqual([]);
+      }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores))),
+    );
+
+    it.effect("lets a history provided around a detached start win over the captured one", () =>
+      Effect.gen(function* () {
+        const scope = yield* Scope.make();
+        const model = scriptedModel([textTurn("Hi.")]);
+        const runner = yield* Runner.makeDetached(weatherAgent).pipe(
+          Effect.provide([model.layer, countingWeatherLayer().layer]),
+          Effect.provideService(Scope.Scope, scope),
+        );
+        yield* runner.start(input("r1", [userMessage("u1", "hi")])).pipe(Effect.provide(History.layerClient));
+        const log = yield* EventLog.EventLog;
+        const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
+        yield* Effect.promise(() => verify(events));
+        expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(yield* loadThread).toEqual([]);
+      }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores, EventLog.layerMemory))),
+    );
+  });
+
+  it.effect("gives a workflow the server history provided to its layer", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([textTurn("Hi."), textTurn("Hi again.")]);
+      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
+      yield* Effect.gen(function* () {
+        const log = yield* EventLog.EventLog;
+        yield* workflow.execute({ input: input("r1", [userMessage("u1", "hi")]) });
+        // The client sends only its new message: the second run takes the rest from the store.
+        yield* workflow.execute({
+          input: input("r2", [{ id: "id-1", role: "assistant", content: "Hi." }, userMessage("u2", "again")]),
+        });
+        for (const runId of ["r1", "r2"]) {
+          const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", runId)))).map((s) => s.event);
+          yield* Effect.promise(() => verify(events));
+          expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        }
+        expect((yield* loadThread).map((entry) => entry.id)).toEqual(["u1", "id-1", "u2", "id-2"]);
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                model.layer,
+                countingWeatherLayer().layer,
+                counterIds(),
+                serverStores,
+                EventLog.layerMemory,
+                WorkflowEngine.layerMemory,
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(roles(model.prompts[1]!)).toEqual(["system", "user", "assistant", "user"]);
+    }),
+  );
 });

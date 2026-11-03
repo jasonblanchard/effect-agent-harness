@@ -71,8 +71,8 @@ async function chatLoop() {
       content: input.trim(),
     });
 
-    // Interrupts can still be open if answering them failed. A run must answer
-    // every open interrupt, so typing something new gives up on them.
+    // Interrupts can still be open if answering them failed. AG-UI has a run
+    // answer every open interrupt, so typing something new gives up on them.
     const cancelled = agent.pendingInterrupts.map((interrupt) => ({
       interruptId: interrupt.id,
       status: "cancelled" as const,

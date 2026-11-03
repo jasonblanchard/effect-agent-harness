@@ -2,7 +2,7 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Thread } from "effentic";
+import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse } from "effentic";
 import { AuthContext, authenticate } from "./auth.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
 import { GetWeather, getWeather } from "./tools/weather.tool.ts";
@@ -37,9 +37,10 @@ const ModelLayer = AnthropicLanguageModel.layer({
 
 const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-email": sendEmail });
 
-// In-memory stores: each thread is kept for the life of the process.
-// Swap these for durable implementations in production.
-const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
+// No thread store: the client owns the transcript and sends it whole with
+// every run (the default client history), so nothing is kept between runs but
+// the event log. Swap these for durable implementations in production.
+const StoresLayer = Layer.mergeAll(Checkpoint.layerNone, EventLog.layerMemory);
 
 const invalidInput = (error: { readonly message: string }) =>
   Effect.succeed(HttpServerResponse.text(`Invalid RunAgentInput: ${error.message}`, { status: 400 }));

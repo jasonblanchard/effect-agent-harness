@@ -9,6 +9,8 @@ import * as AgUiSchema from "../src/AgUiSchema.ts";
 import * as Runner from "../src/Runner.ts";
 import { from, lastValueFrom, toArray } from "rxjs";
 import * as Checkpoint from "../src/Checkpoint.ts";
+import * as History from "../src/History.ts";
+import * as Thread from "../src/Thread.ts";
 
 // -----------------------------------------------------------------------------
 // Scripted language model
@@ -173,6 +175,16 @@ export const toolAnswer = (
 /** What an eval or unit test provides besides the model and tool handlers: no durability, deterministic ids. */
 export const evalLayers = Layer.mergeAll(Checkpoint.layerNone, counterIds());
 
+/**
+ * The server history over an in-memory thread store. `Thread` stays in the
+ * output, so a test can read the store its runs wrote.
+ */
+export const serverStores = History.layerServer.pipe(Layer.provideMerge(Thread.layerMemory));
+
+/** The server history over `thread`, keeping `thread`'s `Thread` in the output. */
+export const serverHistory = <E, R>(thread: Layer.Layer<Thread.Thread, E, R>) =>
+  History.layerServer.pipe(Layer.provideMerge(thread));
+
 // -----------------------------------------------------------------------------
 // AG-UI client verification
 // -----------------------------------------------------------------------------
@@ -194,8 +206,9 @@ export const verify = async (events: ReadonlyArray<AgUi.Event>): Promise<Array<B
 
 /**
  * Runs each input through `Runner.run`, one after another, and returns each
- * run's AG-UI events, already verified. Provide one `Thread` layer
- * around it so the runs share a thread store.
+ * run's AG-UI events, already verified. The runs use the client history,
+ * unless a history is provided around it: provide one `serverStores` so the
+ * runs share a thread store.
  */
 export const runAgUi = <Tools extends Record<string, Tool.Any>, R>(
   agent: Agent.Agent<Tools, R>,

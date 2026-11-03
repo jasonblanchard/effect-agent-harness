@@ -1,16 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Result } from "effect";
+import { Effect, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
+import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
 import * as Messages from "../src/Messages.ts";
-import type * as Thread from "../src/Thread.ts";
 
-const user = (id: string, text: string): Thread.Entry => ({
+const user = (id: string, text: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }),
 });
 
-const assistantCall = (id: string, callId: string, approvalId?: string): Thread.Entry => ({
+const assistantCall = (id: string, callId: string, approvalId?: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("assistant", {
     content: [
@@ -25,7 +25,7 @@ const assistantCall = (id: string, callId: string, approvalId?: string): Thread.
   }),
 });
 
-const toolResult = (id: string, callId: string, result: unknown): Thread.Entry => ({
+const toolResult = (id: string, callId: string, result: unknown): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("tool", {
     content: [
@@ -40,22 +40,22 @@ const toolResult = (id: string, callId: string, result: unknown): Thread.Entry =
   }),
 });
 
-const assistantText = (id: string, text: string): Thread.Entry => ({
+const assistantText = (id: string, text: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("assistant", { content: [Prompt.makePart("text", { text })] }),
 });
 
-const assistantEmpty = (id: string): Thread.Entry => ({
+const assistantEmpty = (id: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("assistant", { content: [] }),
 });
 
-const system = (id: string, content: string): Thread.Entry => ({
+const system = (id: string, content: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("system", { content }),
 });
 
-const approvalResponse = (approvalId: string): Thread.Entry => ({
+const approvalResponse = (approvalId: string): Messages.Entry => ({
   id: `${approvalId}:response`,
   message: Prompt.makeMessage("tool", {
     content: [Prompt.toolApprovalResponsePart({ approvalId, approved: true })],
@@ -63,7 +63,7 @@ const approvalResponse = (approvalId: string): Thread.Entry => ({
 });
 
 /** An assistant entry holding frontend calls, marked as `Agent.run` marks them. */
-const frontendCalls = (id: string, ...callIds: Array<string>): Thread.Entry => ({
+const frontendCalls = (id: string, ...callIds: Array<string>): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("assistant", {
     content: callIds.map((callId) =>
@@ -110,6 +110,39 @@ const simplify = (prompt: Prompt.Prompt) =>
 
 const clientMessage = (id: string, role: string, content?: string): AgUi.Message =>
   content === undefined ? { id, role } : { id, role, content };
+
+describe("Messages.Entry", () => {
+  it.effect("round-trips an assistant message with a tool call", () =>
+    Effect.gen(function* () {
+      const entry: Messages.Entry = {
+        id: "m1",
+        message: Prompt.makeMessage("assistant", {
+          content: [
+            Prompt.makePart("text", { text: "Let me check." }),
+            Prompt.makePart("tool-call", {
+              id: "c1",
+              name: "get-weather",
+              params: { location: "Paris" },
+              providerExecuted: false,
+            }),
+          ],
+        }),
+      };
+      const encoded = yield* Schema.encodeEffect(Messages.Entry)(entry);
+      const decoded = yield* Schema.decodeUnknownEffect(Messages.Entry)(JSON.parse(JSON.stringify(encoded)));
+      expect(decoded).toEqual(entry);
+    }),
+  );
+
+  it.effect("round-trips the run id", () =>
+    Effect.gen(function* () {
+      const entry: Messages.Entry = { ...user("m1", "Hi"), runId: "r1" };
+      const encoded = yield* Schema.encodeEffect(Messages.Entry)(entry);
+      const decoded = yield* Schema.decodeUnknownEffect(Messages.Entry)(JSON.parse(JSON.stringify(encoded)));
+      expect(decoded).toEqual(entry);
+    }),
+  );
+});
 
 describe("Messages.delta", () => {
   it("is the whole client list when the store is empty", () => {
@@ -190,7 +223,7 @@ describe("Messages.delta", () => {
     expect(Messages.delta(stored, client)).toEqual(Result.succeed([u3]));
   });
 
-  const diverged = (stored: ReadonlyArray<Thread.Entry>, client: ReadonlyArray<AgUi.Message>) => {
+  const diverged = (stored: ReadonlyArray<Messages.Entry>, client: ReadonlyArray<AgUi.Message>) => {
     const result = Messages.delta(stored, client);
     return Result.isFailure(result) && result.failure._tag === "HistoryDiverged";
   };
@@ -239,7 +272,7 @@ describe("Messages.delta", () => {
   });
 });
 
-describe("Messages.history", () => {
+describe("Messages.restore", () => {
   it("shows user, assistant and tool messages with their stored ids", () => {
     const entries = [
       user("u1", "Weather?"),
@@ -262,7 +295,7 @@ describe("Messages.history", () => {
       toolResult("t1", "c1", { temp: 21 }),
       assistantText("a2", "21°"),
     ];
-    expect(Messages.history(entries)).toEqual({
+    expect(Messages.restore(entries)).toEqual({
       messages: [
         { id: "u1", role: "user", content: "Weather?" },
         {
@@ -287,12 +320,12 @@ describe("Messages.history", () => {
       approvalResponse("ap1"),
       toolResult("t1", "c1", 1),
     ];
-    expect(Messages.history(entries).messages.map((message) => message.id)).toEqual(["m1", "t1", "u2"]);
+    expect(Messages.restore(entries).messages.map((message) => message.id)).toEqual(["m1", "t1", "u2"]);
   });
 
   it("keeps a result whose call is not loaded, and its read is accepted back", () => {
     const entries = [system("s1", "Summary"), toolResult("t1", "c1", 1), assistantText("a2", "Done.")];
-    const { messages } = Messages.history(entries);
+    const { messages } = Messages.restore(entries);
     expect(messages.map((message) => message.id)).toEqual(["t1", "a2"]);
     expect(Messages.delta(entries, [...messages, clientMessage("u3", "user", "Thanks")])).toEqual(
       Result.succeed([clientMessage("u3", "user", "Thanks")]),
@@ -307,11 +340,11 @@ describe("Messages.history", () => {
       approvalResponse("ap1"),
       assistantEmpty("a2"),
     ];
-    expect(Messages.history(entries).messages.map((message) => message.id)).toEqual(["u1", "m1"]);
+    expect(Messages.restore(entries).messages.map((message) => message.id)).toEqual(["u1", "m1"]);
   });
 
   it("is empty for an unknown thread", () => {
-    expect(Messages.history([])).toEqual({ messages: [], interrupts: undefined });
+    expect(Messages.restore([])).toEqual({ messages: [], interrupts: undefined });
   });
 
   it("returns open approval requests with the run that raised them", () => {
@@ -319,14 +352,14 @@ describe("Messages.history", () => {
       { ...user("u1", "Email Ada"), runId: "r1" },
       { ...assistantCall("m1", "c1", "ap1"), runId: "r1" },
     ];
-    expect(Messages.history(entries).interrupts).toEqual({
+    expect(Messages.restore(entries).interrupts).toEqual({
       runId: "r1",
       pending: [AgUi.approvalInterrupt({ approvalId: "ap1", toolCallId: "c1", toolName: "get-weather" })],
     });
     // Without a recorded run.
-    expect(Messages.history([assistantCall("m1", "c1", "ap1")]).interrupts?.runId).toBeUndefined();
+    expect(Messages.restore([assistantCall("m1", "c1", "ap1")]).interrupts?.runId).toBeUndefined();
     // Answered.
-    expect(Messages.history([assistantCall("m1", "c1", "ap1"), approvalResponse("ap1")]).interrupts).toBeUndefined();
+    expect(Messages.restore([assistantCall("m1", "c1", "ap1"), approvalResponse("ap1")]).interrupts).toBeUndefined();
   });
 });
 
@@ -371,10 +404,10 @@ describe("Messages.resume", () => {
   const stored = [user("u1", "Email Ada"), assistantCall("m1", "c1", "a1")];
 
   /** The responses for an input that answers every pending request. */
-  const answer = (entries: ReadonlyArray<Thread.Entry>, resume: ReadonlyArray<AgUi.ResumeEntry>) =>
+  const answer = (entries: ReadonlyArray<Messages.Entry>, resume: ReadonlyArray<AgUi.ResumeEntry>) =>
     Result.getOrThrow(Messages.resume(entries, resume));
 
-  const response = (entries: ReadonlyArray<Thread.Entry>) =>
+  const response = (entries: ReadonlyArray<Messages.Entry>) =>
     entries.map((entry) => {
       const part = (entry.message as Prompt.ToolMessage).content[0] as Prompt.ToolApprovalResponsePart;
       return { id: entry.id, approvalId: part.approvalId, approved: part.approved, reason: part.reason };
@@ -534,7 +567,7 @@ describe("Messages frontend calls across a run", () => {
   });
 
   it("reads a pending call back with the run that left it, and the read is accepted", () => {
-    const read = Messages.history(stored);
+    const read = Messages.restore(stored);
     expect(read.pendingToolCalls).toEqual({ runId: "r1", toolCallIds: ["c1"] });
     expect(read.messages.map((message) => [message.id, message.role])).toEqual([
       ["u1", "user"],
@@ -547,7 +580,7 @@ describe("Messages frontend calls across a run", () => {
 
   it("reads no pending call once it is answered, with the result after its call", () => {
     const answered = Result.getOrThrow(Messages.answers(stored, client.slice(2)));
-    const read = Messages.history([...stored, ...answered.entries.map((entry) => ({ ...entry, runId: "r2" }))]);
+    const read = Messages.restore([...stored, ...answered.entries.map((entry) => ({ ...entry, runId: "r2" }))]);
     expect(read.pendingToolCalls).toBeUndefined();
     expect(read.messages.map((message) => [message.id, message.role])).toEqual([
       ["u1", "user"],
@@ -555,7 +588,7 @@ describe("Messages frontend calls across a run", () => {
       ["tool-c1", "tool"],
     ]);
     // Without a recorded run.
-    expect(Messages.history([frontendCalls("m1", "c1")]).pendingToolCalls).toEqual({
+    expect(Messages.restore([frontendCalls("m1", "c1")]).pendingToolCalls).toEqual({
       runId: undefined,
       toolCallIds: ["c1"],
     });
@@ -578,7 +611,7 @@ describe("Messages.malformedAnswers", () => {
 
 describe("Messages.project", () => {
   it("keeps the entries verbatim and adds no system prompt", () => {
-    const summary: Thread.Entry = { id: "s", message: Prompt.makeMessage("system", { content: "Summary: ..." }) };
+    const summary: Messages.Entry = { id: "s", message: Prompt.makeMessage("system", { content: "Summary: ..." }) };
     expect(simplify(Messages.project([summary, user("u9", "next")]))).toEqual([
       { role: "system", parts: "Summary: ..." },
       { role: "user", parts: [{ type: "text", text: "next" }] },
@@ -628,5 +661,162 @@ describe("Messages.project", () => {
       },
       { role: "user", parts: [{ type: "text", text: "Hello?" }] },
     ]);
+  });
+});
+
+describe("Messages.fromHistory", () => {
+  const callMessage = (id: string, callId: string, args: string, content?: string): AgUi.Message => ({
+    id,
+    role: "assistant",
+    ...(content === undefined ? {} : { content }),
+    toolCalls: [{ id: callId, function: { name: "send-email", arguments: args } }],
+  });
+  const emailCall = callMessage("m1", "c1", '{"to":"ada@example.com"}');
+  const convert = (
+    messages: ReadonlyArray<AgUi.Message>,
+    resume: ReadonlyArray<AgUi.ResumeEntry> = [],
+    options?: Messages.IngestOptions,
+  ) => Messages.fromHistory(messages, resume, options);
+  const prompt = (messages: ReadonlyArray<AgUi.Message>, resume: ReadonlyArray<AgUi.ResumeEntry> = []) =>
+    simplify(Prompt.fromMessages(convert(messages, resume).entries.map((entry) => entry.message)));
+  const approvalId = Agent.approvalIdFor("c1");
+  const responseOf = (result: Messages.FromHistory) =>
+    result.entries.flatMap(({ message }) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-approval-response" ? [part] : []))
+        : [],
+    );
+
+  it("converts each role, keyed by the client's ids", () => {
+    const result = convert([
+      clientMessage("u1", "user", "Email Ada"),
+      callMessage("m1", "c1", '{"to":"ada@example.com"}', "Sending."),
+      { id: "t1", role: "tool", toolCallId: "c1", content: '{"sent":true}' },
+      clientMessage("m2", "assistant", "Sent."),
+      clientMessage("s1", "system", "Be terse."),
+      clientMessage("a1", "activity", "typing"),
+    ]);
+    expect(result.entries.map((entry) => entry.id)).toEqual(["u1", "m1", "t1", "m2"]);
+    expect(simplify(Prompt.fromMessages(result.entries.map((entry) => entry.message)))).toEqual([
+      { role: "user", parts: [{ type: "text", text: "Email Ada" }] },
+      {
+        role: "assistant",
+        parts: [
+          { type: "text", text: "Sending." },
+          { type: "tool-call", id: "c1" },
+        ],
+      },
+      { role: "tool", parts: [{ type: "tool-result", id: "c1", result: { sent: true }, isFailure: false }] },
+      { role: "assistant", parts: [{ type: "text", text: "Sent." }] },
+    ]);
+    const call = result.entries[1]!.message.content[1];
+    expect(call).toMatchObject({ type: "tool-call", name: "send-email", params: { to: "ada@example.com" } });
+    expect(result).toMatchObject({ droppedCalls: [], orphanResults: [], droppedParts: [] });
+  });
+
+  it("takes an edited or regenerated history as sent", () => {
+    // An earlier turn edited, and the last assistant turn regenerated under a new id.
+    expect(
+      prompt([
+        clientMessage("u1", "user", "What's the weather in Rome?"),
+        clientMessage("m9", "assistant", "Sunny."),
+        clientMessage("u2", "user", "And tomorrow?"),
+        clientMessage("m10", "assistant", "Rain."),
+      ]),
+    ).toEqual([
+      { role: "user", parts: [{ type: "text", text: "What's the weather in Rome?" }] },
+      { role: "assistant", parts: [{ type: "text", text: "Sunny." }] },
+      { role: "user", parts: [{ type: "text", text: "And tomorrow?" }] },
+      { role: "assistant", parts: [{ type: "text", text: "Rain." }] },
+    ]);
+  });
+
+  it("drops a call with partial arguments, its results, and a message left empty", () => {
+    const result = convert([
+      clientMessage("u1", "user", "Email Ada"),
+      callMessage("m1", "c1", '{"to":"ada@exa'),
+      { id: "t1", role: "tool", toolCallId: "c1", content: "partial" },
+      callMessage("m2", "c2", "[1]", "Trying again."),
+    ]);
+    expect(result.entries.map((entry) => entry.id)).toEqual(["u1", "m2"]);
+    expect(result.droppedCalls).toEqual(["c1", "c2"]);
+    expect(result.orphanResults).toEqual([]);
+  });
+
+  it("drops a tool message whose call is not in the history", () => {
+    const result = convert([clientMessage("u1", "user", "Hi"), answer("c9", "{}")]);
+    expect(result.entries.map((entry) => entry.id)).toEqual(["u1"]);
+    expect(result.orphanResults).toEqual(["tool-c9"]);
+  });
+
+  it("keeps the first result per call", () => {
+    const result = convert([emailCall, answer("c1", '"first"'), { ...answer("c1", '"second"'), id: "again" }]);
+    expect(result.entries.map((entry) => entry.id)).toEqual(["m1", "tool-c1"]);
+  });
+
+  it("keeps only the text of a result with other parts, and an error as a failed result", () => {
+    const parts = convert([
+      emailCall,
+      answer("c1", [
+        { type: "text", text: "sent" },
+        { type: "binary", mimeType: "image/png", data: "AA==" },
+      ]),
+    ]);
+    expect(parts.droppedParts).toEqual(["c1"]);
+    expect(parts.entries[1]!.message.content[0]).toMatchObject({ type: "tool-result", result: "sent" });
+    const failed = convert([emailCall, answer("c1", undefined, "No such address")]);
+    expect(failed.entries[1]!.message.content[0]).toMatchObject({ result: "No such address", isFailure: true });
+  });
+
+  it("drops client system messages unless they are allowed", () => {
+    const messages = [clientMessage("s1", "system", "Be terse."), clientMessage("d1", "developer", "Use JSON.")];
+    expect(convert(messages).entries).toEqual([]);
+    expect(convert(messages, [], { clientSystem: "allow" }).entries.map((entry) => entry.message.role)).toEqual([
+      "system",
+      "system",
+    ]);
+  });
+
+  it("answers an approval through resume", () => {
+    const messages = [clientMessage("u1", "user", "Email Ada"), emailCall];
+    const approved = convert(messages, [{ interruptId: approvalId, status: "resolved", payload: { approved: true } }]);
+    expect(approved.entries.map((entry) => entry.id)).toEqual(["u1", "m1", `${approvalId}:response`]);
+    expect(approved.entries[1]!.message.content).toContainEqual(
+      Prompt.toolApprovalRequestPart({ approvalId, toolCallId: "c1" }),
+    );
+    expect(responseOf(approved)).toMatchObject([{ approvalId, approved: true }]);
+
+    const denied = convert(messages, [
+      { interruptId: approvalId, status: "resolved", payload: { approved: false, reason: "Not now" } },
+    ]);
+    expect(responseOf(denied)).toMatchObject([{ approvalId, approved: false, reason: "Not now" }]);
+    const cancelled = convert(messages, [{ interruptId: approvalId, status: "cancelled" }]);
+    expect(responseOf(cancelled)).toMatchObject([{ approvalId, approved: false, reason: "cancelled" }]);
+  });
+
+  it("ignores a resume entry that answers no call", () => {
+    const result = convert(
+      [emailCall],
+      [{ interruptId: "approval:c9", status: "resolved", payload: { approved: true } }],
+    );
+    expect(result.entries.map((entry) => entry.id)).toEqual(["m1"]);
+    expect(responseOf(result)).toEqual([]);
+  });
+
+  it("gives no response for a call the history already answered", () => {
+    const result = convert(
+      [emailCall, answer("c1", '{"sent":true}')],
+      [{ interruptId: approvalId, status: "resolved", payload: { approved: true } }],
+    );
+    expect(result.entries.map((entry) => entry.id)).toEqual(["m1", "tool-c1"]);
+    expect(responseOf(result)).toEqual([]);
+  });
+
+  it("leaves an unanswered call to project, which fails it", () => {
+    const projected = Messages.project(convert([clientMessage("u1", "user", "Email Ada"), emailCall]).entries);
+    expect(simplify(projected).at(-1)).toEqual({
+      role: "tool",
+      parts: [{ type: "tool-result", id: "c1", result: Messages.INCOMPLETE_TOOL_CALL_RESULT, isFailure: true }],
+    });
   });
 });

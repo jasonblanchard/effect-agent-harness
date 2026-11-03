@@ -9,13 +9,13 @@ import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Sse from "../src/Sse.ts";
-import * as Thread from "../src/Thread.ts";
 import {
   ApprovalToolkit,
   countingApprovalLayer,
   evalLayers,
   finish,
   scriptedModel,
+  serverStores,
   type Step,
   text,
   toolCall,
@@ -34,7 +34,7 @@ const weatherAgent = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful
 const services = (steps: ReadonlyArray<Step>) => {
   const model = scriptedModel(steps);
   return {
-    layer: Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers, Thread.layerMemory),
+    layer: Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers, serverStores),
     prompts: model.prompts,
   };
 };
@@ -297,7 +297,7 @@ describe("HttpAgent tool approval", () => {
     const handler = track(
       HttpRouter.toWebHandler(
         agentRoute(Agent.define({ toolkit: ApprovalToolkit })).pipe(
-          Layer.provideMerge(Layer.mergeAll(model.layer, handlers.layer, evalLayers, Thread.layerMemory)),
+          Layer.provideMerge(Layer.mergeAll(model.layer, handlers.layer, evalLayers, serverStores)),
         ),
         { disableLogger: true },
       ),

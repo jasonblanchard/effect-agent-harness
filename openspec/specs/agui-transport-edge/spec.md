@@ -39,7 +39,17 @@ The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only t
 - **THEN** decoding succeeds and the run has no frontend tools
 
 ### Requirement: Runner without service requirements
-The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service. The stream SHALL require the agent's services (language model, tool handlers, thread store, checkpoint store, and any services the agent's system prompt or tools declare, such as the trusted context the caller provides per run), less the services the run's per-run layer provides, plus that layer's own requirements. The caller SHALL be able to provide them where it consumes the stream, for example by providing the per-request ones and closing over its own context, so that the stream requires nothing and can be consumed after the code that created it has returned, for example as a response body. The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
+The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service.
+
+**What the stream requires.** The stream SHALL require:
+- the agent's services: the language model, the tool handlers, and any services the agent's system prompt or tools declare, such as the trusted context the caller provides per run;
+- the checkpoint store;
+
+less the services the run's per-run layer provides, plus that layer's own requirements. The stream SHALL NOT require a thread store or a history. A history MAY be provided to the stream, and the thread store is then a requirement of that history.
+
+**Providing it.** The caller SHALL be able to provide these where it consumes the stream, for example by providing the per-request ones and closing over its own context. The stream then requires nothing, and can be consumed after the code that created it has returned, for example as a response body.
+
+**Failures.** The stream SHALL NOT fail: failures are reported in-band as `RUN_ERROR`.
 
 #### Scenario: Nothing captured when the function is made
 - **WHEN** the run function is made outside any Effect, before any service exists
@@ -56,6 +66,14 @@ The package SHALL provide a request-scoped run as a function from the run's inpu
 #### Scenario: Per-run services are built per run
 - **WHEN** an agent requires `CurrentUser`, and the run's layer provides it from "app/Auth"
 - **THEN** the run's stream requires "app/Auth" and not `CurrentUser`, and `CurrentUser` is built for each run
+
+#### Scenario: No thread store required
+- **WHEN** a run's stream is provided the agent's services and a checkpoint store only
+- **THEN** it requires nothing further, and the run uses the client history
+
+#### Scenario: Server history brings its store
+- **WHEN** a run's stream is provided the server history, built with an in-memory thread store, alongside the agent's services and a checkpoint store
+- **THEN** it requires nothing further, and the run uses the store's history
 
 ### Requirement: Cancellation when the consumer stops
 For the request-scoped runner, when the consumer of a run's event stream stops reading, for example because a client disconnects or calls `abortRun()`, the run SHALL stop and any model request or tool execution still in progress SHALL be cancelled. The detached runner SHALL NOT be affected by any consumer stopping.

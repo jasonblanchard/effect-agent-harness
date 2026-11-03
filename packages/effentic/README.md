@@ -6,11 +6,11 @@ effentic runs an agent (a model, a set of tools, a system prompt) and streams th
 
 The agent's _behaviour_ is kept separate from _durability_. You define the agent once as a plain value. Then you choose, by providing layers, how much of the run survives a crash, a deploy or a dropped connection:
 
-| Plane   | Service      | What it gives you                                                         |
-| ------- | ------------ | ------------------------------------------------------------------------- |
-| Thread  | `Thread`     | The server owns each thread's history; clients only send what is new.     |
-| Compute | `Checkpoint` | Model and tool calls are memoised, so a resumed run never repeats a tool. |
-| Stream  | `EventLog`   | A run's events are stored with cursors, so clients can reconnect.         |
+| Plane   | Service      | What it gives you                                                          |
+| ------- | ------------ | -------------------------------------------------------------------------- |
+| History | `History`    | Who owns the transcript: the client (default), or the server, in `Thread`. |
+| Compute | `Checkpoint` | Model and tool calls are memoised, so a resumed run never repeats a tool.  |
+| Stream  | `EventLog`   | A run's events are stored with cursors, so clients can reconnect.          |
 
 The same agent runs in a unit test with none of these (in-memory or passthrough layers) and in production with all of them.
 
@@ -21,7 +21,7 @@ The same agent runs in a unit test with none of these (in-memory or passthrough 
 - [Quick start](#quick-start)
 - [Defining an agent](#defining-an-agent)
 - [Running over AG-UI](#running-over-ag-ui)
-- [Threads](#threads)
+- [Histories](#histories)
 - [Authentication and run context](#authentication-and-run-context)
 - [Tool approvals](#tool-approvals)
 - [Frontend tools](#frontend-tools)
@@ -40,7 +40,7 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, Effect, Layer, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, Runner, Sse, Thread } from "effentic";
+import { Agent, AgUi, Checkpoint, Runner, Sse } from "effentic";
 
 // 1. Tools
 const GetWeather = Tool.make("get-weather", {
@@ -79,7 +79,7 @@ const AgentRoute = HttpRouter.add(
     Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
   ),
   // The handler's services come from the app layer's output: merge them in rather than hide them.
-).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, Thread.layerMemory, Checkpoint.layerNone)));
+).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, Checkpoint.layerNone)));
 
 export const { handler } = HttpRouter.toWebHandler(AgentRoute);
 ```
@@ -162,21 +162,22 @@ Tool tips:
 `Runner` connects an agent to AG-UI. All runners do the same work for each run:
 
 1. Build the per-run services from the dependencies the caller provided. See [Authentication and run context](#authentication-and-run-context).
-2. Check the input against what was stored for its run id (`RunInputMismatch` if it differs), and claim the thread (`ThreadBusy` if another run is active). See [Threads](#threads).
-3. Load the thread from the `Thread` store.
-4. Take the new messages from the client, plus its answers to the previous run's interrupts and its results for the frontend calls it was left (every open one must be answered).
-5. Run the agent with the run's info (below), the client's frontend tools and its per-run services, committing each finished step to the thread.
-6. Report the run's end to the store (`runEnded`) and release the thread, then emit the terminal event.
+2. Check the input against what was stored for its run id (`RunInputMismatch` if it differs).
+3. Build the prompt from the run's history. By default that is the client's messages as sent; with `History.layerServer` it is the stored thread, which the run claims and loads, plus what the client may add to it. See [Histories](#histories).
+4. Run the agent with the run's info (below), the client's frontend tools and its per-run services. Under the server history, each finished step is committed to the thread.
+5. Emit the terminal event. Under the server history, the run's end is reported to the store (`runEnded`) and the thread released first.
 
 AG-UI events are emitted throughout.
 
 Pick a runner by what should happen when the client goes away:
 
-| Runner                | A client disconnect…              | Requires                                                               |
-| --------------------- | --------------------------------- | ---------------------------------------------------------------------- |
-| `Runner.run`          | cancels the run (model and tools) | `Thread`, `Checkpoint`, model, tools, and what the per-run layer needs |
-| `Runner.makeDetached` | does nothing; the run continues   | the above + `EventLog`, `Scope`                                        |
-| `Runner.workflow`     | does nothing; an engine owns it   | the above (minus `Checkpoint`) + `WorkflowEngine`                      |
+| Runner                | A client disconnect…              | Requires                                                     |
+| --------------------- | --------------------------------- | ------------------------------------------------------------ |
+| `Runner.run`          | cancels the run (model and tools) | `Checkpoint`, model, tools, and what the per-run layer needs |
+| `Runner.makeDetached` | does nothing; the run continues   | the above + `EventLog`, `Scope`                              |
+| `Runner.workflow`     | does nothing; an engine owns it   | the above (minus `Checkpoint`) + `WorkflowEngine`            |
+
+None of them requires a thread store: a run's history is optional, and `History.layerServer` brings its own `Thread`.
 
 `Runner.run` is a plain function: nothing is captured, and each stream requires the agent's services. A route calls it inside its handler and returns `Sse.response(Sse.encode(stream))`. Because the body is read after the handler has returned, `Sse.response` closes over the handler's context, so whatever the stream still needs becomes a requirement of the handler. It also sets `text/event-stream` and `cache-control: no-cache`; `headers` and `status` are merged over them. With `effect/http`, keep those services in the app layer's output (`Layer.provideMerge`): the web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument. For the same reason, a per-request service the route forgets to provide, such as the principal, is not reported at the route but where the web handler is built or called. On another transport, close over the context yourself (`Stream.provideContext(yield* Effect.context())`) and use `Sse.encode` and `Sse.contentType`.
 
@@ -208,7 +209,7 @@ RUN_FINISHED { outcome: { type: "success" } }
 Runner.run(agent, { clientSystem: "allow" }); // default "drop"
 ```
 
-`clientSystem` controls `system` / `developer` messages sent by the client. By default they are dropped, so only your `system` prompt instructs the model.
+`clientSystem` controls `system` / `developer` messages sent by the client, under either history. By default they are dropped, so only your `system` prompt instructs the model.
 
 ### Run info
 
@@ -230,9 +231,40 @@ start(input).pipe(Effect.provideService(AuthContext, principal)); // from Runner
 
 Nothing in the AG-UI input can set a per-run dependency. See [Authentication and run context](#authentication-and-run-context).
 
-## Threads
+## Histories
 
-The server owns the history. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
+AG-UI has the client send its whole history with every run. Who owns that history is a deployment decision, made by providing a `History` to the run:
+
+| History                     | The run's prompt is…                              | Use it when                                                                                             |
+| --------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| client (default, no wiring) | the client's messages, as sent                    | the client owns its conversation: a chat that keeps its own state, edits and regenerates turns          |
+| `History.layerServer`       | the stored thread, plus the client's new messages | the server must own the transcript: a thread shared between users or devices, or kept beyond the client |
+
+### Client history
+
+With nothing provided, the client owns the transcript. Its messages are converted as sent (`Messages.fromHistory`) and nothing is stored, claimed or released:
+
+- user text, and `system` / `developer` messages only with `clientSystem: "allow"`;
+- assistant text and tool calls. A call whose arguments aren't a JSON object, such as one cut off by a cancelled run, is dropped with its results, with a logged warning;
+- `tool` messages as their call's result, decoded like a [frontend tool](#frontend-tools) result, the first per call. One whose call isn't in the history is dropped with a logged warning;
+- other roles are dropped.
+
+Edited and regenerated histories are taken as sent, and two runs on one thread may run at once. [Approvals](#tool-approvals) and [frontend calls](#frontend-tools) work from the history alone: an interrupt's id is derived from its tool call (`Agent.approvalIdFor`), so a `resume` entry answers the unanswered call it names. The run can't know what the previous run left open, so it never fails with `UnansweredInterrupt` or `UnansweredToolCall`: a call with no result and no answer is sent to the model with a failed result. Compaction is the client's concern too, since it sends everything on every run.
+
+### Server history
+
+Provide `History.layerServer` with a `Thread` store, keeping `Thread` in the app layer's output if a route of yours reads it ([below](#reloading-a-thread)):
+
+```ts
+Layer.mergeAll(
+  ModelLayer,
+  ToolsLayer,
+  Checkpoint.layerNone,
+  History.layerServer.pipe(Layer.provideMerge(Thread.layerMemory)),
+);
+```
+
+The server owns the history, in the `Thread` store. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
 
 - `user` messages that have text;
 - `system` / `developer` messages, and only with `clientSystem: "allow"`;
@@ -252,7 +284,7 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 - a stored tool call that never got a result is answered with a failed result;
 - tool results are placed directly after their calls.
 
-**One run at a time.** A thread has at most one active run, because each run reconciles the client against what it loaded and commits on top of it. Every runner claims the thread (`Thread.claim`) before loading it, and a run started while another is active ends at once with `RUN_ERROR` code `ThreadBusy`, without touching the thread. The claim is released after the run's last commit and before its `RUN_FINISHED` / `RUN_ERROR` is sent, so a client can start the next run as soon as it sees the last one end. `HttpAgent` already runs one run at a time per agent, so `ThreadBusy` usually means a second tab or a run that is still going in the background.
+**One run at a time.** A thread has at most one active run, because each run reconciles the client against what it loaded and commits on top of it. The run claims the thread (`Thread.claim`) before loading it, and a run started while another is active ends at once with `RUN_ERROR` code `ThreadBusy`, without touching the thread. The claim is released after the run's last commit and before its `RUN_FINISHED` / `RUN_ERROR` is sent, so a client can start the next run as soon as it sees the last one end. `HttpAgent` already runs one run at a time per agent, so `ThreadBusy` usually means a second tab or a run that is still going in the background.
 
 - A request-scoped run (`run`) that is cancelled releases the thread.
 - A detached or workflow run that crashes keeps it: the thread stays busy until the run is resumed and ends. A durable store should expire a claim after longer than any run takes, so a crashed run that is never resumed doesn't hold its thread for ever.
@@ -269,12 +301,12 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 
 In practice: summarise older history into a system entry, and keep the tail from the last user message on.
 
-### Reloading a thread
+#### Reloading a thread
 
-A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `Messages.history` turns a thread back into what its runs' events showed, for the client to restore:
+A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `Messages.restore` turns a thread back into what its runs' events showed, for the client to restore:
 
 ```ts
-const { messages, interrupts, pendingToolCalls } = yield * Effect.map(thread.load(threadId), Messages.history);
+const { messages, interrupts, pendingToolCalls } = yield * Effect.map(thread.load(threadId), Messages.restore);
 // messages: the AG-UI user, assistant and tool messages, with the ids and content the events carried
 // interrupts: { runId, pending } for approvals still open (as RUN_FINISHED carried them), or undefined
 // pendingToolCalls: { runId, toolCallIds } for frontend calls still waiting for a result, or undefined
@@ -287,6 +319,28 @@ TanStack AI's `useChat` does this itself with `persistence: true`: on mount it c
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
 
 The system prompt is never stored in the thread: the agent adds it to every model call.
+
+### Choosing per request
+
+The history is read from the run's context, so one runner can serve both:
+
+```ts
+const runAgent = Runner.run(agent);
+// A shared thread: the server owns it.
+runAgent(input).pipe(Stream.provide(History.layerServer));
+// A scratch chat: the client owns it.
+runAgent(input);
+```
+
+`History.layerClient` forces the client history where a server history is provided further out. A detached runner uses the history in the context it was built in, unless one is provided around `start`. A workflow uses the one in the context its `layer` is built in, and can't vary it per run, because a replayed execution has only its persisted payload: register a second workflow for the other history.
+
+### Security model
+
+Neither history is an authorization boundary. A client that writes the prompt can already steer the model into any tool call it could forge, so:
+
+- **Tool handlers and per-run dependencies are the authorization boundary.** Check access in handlers, against the verified principal the route provides ([below](#authentication-and-run-context)), never against anything in the input.
+- **`needsApproval` protects the user from the model**, not the server from the client. Under the client history, a client that drops a call's result from its history and approves it again runs the handler again, so make side-effecting handlers idempotent, or use the server history.
+- **The history decides who owns the transcript.** Under the server history, a client can't invent a model turn or a server tool's result; under the client history, it can, and that only affects its own conversation.
 
 ## Authentication and run context
 
@@ -392,7 +446,7 @@ The answered call is executed (or denied) before the model is called again, and 
 - **Approved** only when `status` is `"resolved"` and `payload` is an approval response (`AgUi.ApprovalResponse`, `{ approved: boolean, reason?: string }`) with `approved: true`. Anything else is a denial. `payload.reason` is passed to the model as the reason. Each approval interrupt carries this contract as its `responseSchema`, so a generic client can tell what to send.
 - A `resolved` answer whose payload is not an approval response, such as `{ approve: true }` or `"yes"`, is denied, and the runner logs a warning naming the interrupt ids.
 - `status: "cancelled"` is denied with reason `"cancelled"`.
-- **Every open interrupt must be answered.** A run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredInterrupt`, and nothing it sent is committed. AG-UI 1.0 forbids treating a missing answer as a decision, and `HttpAgent` already refuses to send such a run. To move on without approving, for example when the user types a new message instead, answer each open interrupt with `status: "cancelled"` in the same run as the new message.
+- **Every open interrupt must be answered.** Under the server history, a run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredInterrupt`, and nothing it sent is committed. AG-UI 1.0 forbids treating a missing answer as a decision, and `HttpAgent` already refuses to send such a run. To move on without approving, for example when the user types a new message instead, answer each open interrupt with `status: "cancelled"` in the same run as the new message. Under the client history, an unanswered call is sent to the model with a failed result instead ([Client history](#client-history)).
 - Resume entries for unknown interrupt ids are ignored.
 
 A denied call gets the failed result `{ "type": "execution-denied", "reason": "…" }`.
@@ -411,10 +465,10 @@ A client can advertise tools of its own in `RunAgentInput.tools` (AG-UI frontend
   ```
 
 - **The client answers in its next run's `messages`**, with one `tool` message per call, keyed by `toolCallId`. `error` makes it a failed result. Content that is JSON text is stored as the parsed value, any other text as itself, and a list of content parts as its text; other parts (images, files) are dropped with a logged warning, and the call is still answered. To decline a call, answer it saying so.
-- **Every pending call must be answered.** A run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredToolCall`, and nothing it sent is committed. A client that abandons the thread answers nothing, which is fine.
+- **Every pending call must be answered.** Under the server history, a run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredToolCall`, and nothing it sent is committed. A client that abandons the thread answers nothing, which is fine.
 - **A step can mix kinds.** If the model calls a server tool, a frontend tool and a tool that needs approval in one step, the server call runs and the run ends with the approval interrupt. AG-UI's interrupt outcome carries no `pendingToolCallIds`, so the client finds the frontend call in the stream. The next run must carry both the `resume` entry and the `tool` message (if both are missing, `UnansweredInterrupt` is reported); the approved call then runs before the model is called with every result.
 
-The agent marks each frontend call on its stored assistant entry (in the tool-call part's `options`, removed before the model sees it). Only a marked call that has no result can be answered by the client. A server call left open by a crashed run can't be.
+The agent marks each frontend call on its stored assistant entry (in the tool-call part's `options`, removed before the model sees it). Under the server history, only a marked call that has no result can be answered by the client, and a server call left open by a crashed run can't be. Under the client history, a result is a `tool` message like any other.
 
 **Advertised tools are untrusted input.** Their descriptions and schemas reach the model exactly as the client sent them, like a client system message. Only accept them from clients you'd let instruct the model.
 
@@ -472,7 +526,7 @@ const Routes = HttpRouter.use((router) =>
 - otherwise it closes whatever the earlier attempt left open in the log and continues;
 - steps replayed from the checkpoint store publish no events.
 
-Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision is up to you, and the same run must not be started twice concurrently. A crashed run keeps its thread claimed, so other runs on the thread fail with `ThreadBusy` until you start it again and it ends.
+Use a durable `Checkpoint` so finished tool calls aren't repeated. Supervision is up to you, and the same run must not be started twice concurrently. Under the server history, a crashed run keeps its thread claimed, so other runs on the thread fail with `ThreadBusy` until you start it again and it ends.
 
 ### Workflow runs
 
@@ -495,7 +549,7 @@ const { start, executionId, workflow, layer } = Runner.workflow(agent, {
 yield * start(input).pipe(Effect.provideService(AuthContext, principal));
 ```
 
-`name` is required. The engine registers the workflow under it, derives execution ids from it and stores it with every execution. Give each agent on an engine its own name: two workflows with the same name replace each other's registration and share execution ids. Don't rename a workflow while it has executions in flight, because they would have no handler to resume them. Agents that share a `Thread` store and `EventLog` must not share thread ids either, since both stores key by thread.
+`name` is required. The engine registers the workflow under it, derives execution ids from it and stores it with every execution. Give each agent on an engine its own name: two workflows with the same name replace each other's registration and share execution ids. Don't rename a workflow while it has executions in flight, because they would have no handler to resume them. A workflow's history is the one in the context `layer` is built in: provide `History.layerServer` to `layer` for the server history. Agents that share a `Thread` store and `EventLog` must not share thread ids either, since both stores key by thread.
 
 `start` reads the dependencies' services and builds the payload the engine persists: the input and, when the runner has dependencies, their values, encoded with their schemas. A value a schema rejects makes `start` die before any execution exists. `start` doesn't wait for the run; observe it through the `EventLog`. A resumed execution sees the original dependencies and builds its per-run services again from them. Starting the same run (same `threadId` and `runId`) again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* executionId(input))`, with the same dependencies provided, because the engine derives the id from the encoded payload.
 
@@ -585,7 +639,7 @@ To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`
 
 Each plane is a `Context.Service`. Implement it with your store and provide it as a layer.
 
-**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. It must store each entry it appends with the commit's `runId`, and `load` must return it: `Messages.history` names the run that raised open approvals from it, and a run executed again after a crash recognises its own earlier steps by it (without it, that run fails with `HistoryDiverged`). An entry that is already stored keeps its first run. If `load` returns a compacted thread, it must keep what runs reconcile against ([Threads](#threads)). `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
+**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. It must store each entry it appends with the commit's `runId`, and `load` must return it: `Messages.restore` names the run that raised open approvals from it, and a run executed again after a crash recognises its own earlier steps by it (without it, that run fails with `HistoryDiverged`). An entry that is already stored keeps its first run. If `load` returns a compacted thread, it must keep what runs reconcile against ([Server history](#server-history)). Only `History.layerServer` uses the store. `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
 
 ```ts
 const ThreadLive = Layer.effect(
@@ -608,7 +662,7 @@ const ThreadLive = Layer.effect(
 );
 ```
 
-Entries are `{ id, message, runId? }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Thread.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
+Entries are `{ id, message, runId? }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Messages.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
 
 **Checkpoint ledger:** a get/set store keyed by `(threadId, runId, name)`. The values are JSON-encoded `Exit`s. Keep all three in the key: the client picks `runId`, so it is only unique within a thread.
 
@@ -626,13 +680,14 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                                                                                                                                                               |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `StepLimitExceeded`, `ModelStreamError`                                            |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                             |
-| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                        |
-| `Thread`     | `Thread`, `Entry`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                    |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                      |
-| `Messages`   | `history`, `History`: reading a thread back; `delta`, `ingest`, `resume`, `malformedAnswers`, `answers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the building blocks the runners use |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                         |
+| Module       | Main exports                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError`                                                                                                                                                                         |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                                                                                                                                                                           |
+| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                                                                                      |
+| `History`    | `History`, `layerClient`, `layerServer`                                                                                                                                                                                                                                                                                                                                                  |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                                                       |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                                                                                                  |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                                                    |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `restore`, `Restored`: reading a thread back; `fromHistory`, `FromHistory`: the client history's conversion; `delta`, `ingest`, `resume`, `malformedAnswers`, `answers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the building blocks the runners use |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                                                                                                                                                                       |

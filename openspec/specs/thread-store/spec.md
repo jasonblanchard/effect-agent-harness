@@ -41,7 +41,7 @@ Committing entries SHALL append, in the given order, each entry whose id is not 
 - **THEN** loading returns A once, with run id "r1"
 
 ### Requirement: The store is told when a run ends
-After a run that claimed its thread finishes, is interrupted for approval, or fails, the store SHALL be notified once per terminal outcome with the thread id, run id and outcome kind, before the run's claim is released, so a caller can hook compaction or bookkeeping there. A run that never claimed the thread SHALL NOT be notified.
+After a run that claimed its thread finishes, is interrupted for approval, or fails, the store SHALL be notified once per terminal outcome with the thread id, run id and outcome kind, before the run's claim is released, so a caller can hook compaction or bookkeeping there. Only runs using the server history claim a thread. A run that never claimed the thread SHALL NOT be notified.
 
 #### Scenario: Notification after success
 - **WHEN** a run on thread "t1" finishes successfully
@@ -59,8 +59,19 @@ After a run that claimed its thread finishes, is interrupted for approval, or fa
 - **WHEN** a run fails with `ThreadBusy` or `RunInputMismatch`
 - **THEN** the store receives no run-ended notification for that run
 
+#### Scenario: Run with the client history
+- **WHEN** a run that uses the client history finishes
+- **THEN** the store receives no run-ended notification for that run
+
 ### Requirement: The store owns compaction
-The projection of a thread into a model prompt SHALL be the agent's system prompt followed by the loaded entries' messages verbatim, in order. The library SHALL NOT summarise, drop or reorder entries; a caller compacts by rewriting what the store returns. The only exception: a tool result or approval response whose tool call is in the projection MAY be moved to directly after the assistant message holding that call, because providers require a call's result to follow it. Because a run also reconciles the client's history, `resume` entries and answers to frontend calls against the loaded entries, a compacted thread SHALL keep the latest entries the client has seen, with their ids, every assistant entry holding an approval request that has no response yet, and every assistant entry holding a frontend tool call that has no result yet, with its record that the call belongs to the client. An entry the store writes in place of others SHALL be a system entry, or SHALL come before the latest entry the client has seen; a user, assistant or tool entry the client has never seen, placed after it, makes the client's next run fail with `HistoryDiverged`.
+Under the server history, the projection of a thread into a model prompt SHALL be the agent's system prompt followed by the loaded entries' messages verbatim, in order. The library SHALL NOT summarise, drop or reorder entries; a caller compacts by rewriting what the store returns. The only exception: a tool result or approval response whose tool call is in the projection MAY be moved to directly after the assistant message holding that call, because providers require a call's result to follow it.
+
+A run also reconciles the client's history, its `resume` entries and its answers to frontend calls against the loaded entries. A compacted thread SHALL therefore keep:
+- the latest entries the client has seen, with their ids;
+- every assistant entry holding an approval request that has no response yet;
+- every assistant entry holding a frontend tool call that has no result yet, with its record that the call belongs to the client.
+
+An entry the store writes in place of others SHALL be a system entry, or SHALL come before the latest entry the client has seen. A user, assistant or tool entry the client has never seen, placed after it, makes the client's next run fail with `HistoryDiverged`.
 
 #### Scenario: Caller-compacted thread
 - **WHEN** a store returns a single system entry holding a summary followed by the last user entry
@@ -111,3 +122,14 @@ The store SHALL let a run claim a thread and release its claim. Claiming SHALL s
 #### Scenario: Threads are independent
 - **WHEN** run "r1" holds thread "t1"
 - **THEN** a run can claim thread "t2"
+
+### Requirement: Only the server history uses the store
+A run SHALL load, commit to, claim, release and notify the thread store only when it uses the server history. The store SHALL be a requirement of the server history, not of every run.
+
+#### Scenario: Client history
+- **WHEN** a run uses the client history in a context that also holds a thread store
+- **THEN** the store receives no call for that run
+
+#### Scenario: Server history
+- **WHEN** a run uses the server history
+- **THEN** it claims the thread, loads it, commits its entries, notifies the store that it ended and releases the thread

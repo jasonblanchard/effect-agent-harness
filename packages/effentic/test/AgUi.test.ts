@@ -278,7 +278,7 @@ describe("AgUi.fold", () => {
           type: "interrupt",
           interrupts: [
             {
-              id: "id-2",
+              id: Agent.approvalIdFor("c_email"),
               reason: "tool-approval",
               toolCallId: "c_email",
               message: "Approve call to send-email?",

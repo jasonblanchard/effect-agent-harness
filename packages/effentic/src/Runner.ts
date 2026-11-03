@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Schema, Scope, Stream } from "effect";
+import { Cause, Context, Effect, Layer, Option, Schema, Scope, Stream } from "effect";
 import { Prompt } from "effect/ai";
 import type { Tool } from "effect/ai";
 import { Workflow } from "effect/workflow";
@@ -7,8 +7,9 @@ import * as Agent from "./Agent.ts";
 import * as AgUi from "./AgUi.ts";
 import * as Checkpoint from "./Checkpoint.ts";
 import * as EventLog from "./EventLog.ts";
+import * as History from "./History.ts";
+import * as internal from "./internal/history.ts";
 import * as Messages from "./Messages.ts";
-import * as Thread from "./Thread.ts";
 
 /**
  * A declared slice of a run's trusted context: a service whose value is the
@@ -101,10 +102,12 @@ export interface DetachedOptions<
 /**
  * What a runner needs from outside: the agent's requirements, less the per-run
  * services and the per-run dependencies, plus what the per-run layer needs,
- * less the per-run dependencies. The thread store and the checkpoint store are
- * always required from outside, because the run uses them before its per-run
- * services exist. A detached or workflow runner captures this when it's built;
- * {@link run} has no dependencies and leaves it on each stream.
+ * less the per-run dependencies. The checkpoint store is always required from
+ * outside, because the run uses it before its per-run services exist. No
+ * thread store: the run's {@link History.History} is optional, and
+ * `History.layerServer` brings its own. A detached or workflow runner captures
+ * this when it's built; {@link run} has no dependencies and leaves it on each
+ * stream.
  */
 export type Requirements<
   Tools extends Record<string, Tool.Any>,
@@ -115,7 +118,6 @@ export type Requirements<
 > =
   | Exclude<Agent.Requirements<Tools, R>, ROut | DependencyServices<Dependencies>>
   | Exclude<RIn, DependencyServices<Dependencies>>
-  | Thread.Thread
   | Checkpoint.Checkpoint;
 
 /**
@@ -134,49 +136,13 @@ export class RunInputMismatch extends Schema.TaggedError<RunInputMismatch, { rea
 
 const InputJson = Schema.toCodecJson(AgUi.RunAgentInput);
 
-const failed = (cause: Cause.Cause<unknown>): Agent.Event => {
-  const error = Cause.squash(cause);
-  return { _tag: "Failed", error, code: Agent.errorCode(error) };
-};
-
 /** Ends the stream with a `Failed` event instead of failing it. Interruption passes through. */
 const failInBand = <R>(stream: Stream.Stream<Agent.Event, unknown, R>): Stream.Stream<Agent.Event, never, R> =>
   Stream.catchCause(stream, (cause) =>
     Cause.hasInterruptsOnly(cause)
       ? // An interrupt-only cause has no failures, so its error type is irrelevant.
         Stream.failCause(cause as Cause.Cause<never>)
-      : Stream.make(failed(cause)),
-  );
-
-/**
- * For a terminal event, calls `runEnded` and then releases the thread, even if
- * `runEnded` failed. If either fails, a successful or interrupted run ends as
- * failed instead; a run that already failed keeps its own error.
- */
-const endRun = (
-  threadId: string,
-  runId: string,
-  event: Extract<Agent.Event, { readonly _tag: "Finished" | "Failed" }>,
-): Effect.Effect<Agent.Event, never, Thread.Thread> =>
-  Effect.flatMap(Thread.Thread, (thread) =>
-    thread
-      .runEnded(
-        threadId,
-        runId,
-        event._tag === "Finished" ? { _tag: event.outcome._tag } : { _tag: "Failed", code: event.code },
-      )
-      .pipe(
-        Effect.exit,
-        Effect.flatMap((ended) => Effect.andThen(thread.release(threadId, runId), ended)),
-      ),
-  ).pipe(
-    Effect.as<Agent.Event>(event),
-    Effect.catchCause((cause) =>
-      Cause.hasInterruptsOnly(cause)
-        ? // An interrupt-only cause has no failures, so its error type is irrelevant.
-          Effect.failCause(cause as Cause.Cause<never>)
-        : Effect.succeed(event._tag === "Failed" ? event : failed(cause)),
-    ),
+      : Stream.make(internal.failed(cause)),
   );
 
 /**
@@ -191,35 +157,45 @@ const resolveServices = <ROut, E, RIn>(
       Effect.succeed(Context.empty() as Context.Context<ROut>)
     : Layer.build(options.layer);
 
+/** The run's history: the one in its context, or the client history. */
+const currentHistory: Effect.Effect<internal.Service> = Effect.map(
+  Effect.serviceOption(History.History),
+  // Every `History` value is one of the internal implementations; the public type only hides their members.
+  Option.match({ onNone: () => internal.client, onSome: (service) => service as internal.Service }),
+);
+
 /**
- * One AG-UI run over the server-owned thread:
+ * One AG-UI run:
  *
  * 1. build the per-run layer from the dependencies the run was provided, for
  *    this attempt only;
  * 2. check that the input is the one the run id was first used with
  *    (memoised as the `input` checkpoint; the dependencies are not part of
- *    it), and claim the thread, so it has one active run;
- * 3. load the thread, take the client's delta, its `resume` answers and its
- *    results for pending frontend calls, and commit them;
- * 4. project the thread, memoised as the `prompt` checkpoint so a resumed run
- *    uses the projection the crashed attempt used;
+ *    it);
+ * 3. open the run's {@link History.History} (the client history if its
+ *    context has none), which decides the entries the run starts from: the
+ *    client's messages as sent, or, under `History.layerServer`, the claimed
+ *    and loaded thread plus what the client may add to it;
+ * 4. project those entries, memoised as the `prompt` checkpoint so a resumed
+ *    run uses the projection the crashed attempt used;
  * 5. run the agent with the run's info (the input's ids and `forwardedProps`),
- *    the client's frontend tools and the per-run services, committing each step's entries as it finishes;
- * 6. tell the store the run ended, however it ended, and release the thread
- *    before the terminal event is emitted, so the client's next run finds it
- *    free;
+ *    the client's frontend tools and the per-run services, handing each
+ *    step's entries to the history as it finishes;
+ * 6. hand the terminal event to the history, however the run ended, before
+ *    it is emitted (the server history reports the end and releases the
+ *    thread there, so the client's next run finds it free);
  * 7. project the events onto AG-UI.
  *
  * Every checkpoint is scoped by the thread id as well as the run id, so a run
  * id the client reuses on another thread replays nothing.
  *
  * Failures, including those before the model is called (the per-run layer's
- * errors, `ThreadError`, `HistoryMismatch`, `UnansweredInterrupt`, `UnansweredToolCall`,
- * `RunInputMismatch`, `ThreadBusy`), end the stream with `RUN_ERROR`, so it
- * never fails. A run that never claimed the thread is not reported to the
- * store. Nor is an interrupted run (e.g. a cancelled request), since it has
- * not ended: it keeps its claim, and running it again finishes it. The
- * request-scoped runner releases a cancelled run's claim itself.
+ * errors, `RunInputMismatch`, and the server history's `ThreadError`,
+ * `ThreadBusy`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`,
+ * `UnansweredToolCall`), end the stream with `RUN_ERROR`, so it never fails.
+ * An interrupted run (e.g. a cancelled request) is not handed to the history
+ * as ended: under the server history it keeps its claim, and running it again
+ * finishes it. The request-scoped runner abandons a cancelled run itself.
  */
 const pipeline =
   <Tools extends Record<string, Tool.Any>, R, Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
@@ -234,38 +210,13 @@ const pipeline =
     Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies>
   > => {
     const { threadId, runId } = input;
-    // Runs while the run holds the thread.
-    const claimed = (thread: Thread.Thread["Service"], checkpoint: Checkpoint.Checkpoint["Service"]) =>
+    // Runs once the history has opened the run.
+    const opened = (attempt: internal.Attempt, checkpoint: Checkpoint.Checkpoint["Service"]) =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const stored = yield* thread.load(threadId);
-          const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages, runId));
-          const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
-          // After `resume`, so a run that leaves both kinds open reports the unanswered interrupt.
-          const answered = yield* Effect.fromResult(Messages.answers(stored, delta));
-          const malformed = Messages.malformedAnswers(input.resume ?? []);
-          if (malformed.length > 0) {
-            yield* Effect.logWarning(
-              "effentic: resolved answers that are not approval responses were denied",
-              malformed,
-            );
-          }
-          if (answered.droppedParts.length > 0) {
-            yield* Effect.logWarning(
-              "effentic: content parts other than text were dropped from frontend tool results",
-              answered.droppedParts,
-            );
-          }
-          // Answers to the previous run come before anything new the client says.
-          const added = [
-            ...responses,
-            ...answered.entries,
-            ...Messages.ingest(delta, { clientSystem: options?.clientSystem }),
-          ];
-          yield* thread.commit(threadId, runId, added);
           const prompt = yield* checkpoint.memo(
             { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
-            Effect.sync(() => Messages.project([...stored, ...added])),
+            Effect.sync(() => Messages.project([...attempt.stored, ...attempt.added])),
           );
 
           return Agent.run(agent)({
@@ -274,17 +225,13 @@ const pipeline =
             props: input.forwardedProps,
             prompt: prompt.value,
             frontendTools: input.tools,
-          }).pipe(
-            Stream.tap((event) =>
-              event._tag === "StepFinished" ? thread.commit(threadId, runId, event.entries) : Effect.void,
-            ),
-          );
+          }).pipe(Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)));
         }),
       ).pipe(
         failInBand,
         // After the catch, so a run that failed anywhere above is reported too.
         Stream.mapEffect((event) =>
-          event._tag === "Finished" || event._tag === "Failed" ? endRun(threadId, runId, event) : Effect.succeed(event),
+          event._tag === "Finished" || event._tag === "Failed" ? attempt.end(event) : Effect.succeed(event),
         ),
       );
 
@@ -292,7 +239,6 @@ const pipeline =
     const events = Stream.unwrap(
       Effect.gen(function* () {
         const services = yield* resolveServices(options);
-        const thread = yield* Thread.Thread;
         const checkpoint = yield* Checkpoint.Checkpoint;
         const fingerprint = JSON.stringify(yield* Effect.orDie(Schema.encodeEffect(InputJson)(input)));
         const first = yield* checkpoint.memo(
@@ -302,8 +248,9 @@ const pipeline =
         if (first.value !== fingerprint) {
           return yield* new RunInputMismatch();
         }
-        yield* thread.claim(threadId, runId);
-        return claimed(thread, checkpoint).pipe(Stream.provideContext(services));
+        const history = yield* currentHistory;
+        const attempt = yield* history.beginAttempt(input, { clientSystem: options?.clientSystem });
+        return opened(attempt, checkpoint).pipe(Stream.provideContext(services));
       }),
     ).pipe(failInBand);
     return AgUi.fold(input)(events).pipe(Stream.withSpan("effentic/Runner.run", { attributes: { threadId, runId } }));
@@ -316,7 +263,11 @@ const pipeline =
  *
  * Nothing is captured: the function is plain, and each stream requires the
  * agent's services (a per-run service such as the verified principal among
- * them), the stores, and whatever the per-run `layer` needs. At a transport
+ * them), the checkpoint store, and whatever the per-run `layer` needs. The
+ * run's history is read from the stream's context too: provide
+ * `History.layerServer` (with its `Thread`) to the stream, or around the
+ * handler, for the server history, or nothing for the client history. That
+ * can differ per request. At a transport
  * edge, call it inside the request handler, provide the per-request services
  * (`Stream.provideService(AuthContext, principal)`) and close over the
  * handler's context (`Stream.provideContext(yield* Effect.context())`) before
@@ -334,8 +285,9 @@ export const run = <Tools extends Record<string, Tool.Any>, R, ROut = never, E =
     input: AgUi.RunAgentInput,
   ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
     Stream.suspend(() => {
-      // A run that ended has released its thread. Nothing resumes a cancelled
-      // request-scoped run, so a stream that stops before the end frees it.
+      // A run that ended has been handed to its history. Nothing resumes a cancelled
+      // request-scoped run, so a stream that stops before the end abandons it (the
+      // server history releases its thread).
       let ended = false;
       return runWith(input).pipe(
         Stream.tap((event) =>
@@ -345,13 +297,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R, ROut = never, E =
         ),
         Stream.ensuring(
           Effect.suspend(() =>
-            ended
-              ? Effect.void
-              : Effect.flatMap(Thread.Thread, (thread) => thread.release(input.threadId, input.runId)).pipe(
-                  Effect.catchCause((cause) =>
-                    Effect.logError("effentic: releasing a cancelled run's thread failed", cause),
-                  ),
-                ),
+            ended ? Effect.void : Effect.flatMap(currentHistory, (history) => history.abandonAttempt(input)),
           ),
         ),
       );
@@ -411,6 +357,10 @@ const detached =
  * `Checkpoint` (e.g. `Checkpoint.layerLedger`) completed steps are replayed
  * rather than executed again. Do not start the same run twice concurrently:
  * supervising runs is the caller's concern here, or use {@link workflow}.
+ *
+ * The run's {@link History.History} is the one in the context the runner was
+ * built in, unless one is provided around `start`, which wins: the context
+ * `start` is called in is merged over the captured one.
  */
 export const makeDetached = <
   Tools extends Record<string, Tool.Any>,
@@ -504,6 +454,11 @@ interface PayloadParts {
  * provided, gives a run's execution id for the engine-level controls on
  * `workflow` (`resume`, `poll`, `interrupt`): the engine derives it from the
  * encoded payload.
+ *
+ * The run's {@link History.History} is the one in the context `layer` is built
+ * in (provide `History.layerServer` to it for the server history). A replayed
+ * execution has only its persisted payload, which can't hold a service, so the
+ * history can't vary per run: register a second workflow for the other one.
  */
 export const workflow = <
   Tools extends Record<string, Tool.Any>,

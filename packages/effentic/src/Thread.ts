@@ -1,19 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect";
-import { Prompt } from "effect/ai";
-
-/**
- * One committed message of a thread. The id is the AG-UI message id the client
- * sees (the user's own id, or the id the server minted for an assistant step or
- * tool result), so the client's history can be matched against the store.
- * `runId` is the run whose commit appended the entry. The store records it, so
- * entries passed to `commit` need not carry it.
- */
-export const Entry = Schema.Struct({
-  id: Schema.String,
-  message: Prompt.Message,
-  runId: Schema.optional(Schema.String),
-});
-export type Entry = typeof Entry.Type;
+import type * as Messages from "./Messages.ts";
 
 /** How a run ended, as reported to {@link Thread.runEnded}. */
 export type RunOutcome =
@@ -35,8 +21,9 @@ export class ThreadBusy extends Schema.TaggedError<ThreadBusy, { readonly brand:
 }
 
 /**
- * The server-owned store of threads: the committed messages of each one, and
- * which run, if any, is active on each.
+ * The server history's store of threads: the committed messages of each one,
+ * and which run, if any, is active on each. Runs use it only through
+ * `History.layerServer`; a run on the default client history never touches it.
  *
  * The library projects whatever `load` returns into the model prompt, after the
  * agent's system prompt and without changing it. Compaction is therefore the
@@ -58,8 +45,8 @@ export class ThreadBusy extends Schema.TaggedError<ThreadBusy, { readonly brand:
  * never expected to hold.
  *
  * A thread has at most one active run, because each run reconciles the client
- * against what it loaded and commits on top of it. Every runner claims the
- * thread before loading it and releases it when the run ends. A durable store
+ * against what it loaded and commits on top of it. The server history claims
+ * the thread before loading it and releases it when the run ends. A durable store
  * must make `claim` atomic (e.g. a conditional update), and should let a claim
  * expire after longer than any run takes, so a run that crashed and is never
  * resumed doesn't hold its thread for ever.
@@ -73,7 +60,7 @@ export class Thread extends Context.Service<
      * `runId` of the commit that appended it; an entry the store wrote itself,
      * such as a compaction summary, may have none.
      */
-    readonly load: (threadId: string) => Effect.Effect<ReadonlyArray<Entry>, ThreadError>;
+    readonly load: (threadId: string) => Effect.Effect<ReadonlyArray<Messages.Entry>, ThreadError>;
     /**
      * Makes `runId` the thread's active run. Succeeds if the thread has no
      * active run or `runId` already is it (a resumed run claims again); fails
@@ -90,7 +77,7 @@ export class Thread extends Context.Service<
     readonly commit: (
       threadId: string,
       runId: string,
-      entries: ReadonlyArray<Entry>,
+      entries: ReadonlyArray<Messages.Entry>,
     ) => Effect.Effect<void, ThreadError>;
     /**
      * Called once per run that claimed the thread, after its last commit and
@@ -108,7 +95,7 @@ export class Thread extends Context.Service<
 
 /** Keeps every thread in memory for the lifetime of the process. For tests, local development and examples. */
 export const layerMemory: Layer.Layer<Thread> = Layer.sync(Thread, () => {
-  const threads = new Map<string, Array<Entry>>();
+  const threads = new Map<string, Array<Messages.Entry>>();
   const active = new Map<string, string>();
   return Thread.of({
     load: (threadId) => Effect.sync(() => [...(threads.get(threadId) ?? [])]),

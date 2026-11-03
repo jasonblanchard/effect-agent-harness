@@ -3,7 +3,7 @@ import { Config, DateTime, Effect, Layer, Schema } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { modelMessagesToUIMessages } from "@tanstack/ai";
-import { Agent, AgUi, Checkpoint, EventLog, Messages, Runner, Sse, Thread } from "effentic";
+import { Agent, AgUi, Checkpoint, EventLog, History, Messages, Runner, Sse, Thread } from "effentic";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
@@ -35,10 +35,15 @@ const ModelLayer = AnthropicLanguageModel.layer({
 
 const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-email": sendEmail });
 
-// Stateless: threads live in memory for the life of the process, and a crashed
-// run is not replayed. Approvals still work, because the interrupted thread is
-// held in memory until the next run answers them.
-const StoresLayer = Layer.mergeAll(Thread.layerMemory, Checkpoint.layerNone, EventLog.layerMemory);
+// The server owns the transcript (`History.layerServer`), because the hydrate
+// route below reads each thread back from the store after a reload. Threads
+// live in memory for the life of the process, and a crashed run is not
+// replayed. `Thread` stays in the output for the hydrate route.
+const StoresLayer = Layer.mergeAll(
+  History.layerServer.pipe(Layer.provideMerge(Thread.layerMemory)),
+  Checkpoint.layerNone,
+  EventLog.layerMemory,
+);
 
 const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 
@@ -57,7 +62,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       "/api/chat",
       Effect.gen(function* () {
         const { threadId } = yield* HttpServerRequest.schemaSearchParams(HydrateQuery);
-        const { messages, interrupts } = Messages.history(yield* thread.load(threadId));
+        const { messages, interrupts } = Messages.restore(yield* thread.load(threadId));
         return yield* HttpServerResponse.json({
           // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent)
           // and `toolCalls` is a mutable array.

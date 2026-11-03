@@ -293,7 +293,13 @@ describe("Agent.run approvals", () => {
       expect(emails).toEqual([]);
       expect(prompts).toHaveLength(1);
       const [requested] = byTag(events, "ApprovalRequested");
-      expect(requested).toMatchObject({ step: 1, toolCallId: "c_email", toolName: "send-email", replayed: false });
+      expect(requested).toMatchObject({
+        step: 1,
+        approvalId: Agent.approvalIdFor("c_email"),
+        toolCallId: "c_email",
+        toolName: "send-email",
+        replayed: false,
+      });
       expect(events.at(-1)).toEqual({
         _tag: "Finished",
         outcome: {
@@ -306,6 +312,22 @@ describe("Agent.run approvals", () => {
       const assistant = finished!.entries[0]!.message;
       expect(assistant.role).toBe("assistant");
       expect(partTypes(Prompt.fromMessages([assistant]))).toEqual(["tool-call", "tool-call", "tool-approval-request"]);
+    }),
+  );
+
+  it.effect("gives the same call the same approval id on every thread", () =>
+    Effect.gen(function* () {
+      const ids = yield* Effect.forEach(["t1", "t2"], (threadId) =>
+        Effect.gen(function* () {
+          const model = scriptedModel([[...emailCall, finish("tool-calls")]]);
+          const events = yield* Agent.run(approvalAgent)({ runId: "r1", threadId, prompt: userPrompt }).pipe(
+            Stream.runCollect,
+            Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),
+          );
+          return byTag(Array.from(events), "ApprovalRequested").map((event) => event.approvalId);
+        }),
+      );
+      expect(ids).toEqual([["approval:c_email"], ["approval:c_email"]]);
     }),
   );
 

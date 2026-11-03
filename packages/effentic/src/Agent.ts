@@ -3,7 +3,7 @@ import { IdGenerator, LanguageModel, Prompt, Tool } from "effect/ai";
 import type { Response, Toolkit } from "effect/ai";
 import type { JsonSchema } from "effect";
 import * as Checkpoint from "./Checkpoint.ts";
-import type * as Thread from "./Thread.ts";
+import type * as Messages from "./Messages.ts";
 
 // -----------------------------------------------------------------------------
 // Definition
@@ -124,7 +124,7 @@ export type Event =
       readonly _tag: "StepFinished";
       readonly step: number;
       /** The thread entries this step produced, to be committed. */
-      readonly entries: ReadonlyArray<Thread.Entry>;
+      readonly entries: ReadonlyArray<Messages.Entry>;
       readonly replayed: boolean;
     }
   | { readonly _tag: "Finished"; readonly outcome: Outcome }
@@ -213,6 +213,13 @@ const ToolStep = Schema.Union([
 ]);
 type ToolStep = typeof ToolStep.Type;
 
+/**
+ * The id of the approval request for a tool call, and of the AG-UI interrupt
+ * carrying it. Derived from the call, so a client's history alone links an
+ * interrupt to its call. Treat it as opaque.
+ */
+export const approvalIdFor = (toolCallId: string): string => `approval:${toolCallId}`;
+
 /** A user's answer to an approval request, found in the prompt. */
 interface Decision {
   readonly approved: boolean;
@@ -293,7 +300,7 @@ export const run =
               if (decision === undefined) {
                 const needed = yield* approvalNeeded(toolkit.tools[call.name], call, prompt);
                 if (needed) {
-                  return { _tag: "ApprovalRequested", approvalId: yield* ids.generateId() } as const;
+                  return { _tag: "ApprovalRequested", approvalId: approvalIdFor(call.id) } as const;
                 }
               } else if (!decision.approved) {
                 return yield* result({ type: "execution-denied", reason: decision.reason }, true);
@@ -320,7 +327,7 @@ export const run =
             ),
           );
 
-        const toolEntry = (call: ToolCall, step: Extract<ToolStep, { _tag: "Result" }>): Thread.Entry => ({
+        const toolEntry = (call: ToolCall, step: Extract<ToolStep, { _tag: "Result" }>): Messages.Entry => ({
           id: step.messageId,
           message: Prompt.makeMessage("tool", {
             content: [
@@ -403,7 +410,7 @@ export const run =
           const steps = yield* Effect.forEach(decided, ({ call, decision }) => executeTool(call, prompt, decision), {
             concurrency: "unbounded",
           });
-          const entries: Array<Thread.Entry> = [];
+          const entries: Array<Messages.Entry> = [];
           for (const [i, { call }] of decided.entries()) {
             const { value, replayed } = steps[i]!;
             // A decision always yields a result.
@@ -437,7 +444,7 @@ export const run =
           );
 
           const approvals: Array<Approval> = [];
-          const toolEntries: Array<Thread.Entry> = [];
+          const toolEntries: Array<Messages.Entry> = [];
           for (const [i, call] of executed.entries()) {
             const { value, replayed } = tools[i]!;
             if (value._tag === "ApprovalRequested") {
@@ -457,7 +464,7 @@ export const run =
           }
 
           const assistantMessage = assistant.content.find((message) => message.role === "assistant");
-          const entries: Array<Thread.Entry> = [];
+          const entries: Array<Messages.Entry> = [];
           if (assistantMessage !== undefined) {
             entries.push({
               id: messageId,

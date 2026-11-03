@@ -1,44 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Schema } from "effect";
+import { Effect } from "effect";
 import { Prompt } from "effect/ai";
+import type * as Messages from "../src/Messages.ts";
 import * as Thread from "../src/Thread.ts";
 
-const user = (id: string, text: string): Thread.Entry => ({
+const user = (id: string, text: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }),
-});
-
-describe("Thread.Entry", () => {
-  it.effect("round-trips an assistant message with a tool call", () =>
-    Effect.gen(function* () {
-      const entry: Thread.Entry = {
-        id: "m1",
-        message: Prompt.makeMessage("assistant", {
-          content: [
-            Prompt.makePart("text", { text: "Let me check." }),
-            Prompt.makePart("tool-call", {
-              id: "c1",
-              name: "get-weather",
-              params: { location: "Paris" },
-              providerExecuted: false,
-            }),
-          ],
-        }),
-      };
-      const encoded = yield* Schema.encodeEffect(Thread.Entry)(entry);
-      const decoded = yield* Schema.decodeUnknownEffect(Thread.Entry)(JSON.parse(JSON.stringify(encoded)));
-      expect(decoded).toEqual(entry);
-    }),
-  );
-
-  it.effect("round-trips the run id", () =>
-    Effect.gen(function* () {
-      const entry: Thread.Entry = { ...user("m1", "Hi"), runId: "r1" };
-      const encoded = yield* Schema.encodeEffect(Thread.Entry)(entry);
-      const decoded = yield* Schema.decodeUnknownEffect(Thread.Entry)(JSON.parse(JSON.stringify(encoded)));
-      expect(decoded).toEqual(entry);
-    }),
-  );
 });
 
 describe("Thread.layerMemory", () => {
