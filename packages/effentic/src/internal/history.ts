@@ -1,8 +1,9 @@
 import { Cause, Effect } from "effect";
 import * as Agent from "../Agent.ts";
 import type * as AgUi from "../AgUi.ts";
-import * as Messages from "../Messages.ts";
+import type * as Messages from "../Messages.ts";
 import type * as Thread from "../Thread.ts";
+import * as Conversions from "./conversions.ts";
 
 // -----------------------------------------------------------------------------
 // The private side of `History`: what the runner calls on it. Not exported from
@@ -19,13 +20,13 @@ export type Terminal = Extract<Agent.Event, { readonly _tag: "Finished" | "Faile
 export type AttemptError =
   | Thread.ThreadError
   | Thread.ThreadBusy
-  | Messages.HistoryMismatch
-  | Messages.HistoryDiverged
-  | Messages.UnansweredInterrupt
-  | Messages.UnansweredToolCall;
+  | Conversions.HistoryMismatch
+  | Conversions.HistoryDiverged
+  | Conversions.UnansweredInterrupt
+  | Conversions.UnansweredToolCall;
 
 export interface AttemptOptions {
-  readonly clientSystem: Messages.IngestOptions["clientSystem"];
+  readonly clientSystem: Conversions.IngestOptions["clientSystem"];
 }
 
 /**
@@ -67,7 +68,7 @@ export const failed = (cause: Cause.Cause<unknown>): Terminal => {
 
 const logMalformed = (input: AgUi.RunAgentInput) =>
   Effect.gen(function* () {
-    const malformed = Messages.malformedAnswers(input.resume ?? []);
+    const malformed = Conversions.malformedAnswers(input.resume ?? []);
     if (malformed.length > 0) {
       yield* Effect.logWarning("effentic: resolved answers that are not approval responses were denied", malformed);
     }
@@ -82,7 +83,7 @@ export const client: Service = {
   [TypeId]: TypeId,
   beginAttempt: (input, options) =>
     Effect.gen(function* () {
-      const converted = Messages.fromHistory(input.messages, input.resume ?? [], options);
+      const converted = Conversions.fromHistory(input.messages, input.resume ?? [], options);
       yield* logMalformed(input);
       if (converted.droppedCalls.length > 0) {
         yield* Effect.logWarning(
@@ -155,10 +156,10 @@ export const server = (thread: Thread.Thread["Service"]): Service => ({
     const { threadId, runId } = input;
     const prepare = Effect.gen(function* () {
       const stored = yield* thread.load(threadId);
-      const delta = yield* Effect.fromResult(Messages.delta(stored, input.messages, runId));
-      const responses = yield* Effect.fromResult(Messages.resume(stored, input.resume ?? []));
+      const delta = yield* Effect.fromResult(Conversions.delta(stored, input.messages, runId));
+      const responses = yield* Effect.fromResult(Conversions.resume(stored, input.resume ?? []));
       // After `resume`, so a run that leaves both kinds open reports the unanswered interrupt.
-      const answered = yield* Effect.fromResult(Messages.answers(stored, delta));
+      const answered = yield* Effect.fromResult(Conversions.answers(stored, delta));
       yield* logMalformed(input);
       if (answered.droppedParts.length > 0) {
         yield* Effect.logWarning(
@@ -170,7 +171,7 @@ export const server = (thread: Thread.Thread["Service"]): Service => ({
       const added = [
         ...responses,
         ...answered.entries,
-        ...Messages.ingest(delta, { clientSystem: options.clientSystem }),
+        ...Conversions.ingest(delta, { clientSystem: options.clientSystem }),
       ];
       yield* thread.commit(threadId, runId, added);
       return {

@@ -3,7 +3,7 @@ import { Config, DateTime, Effect, Layer, Schema } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { modelMessagesToUIMessages } from "@tanstack/ai";
-import { Agent, AgUi, Checkpoint, EventLog, History, Messages, Runner, Sse, Thread } from "effentic";
+import { Agent, AgUi, Checkpoint, EventLog, History, Runner, Sse, Thread } from "effentic";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
@@ -49,7 +49,6 @@ const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const thread = yield* Thread.Thread;
     const runAgent = Runner.run(assistant);
 
     // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
@@ -62,7 +61,7 @@ const ChatRoutes = HttpRouter.use((router) =>
       "/api/chat",
       Effect.gen(function* () {
         const { threadId } = yield* HttpServerRequest.schemaSearchParams(HydrateQuery);
-        const { messages, interrupts } = Messages.restore(yield* thread.load(threadId));
+        const { messages, interrupts } = yield* History.restore(threadId);
         return yield* HttpServerResponse.json({
           // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent)
           // and `toolCalls` is a mutable array.

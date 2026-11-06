@@ -1,6 +1,16 @@
 import { Context, Effect, Layer } from "effect";
 import * as internal from "./internal/history.ts";
+import * as Conversions from "./internal/conversions.ts";
 import * as Thread from "./Thread.ts";
+
+export {
+  HistoryDiverged,
+  HistoryMismatch,
+  type Restored,
+  type ShownMessage,
+  UnansweredInterrupt,
+  UnansweredToolCall,
+} from "./internal/conversions.ts";
 
 // -----------------------------------------------------------------------------
 // Who owns a run's transcript. AG-UI has the client send its whole history on
@@ -34,10 +44,29 @@ export class History extends Context.Service<
 
 /**
  * The client owns the transcript: the run's history is `input.messages` as
- * sent, converted as `Messages.fromHistory` describes. Nothing is loaded,
- * stored, claimed or released, so edited and regenerated histories are taken
- * as sent, and two runs on one thread may run at once. The default; provide it
- * to force the client history where a server history is provided further out.
+ * sent. Nothing is loaded, stored, claimed or released, so edited and
+ * regenerated histories are taken as sent, and two runs on one thread may run
+ * at once. The default; provide it to force the client history where a server
+ * history is provided further out.
+ *
+ * The client's messages become the run's entries under their own ids:
+ *
+ * - `user` messages keep their text; `system` and `developer` messages are
+ *   kept as system entries only with `clientSystem: "allow"`.
+ * - `assistant` messages keep their text and tool calls. A call whose
+ *   arguments are not a JSON object, such as one cut off by a cancelled run,
+ *   is dropped together with its results.
+ * - A `tool` message is its call's result (failed if it has `error`; JSON text
+ *   parsed; content parts reduced to their text). Only the first per call is
+ *   kept, and one whose call is not in the history is dropped.
+ * - Other roles are dropped.
+ *
+ * A `resume` entry answers the call with no result whose
+ * `Agent.approvalIdFor` it names, and the decision runs as step 0; an entry
+ * naming no such call is ignored, and a `resolved` one whose payload is not an
+ * `AgUi.ApprovalResponse` denies the call. Dropped calls, results with no
+ * call, dropped content parts and such malformed answers are logged as
+ * warnings.
  *
  * The run can't know what the previous run left open, so it never fails with
  * `UnansweredInterrupt` or `UnansweredToolCall`: a call with no result and no
@@ -59,3 +88,26 @@ export const layerServer: Layer.Layer<History, never, Thread.Thread> = Layer.eff
   History,
   Effect.map(Thread.Thread, internal.server),
 );
+
+/**
+ * The thread as its runs' events showed it, with its open interrupts and
+ * pending frontend calls, for a client that has lost its state (a reload,
+ * another device) to restore. Loads the thread from {@link Thread.Thread} and
+ * makes no claim, so it needs no run and can be read while one is active.
+ * Under the client history nothing is stored, and the client keeps its own
+ * state. Serve it from a route of your own, authorised like the run route. A
+ * client that sends the messages back, with new user messages after them, is
+ * matched against the store as if it had streamed them.
+ *
+ * Messages are in commit order, with each tool result moved directly after
+ * the assistant message holding its call. Ids and content are the events':
+ * an assistant message's text is its segments joined, and a tool result is
+ * its `TOOL_CALL_RESULT` content. Tool call arguments are re-encoded, so their
+ * formatting may differ from the streamed deltas. System entries, approval
+ * responses and reasoning are not returned.
+ */
+export const restore = (threadId: string): Effect.Effect<Conversions.Restored, Thread.ThreadError, Thread.Thread> =>
+  Effect.map(
+    Effect.flatMap(Thread.Thread, (thread) => thread.load(threadId)),
+    Conversions.restore,
+  );

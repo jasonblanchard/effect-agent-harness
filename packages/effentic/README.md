@@ -242,7 +242,7 @@ AG-UI has the client send its whole history with every run. Who owns that histor
 
 ### Client history
 
-With nothing provided, the client owns the transcript. Its messages are converted as sent (`Messages.fromHistory`) and nothing is stored, claimed or released:
+With nothing provided, the client owns the transcript. Its messages are converted as sent, under their own ids, and nothing is stored, claimed or released:
 
 - user text, and `system` / `developer` messages only with `clientSystem: "allow"`;
 - assistant text and tool calls. A call whose arguments aren't a JSON object, such as one cut off by a cancelled run, is dropped with its results, with a logged warning;
@@ -303,10 +303,10 @@ In practice: summarise older history into a system entry, and keep the tail from
 
 #### Reloading a thread
 
-A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `Messages.restore` turns a thread back into what its runs' events showed, for the client to restore:
+A reloaded page, or another device, has no history to send. Its first run would fail with `HistoryMismatch`, and it wouldn't know which approvals are still open. `History.restore` loads a thread from `Thread` and turns it back into what its runs' events showed, for the client to restore. It makes no claim, so it can be read while a run is active:
 
 ```ts
-const { messages, interrupts, pendingToolCalls } = yield * Effect.map(thread.load(threadId), Messages.restore);
+const { messages, interrupts, pendingToolCalls } = yield * History.restore(threadId);
 // messages: the AG-UI user, assistant and tool messages, with the ids and content the events carried
 // interrupts: { runId, pending } for approvals still open (as RUN_FINISHED carried them), or undefined
 // pendingToolCalls: { runId, toolCallIds } for frontend calls still waiting for a result, or undefined
@@ -639,7 +639,7 @@ To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`
 
 Each plane is a `Context.Service`. Implement it with your store and provide it as a layer.
 
-**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. It must store each entry it appends with the commit's `runId`, and `load` must return it: `Messages.restore` names the run that raised open approvals from it, and a run executed again after a crash recognises its own earlier steps by it (without it, that run fails with `HistoryDiverged`). An entry that is already stored keeps its first run. If `load` returns a compacted thread, it must keep what runs reconcile against ([Server history](#server-history)). Only `History.layerServer` uses the store. `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
+**Thread:** `commit` must be idempotent by entry id, because a resumed run commits the same entries again. It must store each entry it appends with the commit's `runId`, and `load` must return it: `History.restore` names the run that raised open approvals from it, and a run executed again after a crash recognises its own earlier steps by it (without it, that run fails with `HistoryDiverged`). An entry that is already stored keeps its first run. If `load` returns a compacted thread, it must keep what runs reconcile against ([Server history](#server-history)). Only `History.layerServer` uses the store. `claim` must be atomic across processes, for example a conditional update of an `active_run_id` column, and should expire.
 
 ```ts
 const ThreadLive = Layer.effect(
@@ -680,14 +680,14 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError`                                                                                                                                                                         |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                                                                                                                                                                           |
-| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                                                                                      |
-| `History`    | `History`, `layerClient`, `layerServer`                                                                                                                                                                                                                                                                                                                                                  |
-| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                                                       |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                                                                                                  |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                                                    |
-| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `restore`, `Restored`: reading a thread back; `fromHistory`, `FromHistory`: the client history's conversion; `delta`, `ingest`, `resume`, `malformedAnswers`, `answers`, `project`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the building blocks the runners use |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                                                                                                                                                                       |
+| Module       | Main exports                                                                                                                                                                                                              |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError`          |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                            |
+| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                       |
+| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`, `ShownMessage`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                        |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                   |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                     |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompt                                                               |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                        |

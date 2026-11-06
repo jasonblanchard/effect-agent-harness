@@ -59,8 +59,12 @@ export type DependencyServices<Dependencies extends ReadonlyArray<AnyService>> =
 
 /** Options of every runner. {@link run} takes exactly these. */
 export interface Options<ROut = never, E = never, RIn = never> {
-  /** What to do with client-sent `system`/`developer` messages. See {@link Messages.IngestOptions}. */
-  readonly clientSystem?: Messages.IngestOptions["clientSystem"];
+  /**
+   * What to do with `system` and `developer` messages sent by the client.
+   * `"drop"` (the default) ignores them, so only the server's system prompt
+   * instructs the model; `"allow"` turns them into system entries.
+   */
+  readonly clientSystem?: "allow" | "drop" | undefined;
   /**
    * Builds per-run services, such as the current user, typically from a
    * service the caller provides per run, like the verified principal. It is

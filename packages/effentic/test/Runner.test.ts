@@ -746,7 +746,7 @@ describe("Runner.run frontend tools", () => {
 });
 
 describe("Runner thread history", () => {
-  const read = Effect.map(loadThread, Messages.restore);
+  const read = History.restore("t1");
   const emailStep: Step = [
     ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
     finish("tool-calls"),

@@ -66,7 +66,7 @@ const approvalResponseSchema = {
 
 /**
  * The interrupt for a tool call waiting for approval, as `RUN_FINISHED` carries
- * it and as `Messages.restore` returns it for an open request.
+ * it and as `History.restore` returns it for an open request.
  */
 export const approvalInterrupt = (approval: {
   readonly approvalId: string;
