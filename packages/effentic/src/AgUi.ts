@@ -1,6 +1,11 @@
 import { PROTOCOL_VERSION } from "./AgUiSchema.ts";
 import type {
   Interrupt,
+  ReasoningEndEvent,
+  ReasoningMessageContentEvent,
+  ReasoningMessageEndEvent,
+  ReasoningMessageStartEvent,
+  ReasoningStartEvent,
   RunErrorEvent,
   RunFinishedEvent,
   RunFinishedOutcome,
@@ -131,6 +136,11 @@ export type Event =
   | TextMessageStartEvent
   | TextMessageContentEvent
   | TextMessageEndEvent
+  | ReasoningStartEvent
+  | ReasoningMessageStartEvent
+  | ReasoningMessageContentEvent
+  | ReasoningMessageEndEvent
+  | ReasoningEndEvent
   | ToolCallStartEvent
   | ToolCallArgsEvent
   | ToolCallEndEvent
@@ -192,6 +202,33 @@ export const textMessageEnd = (messageId: string): TextMessageEndEvent => ({
   messageId,
 });
 
+export const reasoningStart = (messageId: string): ReasoningStartEvent => ({
+  type: "REASONING_START",
+  messageId,
+});
+
+export const reasoningMessageStart = (messageId: string): ReasoningMessageStartEvent => ({
+  type: "REASONING_MESSAGE_START",
+  messageId,
+  role: "reasoning",
+});
+
+export const reasoningMessageContent = (messageId: string, delta: string): ReasoningMessageContentEvent => ({
+  type: "REASONING_MESSAGE_CONTENT",
+  messageId,
+  delta,
+});
+
+export const reasoningMessageEnd = (messageId: string): ReasoningMessageEndEvent => ({
+  type: "REASONING_MESSAGE_END",
+  messageId,
+});
+
+export const reasoningEnd = (messageId: string): ReasoningEndEvent => ({
+  type: "REASONING_END",
+  messageId,
+});
+
 export const toolCallStart = (
   toolCallId: string,
   toolCallName: string,
@@ -227,12 +264,27 @@ export const toolCallResult = (messageId: string, toolCallId: string, content: s
 // -----------------------------------------------------------------------------
 
 /**
- * Projects a run's `Agent.Event`s onto AG-UI: `RUN_STARTED`, then text
- * messages, tool calls and results inside `STEP_STARTED` / `STEP_FINISHED`,
- * ending with `RUN_FINISHED` (success, with `pendingToolCallIds` naming the
- * frontend calls left to the client, or the approval interrupt) or
- * `RUN_ERROR`. A frontend call gets no `TOOL_CALL_RESULT`. Spans still open when a step ends or the run fails are closed,
- * so the sequence is always valid AG-UI.
+ * The message id of a step's `n`th reasoning block, counted from 0 among the
+ * step's blocks, with or without text. Derived rather than minted, so `fold`
+ * and `History.restore` agree with nothing stored for it. Treat the format as
+ * opaque.
+ *
+ * @internal
+ */
+export const reasoningMessageId = (stepMessageId: string, n: number): string => `${stepMessageId}:reasoning:${n}`;
+
+/**
+ * Projects a run's `Agent.Event`s onto AG-UI: `RUN_STARTED`, then reasoning,
+ * text messages, tool calls and results inside `STEP_STARTED` /
+ * `STEP_FINISHED`, ending with `RUN_FINISHED` (success, with
+ * `pendingToolCallIds` naming the frontend calls left to the client, or the
+ * approval interrupt) or `RUN_ERROR`. A frontend call gets no
+ * `TOOL_CALL_RESULT`. Spans still open when a step ends or the run fails are
+ * closed, so the sequence is always valid AG-UI.
+ *
+ * Each reasoning block with text is one `REASONING_START` span holding one
+ * reasoning message, both under {@link reasoningMessageId}. Only its text is
+ * sent: provider metadata such as a signature stays on the stored part.
  *
  * Replayed events are dropped: they were already published by the attempt
  * that executed them.
@@ -309,12 +361,15 @@ export const fold =
 const stepName = (step: number) => `step-${step}`;
 
 /**
- * Events that close every text message, tool call and step left open in
- * `history`, e.g. by an attempt of the run that crashed. Empty when nothing is
- * open.
+ * Events that close every text message, reasoning message, reasoning span,
+ * tool call and step left open in `history`, e.g. by an attempt of the run that
+ * crashed. Empty when nothing is open.
  */
 export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
   const text = new Set<string>();
+  // Tracked apart, because a log can stop between a block's two starts.
+  const reasoningMessages = new Set<string>();
+  const reasoningSpans = new Set<string>();
   const tools = new Set<string>();
   const steps = new Set<string>();
   for (const event of history) {
@@ -324,6 +379,18 @@ export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
         break;
       case "TEXT_MESSAGE_END":
         text.delete(event.messageId);
+        break;
+      case "REASONING_START":
+        reasoningSpans.add(event.messageId);
+        break;
+      case "REASONING_END":
+        reasoningSpans.delete(event.messageId);
+        break;
+      case "REASONING_MESSAGE_START":
+        reasoningMessages.add(event.messageId);
+        break;
+      case "REASONING_MESSAGE_END":
+        reasoningMessages.delete(event.messageId);
         break;
       case "TOOL_CALL_START":
         tools.add(event.toolCallId);
@@ -339,20 +406,50 @@ export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
         break;
     }
   }
-  return [...[...text].map(textMessageEnd), ...[...tools].map(toolCallEnd), ...[...steps].map(stepFinished)];
+  return [
+    ...[...text].map(textMessageEnd),
+    ...[...reasoningSpans].flatMap((id) => (reasoningMessages.has(id) ? closeReasoning(id) : [reasoningEnd(id)])),
+    ...[...tools].map(toolCallEnd),
+    ...[...steps].map(stepFinished),
+  ];
 };
+
+const openReasoning = (messageId: string): Array<Event> => [
+  reasoningStart(messageId),
+  reasoningMessageStart(messageId),
+];
+
+const closeReasoning = (messageId: string): Array<Event> => [reasoningMessageEnd(messageId), reasoningEnd(messageId)];
+
+/** A reasoning block that has started and not ended. */
+interface ReasoningBlock {
+  readonly messageId: string;
+  /** Whether its span was emitted, which waits for its first text. */
+  opened: boolean;
+}
 
 // Provider part ids are only meaningful inside one model stream (Anthropic, for
 // example, uses the content block index), so they are used purely to track
-// which spans are open. Every AG-UI message id is the step's message id.
+// which spans are open. Every AG-UI message id is the step's message id, or
+// derived from it.
 class StepState {
   readonly openText = new Set<string>();
+  readonly openBlocks = new Map<string, ReasoningBlock>();
   readonly openTools = new Set<string>();
   readonly seenTools = new Set<string>();
   readonly messageId: string;
+  private reasoningBlocks = 0;
 
   constructor(messageId: string) {
     this.messageId = messageId;
+  }
+
+  /**
+   * The id of the step's next reasoning block. A block with no text takes one
+   * too, because `History.restore` counts it among the stored parts.
+   */
+  nextReasoningId(): string {
+    return reasoningMessageId(this.messageId, this.reasoningBlocks++);
   }
 
   /** Closes every span still open, e.g. at step end or when the run fails. */
@@ -362,6 +459,12 @@ class StepState {
       this.openText.clear();
       events.push(textMessageEnd(this.messageId));
     }
+    for (const block of this.openBlocks.values()) {
+      if (block.opened) {
+        events.push(...closeReasoning(block.messageId));
+      }
+    }
+    this.openBlocks.clear();
     for (const id of this.openTools) {
       events.push(toolCallEnd(id));
     }
@@ -371,8 +474,9 @@ class StepState {
 }
 
 const handlePart = (state: StepState, anyPart: Response.AnyPart): ReadonlyArray<Event> => {
-  // `AnyPart` is the union of every part type, encoded and decoded.
-  const part = anyPart as Response.StreamPart<Record<string, Tool.Any>>;
+  // `AnyPart` is the union of every part type, encoded and decoded. A whole
+  // `reasoning` part isn't a stream part, but `ModelPart` may carry one.
+  const part = anyPart as Response.StreamPart<Record<string, Tool.Any>> | Response.ReasoningPart;
   switch (part.type) {
     case "text-start": {
       const events = state.openText.size === 0 ? [textMessageStart(state.messageId)] : [];
@@ -393,6 +497,34 @@ const handlePart = (state: StepState, anyPart: Response.AnyPart): ReadonlyArray<
     case "text-end": {
       const closed = state.openText.delete(part.id) && state.openText.size === 0;
       return closed ? [textMessageEnd(state.messageId)] : [];
+    }
+    case "reasoning-start": {
+      // A provider that reuses an open part id replaces the block, as the store does.
+      const replaced = state.openBlocks.get(part.id);
+      state.openBlocks.set(part.id, { messageId: state.nextReasoningId(), opened: false });
+      return replaced?.opened === true ? closeReasoning(replaced.messageId) : [];
+    }
+    case "reasoning-delta": {
+      // The store ignores a delta with no start, so showing it would show what `restore` can't return.
+      const block = state.openBlocks.get(part.id);
+      if (block === undefined || part.delta.length === 0) {
+        return [];
+      }
+      const events = block.opened ? [] : openReasoning(block.messageId);
+      block.opened = true;
+      events.push(reasoningMessageContent(block.messageId, part.delta));
+      return events;
+    }
+    case "reasoning-end": {
+      const block = state.openBlocks.get(part.id);
+      state.openBlocks.delete(part.id);
+      return block?.opened === true ? closeReasoning(block.messageId) : [];
+    }
+    case "reasoning": {
+      const messageId = state.nextReasoningId();
+      return part.text.length === 0
+        ? []
+        : [...openReasoning(messageId), reasoningMessageContent(messageId, part.text), ...closeReasoning(messageId)];
     }
     case "tool-params-start": {
       state.seenTools.add(part.id);

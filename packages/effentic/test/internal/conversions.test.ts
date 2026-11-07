@@ -46,6 +46,19 @@ const assistantText = (id: string, text: string): Messages.Entry => ({
   message: Prompt.makeMessage("assistant", { content: [Prompt.makePart("text", { text })] }),
 });
 
+/** An assistant entry of reasoning blocks, each with a signature, and text if `reply` is given. */
+const assistantReasoning = (id: string, blocks: ReadonlyArray<string>, reply?: string): Messages.Entry => ({
+  id,
+  message: Prompt.makeMessage("assistant", {
+    content: [
+      ...blocks.map((text) =>
+        Prompt.makePart("reasoning", { text, options: { anthropic: { signature: `sig-${id}` } } }),
+      ),
+      ...(reply === undefined ? [] : [Prompt.makePart("text", { text: reply })]),
+    ],
+  }),
+});
+
 const assistantEmpty = (id: string): Messages.Entry => ({
   id,
   message: Prompt.makeMessage("assistant", { content: [] }),
@@ -174,6 +187,38 @@ describe("delta", () => {
     expect(Conversions.delta(thread, client)).toEqual(Result.succeed([u3]));
   });
 
+  describe("reasoning", () => {
+    const u2 = clientMessage("u2", "user", "Thanks");
+    const stored = [user("u1", "Hi"), assistantReasoning("m1", ["Thinking"], "Hello")];
+
+    it("needs no reasoning rows from the client", () => {
+      const client = [clientMessage("u1", "user", "Hi"), clientMessage("m1", "assistant", "Hello"), u2];
+      expect(Conversions.delta(stored, client)).toEqual(Result.succeed([u2]));
+    });
+
+    it("treats reasoning rows as unknown, so they neither anchor nor match", () => {
+      const row = clientMessage(AgUi.reasoningMessageId("m1", 0), "reasoning", "Thinking");
+      const client = [clientMessage("u1", "user", "Hi"), row, clientMessage("m1", "assistant", "Hello"), u2];
+      expect(Conversions.delta(stored, client)).toEqual(Result.succeed([u2]));
+      expect(Conversions.delta(stored, [row, u2])).toEqual(Result.fail(new Conversions.HistoryMismatch()));
+    });
+
+    it("does not check an entry holding only reasoning", () => {
+      const thread = [user("u1", "Hi"), assistantReasoning("m1", ["Thinking"])];
+      expect(Conversions.delta(thread, [clientMessage("u1", "user", "Hi"), u2])).toEqual(Result.succeed([u2]));
+    });
+
+    it("still checks an entry with text after its reasoning", () => {
+      expect(Conversions.delta(stored, [clientMessage("u1", "user", "Hi"), u2])).toEqual(
+        Result.fail(new Conversions.HistoryDiverged()),
+      );
+    });
+
+    it("commits no reasoning row a client sends as new", () => {
+      expect(Conversions.ingest([clientMessage("x", "reasoning", "Thinking")])).toEqual([]);
+    });
+  });
+
   it("accepts a tool result the client placed before a later message", () => {
     const stored = [
       user("u1", "Email Ada"),
@@ -249,7 +294,7 @@ describe("restore", () => {
         message: Prompt.makeMessage("assistant", {
           content: [
             Prompt.makePart("text", { text: "Let me " }),
-            Prompt.makePart("reasoning", { text: "hidden" }),
+            Prompt.makePart("reasoning", { text: "Thinking" }),
             Prompt.makePart("text", { text: "check." }),
             Prompt.makePart("tool-call", {
               id: "c1",
@@ -266,6 +311,8 @@ describe("restore", () => {
     expect(Conversions.restore(entries)).toEqual({
       messages: [
         { id: "u1", role: "user", content: "Weather?" },
+        // Ahead of the text it followed: an assistant message has one `content`.
+        { id: AgUi.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
         {
           id: "m1",
           role: "assistant",
@@ -279,6 +326,42 @@ describe("restore", () => {
       ],
       interrupts: undefined,
     });
+  });
+
+  it("returns each block with text in order, numbered among all the entry's blocks", () => {
+    expect(Conversions.restore([assistantReasoning("m1", ["", "First", "", "Second"], "Hi")]).messages).toEqual([
+      { id: AgUi.reasoningMessageId("m1", 1), role: "reasoning", content: "First" },
+      { id: AgUi.reasoningMessageId("m1", 3), role: "reasoning", content: "Second" },
+      { id: "m1", role: "assistant", content: "Hi" },
+    ]);
+  });
+
+  it("returns an entry holding only reasoning with no assistant message", () => {
+    expect(Conversions.restore([assistantReasoning("m1", ["Thinking"])]).messages).toEqual([
+      { id: AgUi.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
+    ]);
+  });
+
+  it("returns nothing for an entry whose only block has no text", () => {
+    expect(Conversions.restore([assistantReasoning("m1", [""])]).messages).toEqual([]);
+  });
+
+  it("keeps a tool result after its call when the call's entry has reasoning", () => {
+    const { content } = assistantCall("m1", "c1").message as Prompt.AssistantMessage;
+    const entries = [
+      {
+        id: "m1",
+        message: Prompt.makeMessage("assistant", {
+          content: [Prompt.makePart("reasoning", { text: "Thinking" }), ...content],
+        }),
+      },
+      toolResult("t1", "c1", 1),
+    ];
+    expect(Conversions.restore(entries).messages.map((message) => message.id)).toEqual([
+      AgUi.reasoningMessageId("m1", 0),
+      "m1",
+      "t1",
+    ]);
   });
 
   it("moves a tool result directly after its call", () => {

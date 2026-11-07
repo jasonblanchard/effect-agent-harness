@@ -7,7 +7,6 @@ export {
   HistoryDiverged,
   HistoryMismatch,
   type Restored,
-  type ShownMessage,
   UnansweredInterrupt,
   UnansweredToolCall,
 } from "./internal/conversions.ts";
@@ -99,12 +98,17 @@ export const layerServer: Layer.Layer<History, never, Thread.Thread> = Layer.eff
  * client that sends the messages back, with new user messages after them, is
  * matched against the store as if it had streamed them.
  *
- * Messages are in commit order, with each tool result moved directly after
- * the assistant message holding its call. Ids and content are the events':
- * an assistant message's text is its segments joined, and a tool result is
- * its `TOOL_CALL_RESULT` content. Tool call arguments are re-encoded, so their
- * formatting may differ from the streamed deltas. System entries, approval
- * responses and reasoning are not returned.
+ * Messages are AG-UI's own type, in commit order, with each tool result moved
+ * directly after the assistant message holding its call. An entry's reasoning
+ * comes directly before its assistant message, even a block the model produced
+ * after text, and a reasoning block with no text is skipped. Ids and content
+ * are the events': an assistant message's text is its segments joined, a
+ * reasoning message's is its deltas joined, and a tool result is its
+ * `TOOL_CALL_RESULT` content. Tool call arguments are re-encoded, so their
+ * formatting may differ from the streamed deltas. System entries and approval
+ * responses are not returned, and neither is provider metadata such as a
+ * reasoning signature. A client may send `reasoning` messages back or drop
+ * them: they are never committed, and neither choice is a mismatch.
  */
 export const restore = (threadId: string): Effect.Effect<Conversions.Restored, Thread.ThreadError, Thread.Thread> =>
   Effect.map(

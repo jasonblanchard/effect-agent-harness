@@ -1,4 +1,4 @@
-import type { AssistantMessage, Interrupt, ToolMessage, UserMessage } from "../AgUiSchema.ts";
+import type { Interrupt, Message, ReasoningMessage } from "../AgUiSchema.ts";
 import { Option, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import * as Agent from "../Agent.ts";
@@ -54,7 +54,9 @@ export class HistoryDiverged extends Schema.TaggedError<HistoryDiverged, { reado
  * no known message, the client is on a different history (`HistoryMismatch`).
  * If a stored entry after the last known one would be shown by {@link restore}
  * and no client message matches it, the client is missing part of the thread
- * (`HistoryDiverged`). Entries committed by `runId` itself don't count: a run
+ * (`HistoryDiverged`). Reasoning plays no part: a client may keep or drop its
+ * rows, whose ids match no entry, and an entry holding only reasoning need not
+ * be matched. Entries committed by `runId` itself don't count: a run
  * executed again after a crash meets the steps its earlier attempt committed,
  * which its input could not hold.
  */
@@ -527,16 +529,10 @@ const parseObject = (text: string): Record<string, unknown> | undefined => {
 // Reading a thread back
 // -----------------------------------------------------------------------------
 
-/** A message `History.restore` returns. User and tool content is always a string. */
-export type ShownMessage =
-  | (UserMessage & { readonly content: string })
-  | AssistantMessage
-  | (ToolMessage & { readonly content: string });
-
 /** A thread as a client restores it. See `History.restore`. */
 export interface Restored {
   /** The messages the thread's runs showed, as their events showed them. */
-  readonly messages: ReadonlyArray<ShownMessage>;
+  readonly messages: ReadonlyArray<Message>;
   /**
    * The approval requests still waiting for an answer, as the `RUN_FINISHED`
    * that raised them carried them, and the run that raised them (`undefined`
@@ -558,9 +554,14 @@ export interface Restored {
  * The message a client was shown for an entry, with the id and content the
  * run's events gave it, or `undefined` if the events showed none: system
  * entries, approval responses, and assistant entries with neither text nor
- * tool calls. Reasoning is dropped, as the events drop it.
+ * tool calls.
+ *
+ * This is also {@link delta}'s rule for what a client must hold, so reasoning
+ * stays outside it, in {@link reasoningOf}. An entry holding only reasoning
+ * would otherwise have to be matched, and a client can't match it: its rows
+ * carry their blocks' ids, not the entry's.
  */
-const shown = (entry: Entry): ShownMessage | undefined => {
+const shown = (entry: Entry): Message | undefined => {
   const { id, message } = entry;
   switch (message.role) {
     case "user": {
@@ -603,20 +604,39 @@ const shown = (entry: Entry): ShownMessage | undefined => {
 };
 
 /**
+ * The `reasoning` messages of an entry, with the id and text its events gave
+ * them. A block with no text showed nothing, but still counts towards the ids
+ * of the blocks after it. Provider options are never read.
+ */
+const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
+  message.role === "assistant"
+    ? message.content
+        .filter((part) => part.type === "reasoning")
+        .flatMap((part, n) =>
+          part.text.length === 0
+            ? []
+            : [{ id: AgUi.reasoningMessageId(id, n), role: "reasoning" as const, content: part.text }],
+        )
+    : [];
+
+/**
  * The thread's loaded entries as its runs' events showed them, with its open
  * interrupts and pending frontend calls. Public as `History.restore`, which
  * loads the thread first and documents what callers rely on.
  *
  * Messages are in commit order, with each tool result moved directly after
- * the assistant message holding its call. Ids and content are the events':
- * an assistant message's text is its segments joined, and a tool result is
- * its `TOOL_CALL_RESULT` content. Tool call arguments are re-encoded, so their
- * formatting may differ from the streamed deltas.
+ * the assistant message holding its call, and an entry's reasoning directly
+ * before its assistant message: that message has one `content`, so its text
+ * can't be split around a block. Ids and content are the events': an assistant
+ * message's text is its segments joined, a reasoning message's is its deltas
+ * joined, and a tool result is its `TOOL_CALL_RESULT` content. Tool call
+ * arguments are re-encoded, so their formatting may differ from the streamed
+ * deltas.
  */
 export const restore = (entries: ReadonlyArray<Entry>): Restored => {
-  const messages = entries.flatMap((entry) => {
+  const messages = entries.flatMap((entry): ReadonlyArray<Message> => {
     const message = shown(entry);
-    return message === undefined ? [] : [message];
+    return message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
   });
   // Each tool result goes after the assistant message holding its call.
   const caller = new Map<string, string>();
@@ -627,8 +647,8 @@ export const restore = (entries: ReadonlyArray<Entry>): Restored => {
       }
     }
   }
-  const results = new Map<string, Array<ShownMessage>>();
-  const rest: Array<ShownMessage> = [];
+  const results = new Map<string, Array<Message>>();
+  const rest: Array<Message> = [];
   for (const message of messages) {
     const owner = message.role === "tool" ? caller.get(message.toolCallId) : undefined;
     if (owner === undefined) {

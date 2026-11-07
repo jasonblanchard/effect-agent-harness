@@ -132,6 +132,13 @@ function Message({ message }: { readonly message: UIMessage }) {
         switch (part.type) {
           case "text":
             return <p key={index}>{part.content}</p>;
+          case "thinking":
+            return (
+              <details key={index} className="tool">
+                <summary>💭 Reasoning</summary>
+                <p>{part.content}</p>
+              </details>
+            );
           case "tool-call":
             return (
               <details key={part.id} className="tool">

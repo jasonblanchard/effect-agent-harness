@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit, Stream } from "effect";
 import { AiError, Prompt } from "effect/ai";
+import type { Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
 import {
@@ -10,11 +11,14 @@ import {
   finish,
   GetLocation,
   PickFile,
+  reasoning,
   scriptedModel,
+  signature,
   type Step,
   text,
   toolCall,
   verify,
+  wholeReasoning,
 } from "./fixtures.ts";
 
 describe("AgUi.RunAgentInput", () => {
@@ -447,6 +451,207 @@ describe("AgUi.fold", () => {
   );
 });
 
+describe("AgUi.fold reasoning", () => {
+  const block = (messageId: string, ...deltas: ReadonlyArray<string>): ReadonlyArray<AgUi.Event> => [
+    AgUi.reasoningStart(messageId),
+    AgUi.reasoningMessageStart(messageId),
+    ...deltas.map((delta) => AgUi.reasoningMessageContent(messageId, delta)),
+    AgUi.reasoningMessageEnd(messageId),
+    AgUi.reasoningEnd(messageId),
+  ];
+  const first = AgUi.reasoningMessageId("id-1", 0);
+  const second = AgUi.reasoningMessageId("id-1", 1);
+
+  /** The events of one step's parts, without the run and step events around them. */
+  const stepEvents = (events: ReadonlyArray<AgUi.Event>) => events.slice(2, -2);
+
+  it.effect("streams a reasoning block before the reply, span and message sharing an id", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([[...reasoning("0", ["Let", " me think"]), ...text("1", "Hi"), finish("stop")]]);
+      expect(stepEvents(events)).toEqual([
+        { type: "REASONING_START", messageId: first },
+        { type: "REASONING_MESSAGE_START", messageId: first, role: "reasoning" },
+        { type: "REASONING_MESSAGE_CONTENT", messageId: first, delta: "Let" },
+        { type: "REASONING_MESSAGE_CONTENT", messageId: first, delta: " me think" },
+        { type: "REASONING_MESSAGE_END", messageId: first },
+        { type: "REASONING_END", messageId: first },
+        AgUi.textMessageStart("id-1"),
+        AgUi.textMessageContent("id-1", "Hi"),
+        AgUi.textMessageEnd("id-1"),
+      ]);
+    }),
+  );
+
+  it.effect("emits a block delivered whole with one content event", () =>
+    Effect.gen(function* () {
+      const part = (part: Response.AnyPart): Agent.Event => ({
+        _tag: "ModelPart",
+        step: 1,
+        messageId: "m1",
+        part,
+        replayed: false,
+      });
+      const input = { threadId: "t1", runId: "r1" };
+      const events = Array.from(
+        yield* Stream.fromIterable<Agent.Event>([
+          { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
+          // No text, so nothing shows, but it takes its place among the step's blocks.
+          part(wholeReasoning("")),
+          part(wholeReasoning("Done thinking")),
+          { _tag: "StepFinished", step: 1, entries: [], replayed: false },
+          { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
+        ]).pipe(AgUi.fold(input), Stream.runCollect),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(stepEvents(events)).toEqual(block(AgUi.reasoningMessageId("m1", 1), "Done thinking"));
+    }),
+  );
+
+  it.effect("emits nothing for a block with no text, and never a signature", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [
+          ...reasoning("0", [], signature("sig-redacted")),
+          ...reasoning("1", ["", "Thinking"], signature("sig-signed")),
+          ...text("2", "Hi"),
+          finish("stop"),
+        ],
+      ]);
+      expect(stepEvents(events).slice(0, 5)).toEqual(block(second, "Thinking"));
+      expect(JSON.stringify(events)).not.toContain("sig-");
+    }),
+  );
+
+  it.effect("ignores a delta for a block that never started, as the store does", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([[{ type: "reasoning-delta", id: "9", delta: "stray" }, finish("stop")]]);
+      expect(types(events).filter((type) => type.startsWith("REASONING"))).toEqual([]);
+    }),
+  );
+
+  it.effect("gives each block its own id, with text between them", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [...reasoning("0", ["a"]), ...text("1", "Hi"), ...reasoning("2", ["b"]), finish("stop")],
+      ]);
+      expect(stepEvents(events)).toEqual([
+        ...block(first, "a"),
+        AgUi.textMessageStart("id-1"),
+        AgUi.textMessageContent("id-1", "Hi"),
+        AgUi.textMessageEnd("id-1"),
+        ...block(second, "b"),
+      ]);
+      expect(first).not.toBe(second);
+      expect([first, second]).not.toContain("id-1");
+    }),
+  );
+
+  it.effect("numbers blocks from 0 in each step", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [...reasoning("0", ["a"]), ...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...reasoning("0", ["b"]), ...text("1", "18°C"), finish("stop")],
+      ]);
+      expect(events.flatMap((e) => (e.type === "REASONING_START" ? [e.messageId] : []))).toEqual([
+        first,
+        AgUi.reasoningMessageId("id-3", 0),
+      ]);
+    }),
+  );
+
+  it.effect("keeps blocks that overlap apart", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [
+          { type: "reasoning-start", id: "0" },
+          { type: "reasoning-start", id: "1" },
+          { type: "reasoning-delta", id: "0", delta: "a" },
+          { type: "reasoning-delta", id: "1", delta: "b" },
+          { type: "reasoning-end", id: "0" },
+          { type: "reasoning-end", id: "1" },
+          finish("stop"),
+        ],
+      ]);
+      expect(events.flatMap((e) => (e.type === "REASONING_MESSAGE_CONTENT" ? [[e.messageId, e.delta]] : []))).toEqual([
+        [first, "a"],
+        [second, "b"],
+      ]);
+    }),
+  );
+
+  it.effect("closes a block whose part id is started again", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([[...reasoning("0", ["a"]).slice(0, 2), ...reasoning("0", ["b"]), finish("stop")]]);
+      expect(stepEvents(events)).toEqual([...block(first, "a"), ...block(second, "b")]);
+    }),
+  );
+
+  it.effect("closes open reasoning before RUN_ERROR when the model fails", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        Stream.fromIterable(reasoning("0", ["partial"]).slice(0, 2)).pipe(Stream.concat(Stream.fail(modelFailure))),
+      ]);
+      expect(types(events)).toEqual([
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "REASONING_START",
+        "REASONING_MESSAGE_START",
+        "REASONING_MESSAGE_CONTENT",
+        "REASONING_MESSAGE_END",
+        "REASONING_END",
+        "RUN_ERROR",
+      ]);
+    }),
+  );
+
+  it.effect("closes reasoning the model never ended before STEP_FINISHED", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([[...reasoning("0", ["hmm"]).slice(0, 2), finish("stop")]]);
+      expect(types(events)).toEqual([
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "REASONING_START",
+        "REASONING_MESSAGE_START",
+        "REASONING_MESSAGE_CONTENT",
+        "REASONING_MESSAGE_END",
+        "REASONING_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
+      ]);
+    }),
+  );
+
+  it.effect("closes open text, then reasoning, then tool calls", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [
+          ...text("0", "partial").slice(0, 2),
+          ...reasoning("1", ["hmm"]).slice(0, 2),
+          { type: "tool-params-start", id: "toolu_1", name: "get-weather" },
+          { type: "error", error: { message: "overloaded" } },
+        ],
+      ]);
+      expect(types(events).slice(-5)).toEqual([
+        "TEXT_MESSAGE_END",
+        "REASONING_MESSAGE_END",
+        "REASONING_END",
+        "TOOL_CALL_END",
+        "RUN_ERROR",
+      ]);
+    }),
+  );
+
+  it.effect("emits no reasoning for a model that produces none", () =>
+    Effect.gen(function* () {
+      const events = yield* foldRun([
+        [...text("0", "Let me check."), ...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
+        [...text("0", "18°C"), finish("stop")],
+      ]);
+      expect(types(events).filter((type) => type.startsWith("REASONING"))).toEqual([]);
+    }),
+  );
+});
+
 describe("AgUi.closeOpen", () => {
   it("closes the spans an aborted attempt left open", async () => {
     const input = { threadId: "t1", runId: "r1" };
@@ -461,5 +666,51 @@ describe("AgUi.closeOpen", () => {
     expect(closers).toEqual([AgUi.textMessageEnd("m1"), AgUi.toolCallEnd("c1"), AgUi.stepFinished("step-1")]);
     await verify([...history, ...closers, AgUi.runFinished(input)]);
     expect(AgUi.closeOpen([...history, ...closers])).toEqual([]);
+  });
+
+  it("closes a reasoning message and its span, after text and before tool calls", async () => {
+    const input = { threadId: "t1", runId: "r1" };
+    const history: Array<AgUi.Event> = [
+      AgUi.runStarted(input),
+      AgUi.stepStarted("step-1"),
+      AgUi.textMessageStart("m1"),
+      AgUi.reasoningStart("b1"),
+      AgUi.reasoningMessageStart("b1"),
+      AgUi.reasoningMessageContent("b1", "a"),
+      AgUi.toolCallStart("c1", "get-weather", "m1"),
+    ];
+    const closers = AgUi.closeOpen(history);
+    expect(closers).toEqual([
+      AgUi.textMessageEnd("m1"),
+      AgUi.reasoningMessageEnd("b1"),
+      AgUi.reasoningEnd("b1"),
+      AgUi.toolCallEnd("c1"),
+      AgUi.stepFinished("step-1"),
+    ]);
+    await verify([...history, ...closers, AgUi.runFinished(input)]);
+    expect(AgUi.closeOpen([...history, ...closers])).toEqual([]);
+  });
+
+  it("closes only the span of a log that stops between a block's two starts", async () => {
+    const input = { threadId: "t1", runId: "r1" };
+    const history: Array<AgUi.Event> = [AgUi.runStarted(input), AgUi.stepStarted("step-1"), AgUi.reasoningStart("b1")];
+    const closers = AgUi.closeOpen(history);
+    expect(closers).toEqual([AgUi.reasoningEnd("b1"), AgUi.stepFinished("step-1")]);
+    await verify([...history, ...closers, AgUi.runFinished(input)]);
+  });
+
+  it("closes only the span of a log that stops between a block's two ends", async () => {
+    const input = { threadId: "t1", runId: "r1" };
+    const history: Array<AgUi.Event> = [
+      AgUi.runStarted(input),
+      AgUi.stepStarted("step-1"),
+      AgUi.reasoningStart("b1"),
+      AgUi.reasoningMessageStart("b1"),
+      AgUi.reasoningMessageContent("b1", "a"),
+      AgUi.reasoningMessageEnd("b1"),
+    ];
+    const closers = AgUi.closeOpen(history);
+    expect(closers).toEqual([AgUi.reasoningEnd("b1"), AgUi.stepFinished("step-1")]);
+    await verify([...history, ...closers, AgUi.runFinished(input)]);
   });
 });

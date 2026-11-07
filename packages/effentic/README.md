@@ -184,7 +184,7 @@ None of them requires a thread store: a run's history is optional, and `History.
 Guarantees for every runner:
 
 - **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, an error from the per-run layer, a provider error such as `RateLimitError`, …).
-- **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, tool calls and steps are always closed, including when a run fails mid-message.
+- **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, reasoning, tool calls and steps are always closed, including when a run fails mid-message.
 
 What a client sees for a tool-using reply:
 
@@ -210,6 +210,24 @@ Runner.run(agent, { clientSystem: "allow" }); // default "drop"
 ```
 
 `clientSystem` controls `system` / `developer` messages sent by the client, under either history. By default they are dropped, so only your `system` prompt instructs the model.
+
+### Reasoning
+
+Each reasoning block a model step produces streams as one span holding one message, before or between the step's text: `REASONING_START`, `REASONING_MESSAGE_START`, `REASONING_MESSAGE_CONTENT`…, `REASONING_MESSAGE_END`, `REASONING_END`, all under the block's own `messageId`. That id is stable, so [`History.restore`](#reloading-a-thread) returns the block under the same id. Treat its format as opaque.
+
+effentic has no option for this. Reasoning appears when the model produces it, so you enable it in the provider layer:
+
+```ts
+// Without `display`, the Anthropic API returns thinking blocks with no text, so nothing streams.
+// @effect/ai-anthropic's type doesn't declare it yet, hence the separate constant.
+const thinking = { type: "adaptive", display: "summarized" } as const;
+
+const ModelLayer = AnthropicLanguageModel.layer({ model: "claude-haiku-5-5", config: { thinking } });
+```
+
+Once enabled, reasoning reaches **every client**, on the stream and through `restore`, and it can hold content you wouldn't show users. To hide it, leave it off in the model layer, or filter the `REASONING_*` events by mapping the stream.
+
+Only a block's text is sent. Provider metadata such as a signature stays on the stored parts, so the model still gets its reasoning back on later steps and runs under the server history, but no event carries it (`REASONING_ENCRYPTED_VALUE` isn't emitted). A block with no text, such as a redacted one, emits nothing. Under the client history, the client's `reasoning` messages are dropped, so reasoning doesn't return to the model between runs.
 
 ### Run info
 
@@ -307,12 +325,12 @@ A reloaded page, or another device, has no history to send. Its first run would 
 
 ```ts
 const { messages, interrupts, pendingToolCalls } = yield * History.restore(threadId);
-// messages: the AG-UI user, assistant and tool messages, with the ids and content the events carried
+// messages: AG-UI messages (user, reasoning, assistant, tool), with the ids and content the events carried
 // interrupts: { runId, pending } for approvals still open (as RUN_FINISHED carried them), or undefined
 // pendingToolCalls: { runId, toolCallIds } for frontend calls still waiting for a result, or undefined
 ```
 
-The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, answers each of `interrupts.pending` with a `resume` entry in its next run, and each of `pendingToolCalls.toolCallIds` with a `tool` message. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. System entries, approval responses and reasoning are not returned; tool results come directly after their calls. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
+The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, answers each of `interrupts.pending` with a `resume` entry in its next run, and each of `pendingToolCalls.toolCallIds` with a `tool` message. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. `messages` is AG-UI's own `Message` type, so adapt it if your client has its own, and don't assume `content` is a string. System entries and approval responses are not returned. Tool results come directly after their calls, and a step's `reasoning` messages come directly before its assistant message, even a block the model produced after its text, because that message has one `content`. A client may send `reasoning` messages back or drop them: they are never committed, and neither choice causes `HistoryMismatch` or `HistoryDiverged`. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
 
 TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effentic rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
@@ -680,14 +698,14 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effentic"` as namespaces.
 
-| Module       | Main exports                                                                                                                                                                                                              |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError`          |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                            |
-| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                       |
-| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`, `ShownMessage`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections |
-| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                        |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                   |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                     |
-| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompt                                                               |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                        |
+| Module       | Main exports                                                                                                                                                                                                     |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError` |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                   |
+| `Runner`     | `run`, `makeDetached`, `workflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                              |
+| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections        |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                               |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                          |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                            |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompt                                                      |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                               |

@@ -4,7 +4,7 @@ import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
-import type * as AgUi from "../src/AgUi.ts";
+import * as AgUi from "../src/AgUi.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as History from "../src/History.ts";
@@ -19,10 +19,12 @@ import {
   evalLayers,
   finish,
   PickFile,
+  reasoning,
   runAgUi,
   scriptedModel,
   serverHistory,
   serverStores,
+  signature,
   type Step,
   text,
   toolAnswer,
@@ -40,6 +42,12 @@ const input = (runId: string, messages: ReadonlyArray<AgUi.Message>, resume?: Ag
 const userMessage = (id: string, content: string): AgUi.Message => ({ id, role: "user", content });
 
 const types = (events: ReadonlyArray<AgUi.Event>) => events.map((event) => event.type);
+
+/** The reasoning parts of every assistant message in `prompt`. */
+const reasoningParts = (prompt: Prompt.Prompt) =>
+  prompt.content.flatMap((message) =>
+    message.role === "assistant" ? message.content.filter((part) => part.type === "reasoning") : [],
+  );
 
 const partTypes = (prompt: Prompt.Prompt) =>
   prompt.content.flatMap((message) =>
@@ -855,6 +863,164 @@ describe("Runner thread history", () => {
     }),
   );
 
+  describe("reasoning", () => {
+    const reasonedStep: Step = [
+      ...reasoning("0", ["Let", " me think"], signature("sig-1")),
+      ...text("1", "Hi"),
+      finish("stop"),
+    ];
+    const followUp: Step = [...text("0", "OK"), finish("stop")];
+
+    /** The events and the read of a first run on `steps`, then a second run on the messages `next` returns. */
+    const reload = (
+      steps: ReadonlyArray<Step>,
+      next: (messages: ReadonlyArray<AgUi.Message>) => ReadonlyArray<AgUi.Message>,
+    ) =>
+      Effect.gen(function* () {
+        const spy = spyThread();
+        const model = scriptedModel([...steps, followUp]);
+        const result = yield* Effect.gen(function* () {
+          const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Hi")])]);
+          const { messages } = yield* read;
+          const [second] = yield* runAgUi(weatherAgent, [input("r2", next(messages))]);
+          return { events: events!, messages, second: second! };
+        }).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]));
+        return { ...result, commits: spy.log.filter((line) => line.startsWith("commit r2")), prompts: model.prompts };
+      });
+
+    const reasoningIds = (events: ReadonlyArray<AgUi.Event>) =>
+      events.flatMap((e) => (e.type === "REASONING_START" ? [e.messageId] : []));
+
+    it.effect("reads reasoning back under its events' ids, with its deltas joined", () =>
+      Effect.gen(function* () {
+        const { events, messages } = yield* reload([reasonedStep], (messages) => [
+          ...messages,
+          userMessage("u2", "Next"),
+        ]);
+        const deltas = events.flatMap((e) => (e.type === "REASONING_MESSAGE_CONTENT" ? [e.delta] : []));
+        const ids = reasoningIds(events);
+        expect(ids).toHaveLength(1);
+        expect(messages).toEqual([
+          { id: "u1", role: "user", content: "Hi" },
+          { id: ids[0], role: "reasoning", content: deltas.join("") },
+          { id: "id-1", role: "assistant", content: "Hi" },
+        ]);
+        expect(messages[1]).toMatchObject({ content: "Let me think" });
+        expect(JSON.stringify(messages)).not.toContain("sig-1");
+      }),
+    );
+
+    it.effect("reads several blocks before their assistant message and its tool result", () =>
+      Effect.gen(function* () {
+        const { events, messages } = yield* reload(
+          [
+            [
+              ...reasoning("0", ["One"]),
+              ...reasoning("1", ["Two"]),
+              ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
+              finish("tool-calls"),
+            ],
+            [...text("0", "18°C"), finish("stop")],
+          ],
+          (messages) => [...messages, userMessage("u2", "Next")],
+        );
+        const [first, second] = reasoningIds(events);
+        expect(messages.map((message) => [message.role, message.id])).toEqual([
+          ["user", "u1"],
+          ["reasoning", first],
+          ["reasoning", second],
+          ["assistant", "id-1"],
+          ["tool", "id-2"],
+          ["assistant", "id-3"],
+        ]);
+      }),
+    );
+
+    it.effect("keeps a later block's id when the block before it has no text", () =>
+      Effect.gen(function* () {
+        const { events, messages } = yield* reload(
+          [
+            [
+              ...reasoning("0", [], signature("sig-1")),
+              ...reasoning("1", ["Thinking"]),
+              ...text("2", "Hi"),
+              finish("stop"),
+            ],
+          ],
+          (messages) => [...messages, userMessage("u2", "Next")],
+        );
+        const ids = reasoningIds(events);
+        expect(ids).toHaveLength(1);
+        expect(messages[1]).toEqual({ id: ids[0], role: "reasoning", content: "Thinking" });
+      }),
+    );
+
+    it.effect("stores a block with no text and sends it back to the model on the next step", () =>
+      Effect.gen(function* () {
+        const model = scriptedModel([
+          [
+            ...reasoning("0", [], signature("sig-redacted")),
+            ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
+            finish("tool-calls"),
+          ],
+          [...text("0", "18°C"), finish("stop")],
+        ]);
+        const [events] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Hi")])]).pipe(
+          Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]),
+        );
+        expect(reasoningIds(events!)).toEqual([]);
+        expect(reasoningParts(model.prompts[1]!)).toMatchObject([{ text: "", options: signature("sig-redacted") }]);
+      }),
+    );
+
+    it.effect("accepts a read history with its reasoning, and the model keeps reasoning and metadata", () =>
+      Effect.gen(function* () {
+        const { second, commits, prompts } = yield* reload([reasonedStep], (messages) => [
+          ...messages,
+          userMessage("u2", "Next"),
+        ]);
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(commits[0]).toBe("commit r2: u2");
+        expect(reasoningParts(prompts[1]!)).toMatchObject([{ text: "Let me think", options: signature("sig-1") }]);
+      }),
+    );
+
+    it.effect("accepts a read history without its reasoning", () =>
+      Effect.gen(function* () {
+        const { second, commits, prompts } = yield* reload([reasonedStep], (messages) => [
+          ...messages.filter((message) => message.role !== "reasoning"),
+          userMessage("u2", "Next"),
+        ]);
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(commits[0]).toBe("commit r2: u2");
+        expect(reasoningParts(prompts[1]!)).toMatchObject([{ text: "Let me think" }]);
+      }),
+    );
+
+    it.effect("accepts a read history ending in a reasoning-only entry", () =>
+      Effect.gen(function* () {
+        const { messages, second, commits } = yield* reload(
+          [[...reasoning("0", ["Only thinking"]), finish("stop")]],
+          (messages) => [...messages, userMessage("u2", "Next")],
+        );
+        expect(messages.map((message) => message.role)).toEqual(["user", "reasoning"]);
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(commits[0]).toBe("commit r2: u2");
+      }),
+    );
+
+    it.effect("does not reject a client whose history ends before a reasoning-only entry", () =>
+      Effect.gen(function* () {
+        const { second, commits } = yield* reload(
+          [[...reasoning("0", ["Only thinking"]), finish("stop")]],
+          (messages) => [...messages.filter((message) => message.role === "user"), userMessage("u2", "Next")],
+        );
+        expect(second.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+        expect(commits[0]).toBe("commit r2: u2");
+      }),
+    );
+  });
+
   it.effect("rejects an edited history before committing or calling the model", () =>
     Effect.gen(function* () {
       const spy = spyThread();
@@ -1128,6 +1294,61 @@ describe("Runner.makeDetached", () => {
       ]);
       expect(after[2]).toEqual({ type: "STEP_STARTED", stepName: "step-2" });
       expect(after[3]).toMatchObject({ messageId: "id-4" });
+      yield* Effect.promise(() => verify([...before.map((s) => s.event), ...after]));
+    }).pipe(Effect.provide(shared())),
+  );
+
+  it.effect("completes an attempt that crashed mid-reasoning without repeating its finished steps", () =>
+    Effect.gen(function* () {
+      const log = yield* EventLog.EventLog;
+      const block = (stepMessageId: string) => `${stepMessageId}:reasoning:0`;
+      const crashed = yield* Scope.make();
+      yield* start(crashed, [
+        [
+          ...reasoning("0", ["Look it up."]),
+          ...toolCall("toolu_1", "get-weather", { location: "Paris" }),
+          finish("tool-calls"),
+        ],
+        Stream.fromIterable(reasoning("0", ["Now"]).slice(0, 2)).pipe(Stream.concat(Stream.never)),
+      ]);
+      yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
+        Stream.takeUntil((s) => s.event.type === "REASONING_MESSAGE_CONTENT" && s.event.messageId === block("id-3")),
+        Stream.runDrain,
+      );
+      yield* Scope.close(crashed, Exit.void);
+      const before = yield* log.read("t1", "r1");
+
+      yield* start(yield* Scope.make(), [[...reasoning("0", ["Again"]), ...text("1", "18°C"), finish("stop")]]);
+      const after = (yield* subscribe(before.at(-1)!.cursor)).map((s) => s.event);
+
+      expect(after.slice(0, 3)).toEqual([
+        { type: "REASONING_MESSAGE_END", messageId: block("id-3") },
+        { type: "REASONING_END", messageId: block("id-3") },
+        { type: "STEP_FINISHED", stepName: "step-2" },
+      ]);
+      expect(after[3]).toEqual({ type: "STEP_STARTED", stepName: "step-2" });
+      expect(after[4]).toEqual({ type: "REASONING_START", messageId: block("id-4") });
+      // The replayed step 1 published no reasoning again.
+      expect(after.filter((e) => "messageId" in e && e.messageId === block("id-1"))).toEqual([]);
+      yield* Effect.promise(() => verify([...before.map((s) => s.event), ...after]));
+    }).pipe(Effect.provide(shared())),
+  );
+
+  it.effect("completes a log that stops between a reasoning block's two starts", () =>
+    Effect.gen(function* () {
+      const log = yield* EventLog.EventLog;
+      yield* log.append("t1", "r1", AgUi.runStarted(run1));
+      yield* log.append("t1", "r1", AgUi.stepStarted("step-1"));
+      yield* log.append("t1", "r1", AgUi.reasoningStart("lost:reasoning:0"));
+      const before = yield* log.read("t1", "r1");
+
+      yield* start(yield* Scope.make(), [[...text("0", "18°C"), finish("stop")]]);
+      const after = (yield* subscribe(before.at(-1)!.cursor)).map((s) => s.event);
+
+      expect(after.slice(0, 2)).toEqual([
+        { type: "REASONING_END", messageId: "lost:reasoning:0" },
+        { type: "STEP_FINISHED", stepName: "step-1" },
+      ]);
       yield* Effect.promise(() => verify([...before.map((s) => s.event), ...after]));
     }).pipe(Effect.provide(shared())),
   );

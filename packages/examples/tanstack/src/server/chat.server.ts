@@ -2,7 +2,8 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, DateTime, Effect, Layer, Schema } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { modelMessagesToUIMessages } from "@tanstack/ai";
+import { convertMessagesToModelMessages, modelMessagesToUIMessages } from "@tanstack/ai";
+import type { ModelMessage } from "@tanstack/ai";
 import { Agent, AgUi, Checkpoint, EventLog, History, Runner, Sse, Thread } from "effentic";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
@@ -22,8 +23,15 @@ const assistant = Agent.define({
   }),
 });
 
+// Reasoning is switched on here, in the provider's config: effentic streams
+// whatever the model produces, to every client. Without `display`, the API
+// returns thinking blocks with no text. `@effect/ai-anthropic`'s type doesn't
+// declare it yet, hence the separate constant.
+const thinking = { type: "adaptive", display: "summarized" } as const;
+
 const ModelLayer = AnthropicLanguageModel.layer({
   model: "claude-haiku-5-5",
+  config: { thinking },
 }).pipe(
   Layer.provide(
     AnthropicClient.layerConfig({
@@ -47,6 +55,16 @@ const StoresLayer = Layer.mergeAll(
 
 const HydrateQuery = Schema.Struct({ threadId: Schema.String });
 
+/**
+ * A read thread as TanStack's `UIMessage`s, which its hydrate requires: it speaks
+ * AG-UI on the run stream, but not here. `convertMessagesToModelMessages` takes
+ * AG-UI rows, folding each `reasoning` message into the assistant message after
+ * it, though its type doesn't say so, hence the cast. Reasoning with no assistant
+ * message directly after it (a step that produced only reasoning) is dropped.
+ */
+const toUIMessages = (messages: History.Restored["messages"]) =>
+  modelMessagesToUIMessages(convertMessagesToModelMessages([...messages] as Array<ModelMessage>));
+
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const runAgent = Runner.run(assistant);
@@ -63,21 +81,7 @@ const ChatRoutes = HttpRouter.use((router) =>
         const { threadId } = yield* HttpServerRequest.schemaSearchParams(HydrateQuery);
         const { messages, interrupts } = yield* History.restore(threadId);
         return yield* HttpServerResponse.json({
-          // TanStack's model messages are AG-UI's, except that `content` is required (`null` when absent)
-          // and `toolCalls` is a mutable array.
-          messages: modelMessagesToUIMessages(
-            messages.map((message) => {
-              if (message.role !== "assistant") {
-                return message;
-              }
-              const { toolCalls, ...rest } = message;
-              return {
-                ...rest,
-                content: message.content ?? null,
-                ...(toolCalls === undefined ? {} : { toolCalls: [...toolCalls] }),
-              };
-            }),
-          ),
+          messages: toUIMessages(messages),
           interrupts: interrupts === undefined ? null : interrupts,
           activeRun: null,
         });

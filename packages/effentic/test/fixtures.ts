@@ -1,8 +1,8 @@
 import { verifyEvents } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { Effect, Layer, Schema, Stream } from "effect";
-import { AiError, IdGenerator, LanguageModel, Tool, Toolkit } from "effect/ai";
-import type { Prompt, Response } from "effect/ai";
+import { AiError, IdGenerator, LanguageModel, Response, Tool, Toolkit } from "effect/ai";
+import type { Prompt } from "effect/ai";
 import type * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
 import * as AgUiSchema from "../src/AgUiSchema.ts";
@@ -50,6 +50,27 @@ export const text = (id: string, ...deltas: Array<string>): Array<Response.Strea
   ...deltas.map((delta): Response.StreamPartEncoded => ({ type: "text-delta", id, delta })),
   { type: "text-end", id },
 ];
+
+/** Metadata as a provider puts it on a reasoning block, holding a signature for replay. */
+export const signature = (value: string) => ({ anthropic: { signature: value } });
+
+/** A streamed reasoning block. `metadata` goes on its end part, where a provider sends the signature. */
+export const reasoning = (
+  id: string,
+  deltas: ReadonlyArray<string>,
+  metadata?: ReturnType<typeof signature>,
+): Array<Response.StreamPartEncoded> => [
+  { type: "reasoning-start", id },
+  ...deltas.map((delta): Response.StreamPartEncoded => ({ type: "reasoning-delta", id, delta })),
+  metadata === undefined ? { type: "reasoning-end", id } : { type: "reasoning-end", id, metadata },
+];
+
+/**
+ * A reasoning block delivered whole. Not a stream part, so `LanguageModel`
+ * rejects it from a scripted step: pass it to `AgUi.fold` as a `ModelPart`.
+ */
+export const wholeReasoning = (reasoningText: string): Response.ReasoningPart =>
+  Response.makePart("reasoning", { text: reasoningText });
 
 export const toolCall = (
   id: string,
