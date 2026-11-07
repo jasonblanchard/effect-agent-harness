@@ -244,277 +244,278 @@ interface Decision {
  * event. Interrupting it (the consumer stops reading) cancels the run, and
  * nothing more is emitted.
  */
-export const run =
-  <Tools extends Record<string, Tool.Any>, R>(agent: Agent<Tools, R>) =>
-  (input: RunInput): Stream.Stream<Event, never, Requirements<Tools, R>> =>
-    Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
-      const emit = (event: Event) => Queue.offer(queue, event);
-      const { prompt: _, frontendTools = [], ...info } = input;
-      return Effect.gen(function* () {
-        const checkpoint = yield* Checkpoint.Checkpoint;
-        const toolkit = yield* agent.toolkit;
-        // The model is offered the agent's tools plus the client's. A server tool wins a name clash.
-        const frontend = new Map<string, Tool.Any>();
-        for (const tool of frontendTools) {
-          if (Object.hasOwn(toolkit.tools, tool.name)) {
-            yield* Effect.logWarning("effentic: frontend tool ignored, a server tool has its name", tool.name);
-          } else if (!frontend.has(tool.name)) {
-            frontend.set(
-              tool.name,
-              Tool.dynamic(tool.name, {
-                description: tool.description,
-                parameters: tool.parameters as JsonSchema.JsonSchema,
-              }),
-            );
-          }
-        }
-        // Typed as the agent's toolkit: frontend tools have no handlers and need no services, and since
-        // tool calls are not resolved by the model call, `handle` is never called for one.
-        const modelToolkit = {
-          tools: { ...toolkit.tools, ...Object.fromEntries(frontend) },
-          handle: toolkit.handle,
-        } as Toolkit.WithHandler<Tools>;
-        const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
-          Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
-        );
-        // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
-        const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
-          checkpoint.memo(
-            { threadId: input.threadId, runId: input.runId, name, success: ToolStep, error: Schema.Never },
-            Effect.orDie(body),
-          );
-
-        const result = (encodedResult: unknown, isFailure: boolean) =>
-          Effect.map(ids.generateId(), (messageId): ToolStep => ({
-            _tag: "Result",
-            messageId,
-            encodedResult,
-            isFailure,
-          }));
-
-        // Runs the handler, unless the call needs approval and no decision was made yet.
-        const executeTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined) =>
-          memoTool(
-            `tool:${call.id}`,
-            Effect.gen(function* () {
-              if (decision === undefined) {
-                const needed = yield* approvalNeeded(toolkit.tools[call.name], call, prompt);
-                if (needed) {
-                  return { _tag: "ApprovalRequested", approvalId: approvalIdFor(call.id) } as const;
-                }
-              } else if (!decision.approved) {
-                return yield* result({ type: "execution-denied", reason: decision.reason }, true);
-              }
-              const results = yield* toolkit.handle(call.name, call.params as never, call.id);
-              const final = yield* Stream.runLast(Stream.filter(results, (r) => !r.preliminary));
-              if (Option.isNone(final)) {
-                return yield* Effect.die("Tool handler did not produce a final result");
-              }
-              return yield* result(final.value.encodedResult, final.value.isFailure);
+export const run = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent<Tools, R>,
+  input: RunInput,
+): Stream.Stream<Event, never, Requirements<Tools, R>> =>
+  Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
+    const emit = (event: Event) => Queue.offer(queue, event);
+    const { prompt: _, frontendTools = [], ...info } = input;
+    return Effect.gen(function* () {
+      const checkpoint = yield* Checkpoint.Checkpoint;
+      const toolkit = yield* agent.toolkit;
+      // The model is offered the agent's tools plus the client's. A server tool wins a name clash.
+      const frontend = new Map<string, Tool.Any>();
+      for (const tool of frontendTools) {
+        if (Object.hasOwn(toolkit.tools, tool.name)) {
+          yield* Effect.logWarning("effentic: frontend tool ignored, a server tool has its name", tool.name);
+        } else if (!frontend.has(tool.name)) {
+          frontend.set(
+            tool.name,
+            Tool.dynamic(tool.name, {
+              description: tool.description,
+              parameters: tool.parameters as JsonSchema.JsonSchema,
             }),
           );
+        }
+      }
+      // Typed as the agent's toolkit: frontend tools have no handlers and need no services, and since
+      // tool calls are not resolved by the model call, `handle` is never called for one.
+      const modelToolkit = {
+        tools: { ...toolkit.tools, ...Object.fromEntries(frontend) },
+        handle: toolkit.handle,
+      } as Toolkit.WithHandler<Tools>;
+      const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
+        Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
+      );
+      // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
+      const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
+        checkpoint.memo(
+          { threadId: input.threadId, runId: input.runId, name, success: ToolStep, error: Schema.Never },
+          Effect.orDie(body),
+        );
 
-        // The model stopped for a reason that does not complete the response.
-        const interruptTool = (call: ToolCall, finishReason: string) =>
-          memoTool(
-            `tool:${call.id}`,
-            result(
-              {
-                type: "execution-interrupted",
-                reason: `Tool call execution was interrupted because the response finished with reason "${finishReason}"`,
-              },
-              true,
-            ),
-          );
+      const result = (encodedResult: unknown, isFailure: boolean) =>
+        Effect.map(ids.generateId(), (messageId): ToolStep => ({
+          _tag: "Result",
+          messageId,
+          encodedResult,
+          isFailure,
+        }));
 
-        const toolEntry = (call: ToolCall, step: Extract<ToolStep, { _tag: "Result" }>): Messages.Entry => ({
-          id: step.messageId,
-          message: Prompt.makeMessage("tool", {
-            content: [
-              Prompt.makePart("tool-result", {
-                id: call.id,
-                name: call.name,
-                result: step.encodedResult,
-                isFailure: step.isFailure,
-                providerExecuted: false,
-              }),
-            ],
+      // Runs the handler, unless the call needs approval and no decision was made yet.
+      const executeTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined) =>
+        memoTool(
+          `tool:${call.id}`,
+          Effect.gen(function* () {
+            if (decision === undefined) {
+              const needed = yield* approvalNeeded(toolkit.tools[call.name], call, prompt);
+              if (needed) {
+                return { _tag: "ApprovalRequested", approvalId: approvalIdFor(call.id) } as const;
+              }
+            } else if (!decision.approved) {
+              return yield* result({ type: "execution-denied", reason: decision.reason }, true);
+            }
+            const results = yield* toolkit.handle(call.name, call.params as never, call.id);
+            const final = yield* Stream.runLast(Stream.filter(results, (r) => !r.preliminary));
+            if (Option.isNone(final)) {
+              return yield* Effect.die("Tool handler did not produce a final result");
+            }
+            return yield* result(final.value.encodedResult, final.value.isFailure);
           }),
+        );
+
+      // The model stopped for a reason that does not complete the response.
+      const interruptTool = (call: ToolCall, finishReason: string) =>
+        memoTool(
+          `tool:${call.id}`,
+          result(
+            {
+              type: "execution-interrupted",
+              reason: `Tool call execution was interrupted because the response finished with reason "${finishReason}"`,
+            },
+            true,
+          ),
+        );
+
+      const toolEntry = (call: ToolCall, step: Extract<ToolStep, { _tag: "Result" }>): Messages.Entry => ({
+        id: step.messageId,
+        message: Prompt.makeMessage("tool", {
+          content: [
+            Prompt.makePart("tool-result", {
+              id: call.id,
+              name: call.name,
+              result: step.encodedResult,
+              isFailure: step.isFailure,
+              providerExecuted: false,
+            }),
+          ],
+        }),
+      });
+
+      const modelStep = (step: number, prompt: Prompt.Prompt) =>
+        checkpoint.memo(
+          {
+            threadId: input.threadId,
+            runId: input.runId,
+            name: `model:${step}`,
+            success: ModelStep,
+            error: Schema.Never,
+          },
+          Effect.gen(function* () {
+            const messageId = yield* ids.generateId();
+            yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
+            const parts: Array<Response.AnyPart> = [];
+            yield* LanguageModel.streamText({
+              prompt: withSystem(forModel(prompt)),
+              toolkit: modelToolkit,
+              disableToolCallResolution: true,
+            }).pipe(
+              Stream.runForEach((streamed) => {
+                // The toolkit's own part type is narrower; this only widens tool names and parameters.
+                const part = streamed as Response.AnyPart;
+                if (part.type === "error") {
+                  return Effect.fail(new ModelStreamError({ error: part.error }));
+                }
+                parts.push(part);
+                return emit({ _tag: "ModelPart", step, messageId, part, replayed: false });
+              }),
+            );
+            const finish = parts.find((part) => part.type === "finish");
+            return {
+              messageId,
+              assistant: Prompt.fromResponseParts(parts),
+              toolCalls: parts.flatMap((part) =>
+                part.type === "tool-call" && part.providerExecuted !== true
+                  ? [{ id: part.id, name: part.name, params: part.params }]
+                  : [],
+              ),
+              finishReason: finish?.type === "finish" ? finish.reason : "unknown",
+            } satisfies ModelStep;
+          }).pipe(Effect.orDie),
+        );
+
+      // Resolved before step 0, so a system prompt that fails runs no tool.
+      const system =
+        agent.system === undefined || typeof agent.system === "string"
+          ? agent.system
+          : (yield* checkpoint.memo(
+              {
+                threadId: input.threadId,
+                runId: input.runId,
+                name: "system",
+                success: Schema.String,
+                error: Schema.Never,
+              },
+              agent.system,
+            )).value;
+      const withSystem = (prompt: Prompt.Prompt) =>
+        system === undefined || system.length === 0
+          ? prompt
+          : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
+
+      // Step 0: approval answers carried by the prompt are resolved before the model is called.
+      let prompt = input.prompt;
+      const decided = pendingDecisions(prompt);
+      if (decided.length > 0) {
+        const steps = yield* Effect.forEach(decided, ({ call, decision }) => executeTool(call, prompt, decision), {
+          concurrency: "unbounded",
+        });
+        const entries: Array<Messages.Entry> = [];
+        for (const [i, { call }] of decided.entries()) {
+          const { value, replayed } = steps[i]!;
+          // A decision always yields a result.
+          if (value._tag === "Result") {
+            entries.push(toolEntry(call, value));
+            yield* emit(toolResultEvent(0, call, value, replayed));
+          }
+        }
+        yield* emit({ _tag: "StepFinished", step: 0, entries, replayed: steps.every((s) => s.replayed) });
+        // The prompt may continue past the calls (e.g. a new user message), so place the results right after them.
+        prompt = orderToolResults(Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message))));
+      }
+
+      for (let step = 1; ; step++) {
+        const model = yield* modelStep(step, prompt);
+        const { messageId, assistant, toolCalls, finishReason } = model.value;
+        if (model.replayed) {
+          yield* emit({ _tag: "StepStarted", step, messageId, replayed: true });
+        }
+
+        const complete = finishReason === "tool-calls" || finishReason === "stop";
+        const modelPrompt = forModel(prompt);
+        // Left to the client. A step cut short answers them like any other call.
+        const pending = complete ? toolCalls.filter((call) => frontend.has(call.name)) : [];
+        const pendingIds = new Set(pending.map((call) => call.id));
+        const executed = toolCalls.filter((call) => !pendingIds.has(call.id));
+        const tools = yield* Effect.forEach(
+          executed,
+          (call) => (complete ? executeTool(call, modelPrompt, undefined) : interruptTool(call, finishReason)),
+          { concurrency: "unbounded" },
+        );
+
+        const approvals: Array<Approval> = [];
+        const toolEntries: Array<Messages.Entry> = [];
+        for (const [i, call] of executed.entries()) {
+          const { value, replayed } = tools[i]!;
+          if (value._tag === "ApprovalRequested") {
+            approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
+            yield* emit({
+              _tag: "ApprovalRequested",
+              step,
+              approvalId: value.approvalId,
+              toolCallId: call.id,
+              toolName: call.name,
+              replayed,
+            });
+          } else {
+            toolEntries.push(toolEntry(call, value));
+            yield* emit(toolResultEvent(step, call, value, replayed));
+          }
+        }
+
+        const assistantMessage = assistant.content.find((message) => message.role === "assistant");
+        const entries: Array<Messages.Entry> = [];
+        if (assistantMessage !== undefined) {
+          entries.push({
+            id: messageId,
+            message: Prompt.makeMessage("assistant", {
+              content: [
+                ...assistantMessage.content.map((part) =>
+                  part.type === "tool-call" && pendingIds.has(part.id) ? markFrontend(part) : part,
+                ),
+                ...approvals.map((a) =>
+                  Prompt.toolApprovalRequestPart({ approvalId: a.approvalId, toolCallId: a.toolCallId }),
+                ),
+              ],
+              options: assistantMessage.options,
+            }),
+          });
+        }
+        entries.push(...toolEntries);
+        yield* emit({
+          _tag: "StepFinished",
+          step,
+          entries,
+          replayed: model.replayed && tools.every((t) => t.replayed),
         });
 
-        const modelStep = (step: number, prompt: Prompt.Prompt) =>
-          checkpoint.memo(
-            {
-              threadId: input.threadId,
-              runId: input.runId,
-              name: `model:${step}`,
-              success: ModelStep,
-              error: Schema.Never,
-            },
-            Effect.gen(function* () {
-              const messageId = yield* ids.generateId();
-              yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
-              const parts: Array<Response.AnyPart> = [];
-              yield* LanguageModel.streamText({
-                prompt: withSystem(forModel(prompt)),
-                toolkit: modelToolkit,
-                disableToolCallResolution: true,
-              }).pipe(
-                Stream.runForEach((streamed) => {
-                  // The toolkit's own part type is narrower; this only widens tool names and parameters.
-                  const part = streamed as Response.AnyPart;
-                  if (part.type === "error") {
-                    return Effect.fail(new ModelStreamError({ error: part.error }));
-                  }
-                  parts.push(part);
-                  return emit({ _tag: "ModelPart", step, messageId, part, replayed: false });
-                }),
-              );
-              const finish = parts.find((part) => part.type === "finish");
-              return {
-                messageId,
-                assistant: Prompt.fromResponseParts(parts),
-                toolCalls: parts.flatMap((part) =>
-                  part.type === "tool-call" && part.providerExecuted !== true
-                    ? [{ id: part.id, name: part.name, params: part.params }]
-                    : [],
-                ),
-                finishReason: finish?.type === "finish" ? finish.reason : "unknown",
-              } satisfies ModelStep;
-            }).pipe(Effect.orDie),
-          );
-
-        // Resolved before step 0, so a system prompt that fails runs no tool.
-        const system =
-          agent.system === undefined || typeof agent.system === "string"
-            ? agent.system
-            : (yield* checkpoint.memo(
-                {
-                  threadId: input.threadId,
-                  runId: input.runId,
-                  name: "system",
-                  success: Schema.String,
-                  error: Schema.Never,
-                },
-                agent.system,
-              )).value;
-        const withSystem = (prompt: Prompt.Prompt) =>
-          system === undefined || system.length === 0
-            ? prompt
-            : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
-
-        // Step 0: approval answers carried by the prompt are resolved before the model is called.
-        let prompt = input.prompt;
-        const decided = pendingDecisions(prompt);
-        if (decided.length > 0) {
-          const steps = yield* Effect.forEach(decided, ({ call, decision }) => executeTool(call, prompt, decision), {
-            concurrency: "unbounded",
-          });
-          const entries: Array<Messages.Entry> = [];
-          for (const [i, { call }] of decided.entries()) {
-            const { value, replayed } = steps[i]!;
-            // A decision always yields a result.
-            if (value._tag === "Result") {
-              entries.push(toolEntry(call, value));
-              yield* emit(toolResultEvent(0, call, value, replayed));
-            }
-          }
-          yield* emit({ _tag: "StepFinished", step: 0, entries, replayed: steps.every((s) => s.replayed) });
-          // The prompt may continue past the calls (e.g. a new user message), so place the results right after them.
-          prompt = orderToolResults(Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message))));
+        const pendingToolCalls = pending.map((call) => ({ toolCallId: call.id, toolName: call.name }));
+        if (approvals.length > 0) {
+          return yield* emit({ _tag: "Finished", outcome: { _tag: "Interrupted", approvals, pendingToolCalls } });
         }
-
-        for (let step = 1; ; step++) {
-          const model = yield* modelStep(step, prompt);
-          const { messageId, assistant, toolCalls, finishReason } = model.value;
-          if (model.replayed) {
-            yield* emit({ _tag: "StepStarted", step, messageId, replayed: true });
-          }
-
-          const complete = finishReason === "tool-calls" || finishReason === "stop";
-          const modelPrompt = forModel(prompt);
-          // Left to the client. A step cut short answers them like any other call.
-          const pending = complete ? toolCalls.filter((call) => frontend.has(call.name)) : [];
-          const pendingIds = new Set(pending.map((call) => call.id));
-          const executed = toolCalls.filter((call) => !pendingIds.has(call.id));
-          const tools = yield* Effect.forEach(
-            executed,
-            (call) => (complete ? executeTool(call, modelPrompt, undefined) : interruptTool(call, finishReason)),
-            { concurrency: "unbounded" },
-          );
-
-          const approvals: Array<Approval> = [];
-          const toolEntries: Array<Messages.Entry> = [];
-          for (const [i, call] of executed.entries()) {
-            const { value, replayed } = tools[i]!;
-            if (value._tag === "ApprovalRequested") {
-              approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
-              yield* emit({
-                _tag: "ApprovalRequested",
-                step,
-                approvalId: value.approvalId,
-                toolCallId: call.id,
-                toolName: call.name,
-                replayed,
-              });
-            } else {
-              toolEntries.push(toolEntry(call, value));
-              yield* emit(toolResultEvent(step, call, value, replayed));
-            }
-          }
-
-          const assistantMessage = assistant.content.find((message) => message.role === "assistant");
-          const entries: Array<Messages.Entry> = [];
-          if (assistantMessage !== undefined) {
-            entries.push({
-              id: messageId,
-              message: Prompt.makeMessage("assistant", {
-                content: [
-                  ...assistantMessage.content.map((part) =>
-                    part.type === "tool-call" && pendingIds.has(part.id) ? markFrontend(part) : part,
-                  ),
-                  ...approvals.map((a) =>
-                    Prompt.toolApprovalRequestPart({ approvalId: a.approvalId, toolCallId: a.toolCallId }),
-                  ),
-                ],
-                options: assistantMessage.options,
-              }),
-            });
-          }
-          entries.push(...toolEntries);
-          yield* emit({
-            _tag: "StepFinished",
-            step,
-            entries,
-            replayed: model.replayed && tools.every((t) => t.replayed),
-          });
-
-          const pendingToolCalls = pending.map((call) => ({ toolCallId: call.id, toolName: call.name }));
-          if (approvals.length > 0) {
-            return yield* emit({ _tag: "Finished", outcome: { _tag: "Interrupted", approvals, pendingToolCalls } });
-          }
-          if (pendingToolCalls.length > 0 || finishReason !== "tool-calls" || toolCalls.length === 0) {
-            return yield* emit({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls } });
-          }
-          if (step + 1 > agent.maxSteps) {
-            return yield* new StepLimitExceeded({ maxSteps: agent.maxSteps });
-          }
-          prompt = Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message)));
+        if (pendingToolCalls.length > 0 || finishReason !== "tool-calls" || toolCalls.length === 0) {
+          return yield* emit({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls } });
         }
-      }).pipe(
-        Effect.catchCause((cause) => {
-          if (Cause.hasInterruptsOnly(cause)) {
-            // An interrupt-only cause has no failures, so its error type is irrelevant.
-            return Queue.failCause(queue, cause as Cause.Cause<never>);
-          }
-          const error = Cause.squash(cause);
-          return emit({ _tag: "Failed", error, code: errorCode(error) });
-        }),
-        Effect.andThen(Queue.end(queue)),
-        Effect.provideService(CurrentRun, info),
-        Effect.withSpan("effentic/Agent.run", { attributes: { runId: input.runId, threadId: input.threadId } }),
-      );
-    });
+        if (step + 1 > agent.maxSteps) {
+          return yield* new StepLimitExceeded({ maxSteps: agent.maxSteps });
+        }
+        prompt = Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message)));
+      }
+    }).pipe(
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) {
+          // An interrupt-only cause has no failures, so its error type is irrelevant.
+          return Queue.failCause(queue, cause as Cause.Cause<never>);
+        }
+        const error = Cause.squash(cause);
+        return emit({ _tag: "Failed", error, code: errorCode(error) });
+      }),
+      Effect.andThen(Queue.end(queue)),
+      Effect.provideService(CurrentRun, info),
+      Effect.withSpan("effentic/Agent.run", { attributes: { runId: input.runId, threadId: input.threadId } }),
+    );
+  });
 
 const toolResultEvent = (
   step: number,

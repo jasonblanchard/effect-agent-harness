@@ -201,7 +201,7 @@ const currentHistory: Effect.Effect<internal.Service> = Effect.map(
  * as ended: under the server history it keeps its claim, and running it again
  * finishes it. The request-scoped runner abandons a cancelled run itself.
  */
-const pipeline =
+const agUiRun =
   <Tools extends Record<string, Tool.Any>, R, Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
     agent: Agent.Agent<Tools, R>,
     options?: Options<ROut, E, RIn>,
@@ -223,7 +223,7 @@ const pipeline =
             Effect.sync(() => Messages.project([...attempt.stored, ...attempt.added])),
           );
 
-          return Agent.run(agent)({
+          return Agent.run(agent, {
             runId,
             threadId,
             props: input.forwardedProps,
@@ -286,7 +286,7 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
   agent: Agent.Agent<Tools, R>,
   options?: Options<ROut, E, RIn>,
 ) => {
-  const runWith = pipeline<Tools, R, readonly [], ROut, E, RIn>(agent, options);
+  const runWith = agUiRun<Tools, R, readonly [], ROut, E, RIn>(agent, options);
   return (
     input: AgUi.RunAgentInput,
   ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
@@ -311,7 +311,7 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
 };
 
 /**
- * Runs the pipeline into the event log. If the log already holds an earlier
+ * Runs {@link agUiRun} into the event log. If the log already holds an earlier
  * attempt of the run, that attempt is completed instead of started over: a
  * finished run is left alone, spans the attempt left open are closed, and its
  * `RUN_STARTED` is not repeated. Steps the earlier attempt completed are
@@ -329,7 +329,7 @@ const detached =
     EventLog.EventLogError,
     Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies> | EventLog.EventLog
   > => {
-    const runWith = pipeline<Tools, R, Dependencies, ROut, E, RIn>(agent, options);
+    const runWith = agUiRun<Tools, R, Dependencies, ROut, E, RIn>(agent, options);
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const append = (event: AgUi.Event) => log.append(input.threadId, input.runId, event);

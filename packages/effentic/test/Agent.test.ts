@@ -34,7 +34,7 @@ const runCore = (
     const weather = countingWeatherLayer();
     const agent =
       options?.maxSteps === undefined ? weatherAgent : Agent.define({ toolkit: WeatherToolkit, ...options });
-    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: options?.prompt ?? userPrompt }).pipe(
+    const events = yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt: options?.prompt ?? userPrompt }).pipe(
       Stream.runCollect,
       Effect.provide([model.layer, weather.layer, evalLayers]),
     );
@@ -69,7 +69,7 @@ describe("Agent.define", () => {
       const runWith = (checkpoint: Layer.Layer<Checkpoint.Checkpoint>) =>
         Effect.gen(function* () {
           const model = scriptedModel(script());
-          yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+          yield* Agent.run(weatherAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, checkpoint, counterIds()]),
           );
@@ -113,7 +113,7 @@ describe("Agent.run", () => {
       const model = scriptedModel([
         Stream.fromIterable(text("0", "first").slice(0, 2)).pipe(Stream.concat(Stream.never)),
       ]);
-      const events = yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      const events = yield* Agent.run(weatherAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
         Stream.take(3),
         Stream.runCollect,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
@@ -159,7 +159,7 @@ describe("Agent.run", () => {
       const handlers = WeatherToolkit.toLayer({
         "get-weather": () => Effect.sync(() => (log.push("handler"), { temperature: 18 })),
       });
-      const events = yield* Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      const events = yield* Agent.run(weatherAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
         Stream.runCollect,
         Effect.provide([model.layer, handlers, evalLayers]),
       );
@@ -277,7 +277,7 @@ describe("Agent.run approvals", () => {
     Effect.gen(function* () {
       const model = scriptedModel(steps);
       const handlers = countingApprovalLayer();
-      const events = yield* Agent.run(approvalAgent)({ runId: "r1", threadId: "t1", prompt }).pipe(
+      const events = yield* Agent.run(approvalAgent, { runId: "r1", threadId: "t1", prompt }).pipe(
         Stream.runCollect,
         Effect.provide([model.layer, handlers.layer, evalLayers]),
       );
@@ -320,7 +320,7 @@ describe("Agent.run approvals", () => {
       const ids = yield* Effect.forEach(["t1", "t2"], (threadId) =>
         Effect.gen(function* () {
           const model = scriptedModel([[...emailCall, finish("tool-calls")]]);
-          const events = yield* Agent.run(approvalAgent)({ runId: "r1", threadId, prompt: userPrompt }).pipe(
+          const events = yield* Agent.run(approvalAgent, { runId: "r1", threadId, prompt: userPrompt }).pipe(
             Stream.runCollect,
             Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),
           );
@@ -343,7 +343,7 @@ describe("Agent.run approvals", () => {
       const toolkit = Toolkit.make(Risky);
       let ran = 0;
       const model = scriptedModel([[...toolCall("c1", "risky", {}), finish("tool-calls")], [finish("stop")]]);
-      const events = yield* Agent.run(Agent.define({ toolkit }))({
+      const events = yield* Agent.run(Agent.define({ toolkit }), {
         runId: "r1",
         threadId: "t1",
         prompt: userPrompt,
@@ -414,7 +414,7 @@ describe("Agent.run approvals", () => {
   it.effect("does not count step 0 against the step limit", () =>
     Effect.gen(function* () {
       const model = scriptedModel([[...text("0", "Sent."), finish("stop")]]);
-      const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, maxSteps: 1 }))({
+      const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, maxSteps: 1 }), {
         runId: "r1",
         threadId: "t1",
         prompt: answered(true),
@@ -441,7 +441,7 @@ describe("Agent.run frontend tools", () => {
     Effect.gen(function* () {
       const model = scriptedModel(steps);
       const handlers = countingApprovalLayer();
-      const events = yield* Agent.run(approvalAgent)({
+      const events = yield* Agent.run(approvalAgent, {
         runId: "r1",
         threadId: "t1",
         prompt: options?.prompt ?? userPrompt,
@@ -579,7 +579,7 @@ describe("Agent.run replay", () => {
       const attempt = (steps: ReadonlyArray<Step>) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = yield* Agent.run(weatherAgent)({
+          const events = yield* Agent.run(weatherAgent, {
             runId: "r1",
             threadId: "t1",
             prompt: userPrompt,
@@ -616,7 +616,7 @@ describe("Agent.run replay", () => {
       const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Agent.run(weatherAgent)({ runId: "r1", threadId: "t1", prompt: userPrompt });
+          const events = Agent.run(weatherAgent, { runId: "r1", threadId: "t1", prompt: userPrompt });
           const collected = yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runCollect,
             Effect.provide([model.layer, weather.layer]),
@@ -707,7 +707,7 @@ describe("Agent.CurrentRun", () => {
     Effect.gen(function* () {
       const model = scriptedModel([[...toolCall("c1", "who-am-i", {}), finish("tool-calls")], [finish("stop")]]);
       const handlers = runInfoLayer();
-      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }))({
+      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }), {
         runId: "r1",
         threadId: "t1",
         props: { locale: "fr" },
@@ -733,7 +733,7 @@ describe("Agent.CurrentRun", () => {
         },
         { role: "tool", content: [{ type: "tool-approval-response", approvalId: "a1", approved: true }] },
       ]);
-      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }))({
+      yield* Agent.run(Agent.define({ toolkit: RunInfoToolkit }), {
         runId: "r1",
         threadId: "t1",
         props: { locale: "fr" },
@@ -766,7 +766,7 @@ describe("Agent per-run services", () => {
     expectTypeOf<CurrentUser>().toExtend<RequirementsOf<typeof agent>>();
     // The handler layer builds without the dependency: handlers read it per call.
     expectTypeOf(userToolkitLayer).toEqualTypeOf<Layer.Layer<Tool.HandlersFor<typeof UserToolkit.tools>>>();
-    const run = Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+    const run = Agent.run(agent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
       Stream.runDrain,
       Effect.provide([userToolkitLayer, evalLayers]),
     );
@@ -780,7 +780,7 @@ describe("Agent per-run services", () => {
         [...toolCall("c1", "who-is-user", {}), finish("tool-calls")],
         [...text("0", "You are u1."), finish("stop")],
       ]);
-      const events = yield* Agent.run(Agent.define({ toolkit: UserToolkit }))({
+      const events = yield* Agent.run(Agent.define({ toolkit: UserToolkit }), {
         runId: "r1",
         threadId: "t1",
         prompt: userPrompt,
@@ -816,7 +816,7 @@ describe("Agent system prompt", () => {
         [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
         [...text("0", "18°C"), finish("stop")],
       ]);
-      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }))({
+      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }), {
         runId: "r1",
         threadId: "t1",
         prompt: userPrompt,
@@ -843,7 +843,7 @@ describe("Agent system prompt", () => {
             [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
             [...text("0", "18°C"), finish("stop")],
           ]);
-          yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+          yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, users.layer, evalLayers]),
           );
@@ -870,7 +870,7 @@ describe("Agent system prompt", () => {
             : "Reply in English.";
         }),
       });
-      yield* Agent.run(agent)({ runId: "r1", threadId: "t1", props: { locale: "fr" }, prompt: userPrompt }).pipe(
+      yield* Agent.run(agent, { runId: "r1", threadId: "t1", props: { locale: "fr" }, prompt: userPrompt }).pipe(
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
       );
@@ -885,7 +885,7 @@ describe("Agent system prompt", () => {
         { role: "system", content: "Summary: they asked about Paris." },
         { role: "user", content: "And now?" },
       ]);
-      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }))({
+      yield* Agent.run(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }), {
         runId: "r1",
         threadId: "t1",
         prompt,
@@ -902,7 +902,8 @@ describe("Agent system prompt", () => {
     Effect.gen(function* () {
       const model = scriptedModel([[...text("0", "Sent."), finish("stop")]]);
       const handlers = countingApprovalLayer();
-      const events = yield* Agent.run(Agent.define({ toolkit: ApprovalToolkit, system: Effect.die("directory down") }))(
+      const events = yield* Agent.run(
+        Agent.define({ toolkit: ApprovalToolkit, system: Effect.die("directory down") }),
         {
           runId: "r1",
           threadId: "t1",
@@ -939,7 +940,7 @@ describe("Agent system prompt", () => {
       const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Agent.run(agent)({ runId: "r1", threadId: "t1", prompt: userPrompt });
+          const events = Agent.run(agent, { runId: "r1", threadId: "t1", prompt: userPrompt });
           yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, clock]),

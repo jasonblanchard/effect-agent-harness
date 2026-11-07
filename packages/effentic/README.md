@@ -606,7 +606,7 @@ yield *
 
 ## Testing and evals
 
-The core loop doesn't depend on AG-UI or any store. `Agent.run(agent)({ runId, threadId, props?, prompt })` takes the run info and an effect/ai `Prompt` (without the system prompt, which the agent adds) and emits `Agent.Event`s:
+The core loop doesn't depend on AG-UI or any store. `Agent.run(agent, { runId, threadId, props?, prompt })` takes the run info and an effect/ai `Prompt` (without the system prompt, which the agent adds) and emits `Agent.Event`s:
 
 | Event               | When                                                                   |
 | ------------------- | ---------------------------------------------------------------------- |
@@ -628,7 +628,7 @@ import { Prompt } from "effect/ai";
 
 const events =
   yield *
-  Agent.run(agent)({
+  Agent.run(agent, {
     runId: "eval-1",
     threadId: "eval",
     prompt: Prompt.make([{ role: "user", content: "Weather in Paris?" }]),
@@ -640,7 +640,7 @@ Provide an `IdGenerator` (from `effect/ai`) to make message ids deterministic.
 To check how the agent behaves for different users or settings, pass the run info as literals and provide the per-run services directly. The same definition is used, and no HTTP, token or runner is involved:
 
 ```ts
-Agent.run(agent)({ runId: "eval-2", threadId: "eval", prompt }).pipe(
+Agent.run(agent, { runId: "eval-2", threadId: "eval", prompt }).pipe(
   Stream.runCollect,
   Effect.provide([
     ModelLayer,

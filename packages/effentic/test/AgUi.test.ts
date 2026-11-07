@@ -152,7 +152,7 @@ const prompt = Prompt.make([{ role: "user", content: "What is the weather in Par
 const foldRun = (steps: ReadonlyArray<Step>, frontendTools?: ReadonlyArray<AgUi.FrontendTool>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run(agent)({ runId: "r1", threadId: "t1", prompt, frontendTools }).pipe(
+    const events = yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt, frontendTools }).pipe(
       AgUi.fold({ threadId: "t1", runId: "r1" }),
       Stream.runCollect,
       Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),
