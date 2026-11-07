@@ -24,6 +24,6 @@
 
 ## 4. Docs and checks
 
-- [ ] 4.1 Update `packages/effentic/AGENTS.md`: the `Runner` options, and `fold`'s interrupt metadata and throw behaviour
+- [ ] 4.1 Update `packages/effect-agent-harness/AGENTS.md`: the `Runner` options, and `fold`'s interrupt metadata and throw behaviour
 - [ ] 4.2 Update `packages/examples/tanstack/AGENTS.md`: replace the "unbound + `resumeInterruptsUnsafe`" explanation with the binding hook, and update the manual checks
 - [ ] 4.3 Run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check` and fix every finding

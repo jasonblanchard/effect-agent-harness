@@ -2,7 +2,7 @@
 // (`schema/ag-ui-1.0.json`, a copy of https://docs.ag-ui.com/spec/1.0/schema.json)
 // with Effect's own JSON Schema importer and code generator.
 //
-// Run with `pnpm --filter effentic generate:schema`. To move to a new spec
+// Run with `pnpm --filter effect-agent-harness generate:schema`. To move to a new spec
 // version, replace the pinned file and regenerate.
 //
 // The importer accepts a subset of draft 2020-12, so the document is rewritten

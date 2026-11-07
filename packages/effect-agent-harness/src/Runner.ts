@@ -257,7 +257,9 @@ const agUiRun =
         return opened(attempt, checkpoint).pipe(Stream.provideContext(services));
       }),
     ).pipe(failInBand);
-    return AgUi.fold(input)(events).pipe(Stream.withSpan("effentic/Runner.run", { attributes: { threadId, runId } }));
+    return AgUi.fold(input)(events).pipe(
+      Stream.withSpan("effect-agent-harness/Runner.run", { attributes: { threadId, runId } }),
+    );
   };
 
 /**
@@ -399,7 +401,9 @@ export const makeDetached = <
           const perRun = yield* Effect.context<DependencyServices<Dependencies>>();
           yield* body(input).pipe(
             Effect.tapCause((cause) =>
-              Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.logError("effentic: detached run failed", cause),
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.void
+                : Effect.logError("effect-agent-harness: detached run failed", cause),
             ),
             Effect.provideContext(Context.merge(context, perRun)),
             Effect.forkIn(scope),

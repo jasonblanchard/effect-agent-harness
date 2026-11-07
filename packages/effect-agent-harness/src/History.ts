@@ -39,7 +39,7 @@ export class History extends Context.Service<
   History,
   /** Opaque: get one from {@link layerClient} or {@link layerServer}. Its members are internal. */
   { readonly [internal.TypeId]: internal.TypeId }
->()("effentic/History") {}
+>()("effect-agent-harness/History") {}
 
 /**
  * The client owns the transcript: the run's history is `input.messages` as

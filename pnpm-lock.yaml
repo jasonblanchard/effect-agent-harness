@@ -191,7 +191,7 @@ importers:
         specifier: 'catalog:'
         version: 7.0.2
 
-  packages/effentic:
+  packages/effect-agent-harness:
     dependencies:
       effect:
         specifier: 'catalog:'
@@ -227,9 +227,9 @@ importers:
       effect:
         specifier: 'catalog:'
         version: 4.0.5
-      effentic:
+      effect-agent-harness:
         specifier: workspace:*
-        version: link:../../effentic
+        version: link:../../effect-agent-harness
     devDependencies:
       '@types/node':
         specifier: ^26.6.5
@@ -258,9 +258,9 @@ importers:
       effect:
         specifier: 'catalog:'
         version: 4.0.5
-      effentic:
+      effect-agent-harness:
         specifier: workspace:*
-        version: link:../../effentic
+        version: link:../../effect-agent-harness
       react:
         specifier: ^19.3.1
         version: 19.3.1

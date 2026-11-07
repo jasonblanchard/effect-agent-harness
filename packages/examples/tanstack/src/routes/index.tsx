@@ -36,10 +36,10 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
   });
   const [input, setInput] = useState("");
 
-  // effentic's approval interrupts are plain AG-UI interrupts, without TanStack's
+  // effect-agent-harness's approval interrupts are plain AG-UI interrupts, without TanStack's
   // own binding metadata, so TanStack lists them as `unbound` and offers no
   // `resolveInterrupt`. Answer them with AG-UI `resume` entries instead: the
-  // payload is effentic's `AgUi.ApprovalResponse`.
+  // payload is effect-agent-harness's `AgUi.ApprovalResponse`.
   const approvals = interrupts.filter((interrupt) => interrupt.reason === "tool-approval");
   const [decisions, setDecisions] = useState<Record<string, boolean>>({});
   const decide = (interruptId: string, approved: boolean) => {
@@ -71,7 +71,7 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
   return (
     <main className="chat">
       <header>
-        <h1>effentic × TanStack AI</h1>
+        <h1>effect-agent-harness × TanStack AI</h1>
         <p>
           Ask about the weather anywhere, what time it is where you are (your browser answers), or ask it to send an
           email (it asks you first).

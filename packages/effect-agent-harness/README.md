@@ -1,8 +1,8 @@
-# effentic
+# effect-agent-harness
 
 Build [AG-UI](https://docs.ag-ui.com) agents with [Effect](https://effect.website).
 
-effentic runs an agent (a model, a set of tools, a system prompt) and streams the run to any AG-UI client, such as `@ag-ui/client`'s `HttpAgent` or CopilotKit. It is built on `effect/ai`, so it works with any Effect model provider.
+effect-agent-harness runs an agent (a model, a set of tools, a system prompt) and streams the run to any AG-UI client, such as `@ag-ui/client`'s `HttpAgent` or CopilotKit. It is built on `effect/ai`, so it works with any Effect model provider.
 
 The agent's _behaviour_ is kept separate from _durability_. You define the agent once as a plain value. Then you choose, by providing layers, how much of the run survives a crash, a deploy or a dropped connection:
 
@@ -40,7 +40,7 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, Effect, Layer, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, Runner, Sse } from "effentic";
+import { Agent, AgUi, Checkpoint, Runner, Sse } from "effect-agent-harness";
 
 // 1. Tools
 const GetWeather = Tool.make("get-weather", {
@@ -215,7 +215,7 @@ Runner.makeAttached(agent, { clientSystem: "allow" }); // default "drop"
 
 Each reasoning block a model step produces streams as one span holding one message, before or between the step's text: `REASONING_START`, `REASONING_MESSAGE_START`, `REASONING_MESSAGE_CONTENT`…, `REASONING_MESSAGE_END`, `REASONING_END`, all under the block's own `messageId`. That id is stable, so [`History.restore`](#reloading-a-thread) returns the block under the same id. Treat its format as opaque.
 
-effentic has no option for this. Reasoning appears when the model produces it, so you enable it in the provider layer:
+effect-agent-harness has no option for this. Reasoning appears when the model produces it, so you enable it in the provider layer:
 
 ```ts
 // Without `display`, the Anthropic API returns thinking blocks with no text, so nothing streams.
@@ -282,7 +282,7 @@ Layer.mergeAll(
 );
 ```
 
-The server owns the history, in the `Thread` store. A client like `HttpAgent` sends its whole history on every run. effentic keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
+The server owns the history, in the `Thread` store. A client like `HttpAgent` sends its whole history on every run. effect-agent-harness keeps only the **delta**, meaning the messages after the last one the store already has, and from it accepts only:
 
 - `user` messages that have text;
 - `system` / `developer` messages, and only with `clientSystem: "allow"`;
@@ -332,7 +332,7 @@ const { messages, interrupts, pendingToolCalls } = yield * History.restore(threa
 
 The library doesn't serve this route. Expose it as a `GET` of your own, and authorise the thread there just as you do for runs. The client sets its messages to `messages`, answers each of `interrupts.pending` with a `resume` entry in its next run, and each of `pendingToolCalls.toolCallIds` with a `tool` message. A client that sends `messages` back, with new user messages after them, is matched like one that streamed them. `messages` is AG-UI's own `Message` type, so adapt it if your client has its own, and don't assume `content` is a string. System entries and approval responses are not returned. Tool results come directly after their calls, and a step's `reasoning` messages come directly before its assistant message, even a block the model produced after its text, because that message has one `content`. A client may send `reasoning` messages back or drop them: they are never committed, and neither choice causes `HistoryMismatch` or `HistoryDiverged`. `interrupts.runId` is the run that raised them, which TanStack AI needs. It is `undefined` if the store didn't record it.
 
-TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effentic rejects with `HistoryMismatch`. The `tanstack` example serves this route.
+TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effect-agent-harness rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
 
@@ -362,7 +362,7 @@ Neither history is an authorization boundary. A client that writes the prompt ca
 
 ## Authentication and run context
 
-effentic never sees the request's credentials. The route authenticates, and provides the result to the run as a service, the way any Effect dependency is provided. The agent can require that service directly, or a per-run `layer` turns it into the services the agent requires:
+effect-agent-harness never sees the request's credentials. The route authenticates, and provides the result to the run as a service, the way any Effect dependency is provided. The agent can require that service directly, or a per-run `layer` turns it into the services the agent requires:
 
 ```ts
 // What the route provides for each run: the principal it verified.
@@ -406,7 +406,7 @@ How it fits together:
 Three rules:
 
 - **Put the verified principal in a dependency, not the raw token.** A workflow's dependencies are persisted by `Runner.makeWorkflow` (and may end up in logs), and a token can expire before a resumed run reaches a tool. A tool that calls another API as the user should get credentials from a service keyed by the principal.
-- **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else. This is also the only check runs need. The client picks `runId` too, but effentic keys everything it stores for a run (checkpoints, the workflow execution, the event log) by thread id _and_ run id, so a run id reused on another thread finds nothing. Routes that read a run, such as an event stream, take the thread id as well and check it the same way.
+- **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else. This is also the only check runs need. The client picks `runId` too, but effect-agent-harness keys everything it stores for a run (checkpoints, the workflow execution, the event log) by thread id _and_ run id, so a run id reused on another thread finds nothing. Routes that read a run, such as an event stream, take the thread id as well and check it the same way.
 - **Treat `props` as untrusted.** They are whatever the client sent. Use them to choose between values you know (a locale, a display mode), and don't paste them into the system prompt.
 
 ## Tool approvals
@@ -696,7 +696,7 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 ## Module reference
 
-Everything is exported from `"effentic"` as namespaces.
+Everything is exported from `"effect-agent-harness"` as namespaces.
 
 | Module       | Main exports                                                                                                                                                                                                     |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

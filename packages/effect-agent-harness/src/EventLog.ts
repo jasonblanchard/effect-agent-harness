@@ -62,7 +62,7 @@ export class EventLog extends Context.Service<
       after?: string,
     ) => Effect.Effect<Stream.Stream<Stored, EventLogError>, InvalidCursor | EventLogError>;
   }
->()("effentic/EventLog") {}
+>()("effect-agent-harness/EventLog") {}
 
 interface RunLog {
   readonly events: Array<Stored>;

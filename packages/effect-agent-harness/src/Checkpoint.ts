@@ -36,7 +36,7 @@ export class Checkpoint extends Context.Service<
       effect: Effect.Effect<A, E, R>,
     ) => Effect.Effect<Memoized<A>, E, R>;
   }
->()("effentic/Checkpoint") {}
+>()("effect-agent-harness/Checkpoint") {}
 
 /** Always runs the effect and never replays. For tests and evals. */
 export const layerNone: Layer.Layer<Checkpoint> = Layer.succeed(Checkpoint)({
@@ -62,7 +62,7 @@ export class Ledger extends Context.Service<
     readonly get: (threadId: string, runId: string, name: string) => Effect.Effect<Option.Option<unknown>, LedgerError>;
     readonly set: (threadId: string, runId: string, name: string, exit: unknown) => Effect.Effect<void, LedgerError>;
   }
->()("effentic/Checkpoint/Ledger") {}
+>()("effect-agent-harness/Checkpoint/Ledger") {}
 
 /**
  * Memoises steps in the {@link Ledger} in context. Ledger and codec errors are

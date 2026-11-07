@@ -4,7 +4,7 @@ import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { convertMessagesToModelMessages, modelMessagesToUIMessages } from "@tanstack/ai";
 import type { ModelMessage } from "@tanstack/ai";
-import { Agent, AgUi, Checkpoint, EventLog, History, Runner, Sse, Thread } from "effentic";
+import { Agent, AgUi, Checkpoint, EventLog, History, Runner, Sse, Thread } from "effect-agent-harness";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
@@ -23,7 +23,7 @@ const assistant = Agent.define({
   }),
 });
 
-// Reasoning is switched on here, in the provider's config: effentic streams
+// Reasoning is switched on here, in the provider's config: effect-agent-harness streams
 // whatever the model produces, to every client. Without `display`, the API
 // returns thinking blocks with no text. `@effect/ai-anthropic`'s type doesn't
 // declare it yet, hence the separate constant.

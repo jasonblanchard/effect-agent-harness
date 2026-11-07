@@ -10,7 +10,7 @@ import * as Conversions from "./conversions.ts";
 // the package, so its rerun rules can change before they become a contract.
 // -----------------------------------------------------------------------------
 
-export const TypeId: unique symbol = Symbol.for("effentic/History");
+export const TypeId: unique symbol = Symbol.for("effect-agent-harness/History");
 export type TypeId = typeof TypeId;
 
 /** A terminal event of `Agent.run`. */
@@ -70,7 +70,10 @@ const logMalformed = (input: AgUi.RunAgentInput) =>
   Effect.gen(function* () {
     const malformed = Conversions.malformedAnswers(input.resume ?? []);
     if (malformed.length > 0) {
-      yield* Effect.logWarning("effentic: resolved answers that are not approval responses were denied", malformed);
+      yield* Effect.logWarning(
+        "effect-agent-harness: resolved answers that are not approval responses were denied",
+        malformed,
+      );
     }
   });
 
@@ -87,19 +90,19 @@ export const client: Service = {
       yield* logMalformed(input);
       if (converted.droppedCalls.length > 0) {
         yield* Effect.logWarning(
-          "effentic: tool calls whose arguments are not a JSON object were dropped from the client's history",
+          "effect-agent-harness: tool calls whose arguments are not a JSON object were dropped from the client's history",
           converted.droppedCalls,
         );
       }
       if (converted.orphanResults.length > 0) {
         yield* Effect.logWarning(
-          "effentic: tool messages with no call in the client's history were dropped",
+          "effect-agent-harness: tool messages with no call in the client's history were dropped",
           converted.orphanResults,
         );
       }
       if (converted.droppedParts.length > 0) {
         yield* Effect.logWarning(
-          "effentic: content parts other than text were dropped from tool results",
+          "effect-agent-harness: content parts other than text were dropped from tool results",
           converted.droppedParts,
         );
       }
@@ -163,7 +166,7 @@ export const server = (thread: Thread.Thread["Service"]): Service => ({
       yield* logMalformed(input);
       if (answered.droppedParts.length > 0) {
         yield* Effect.logWarning(
-          "effentic: content parts other than text were dropped from frontend tool results",
+          "effect-agent-harness: content parts other than text were dropped from frontend tool results",
           answered.droppedParts,
         );
       }
@@ -194,6 +197,8 @@ export const server = (thread: Thread.Thread["Service"]): Service => ({
     thread
       .release(input.threadId, input.runId)
       .pipe(
-        Effect.catchCause((cause) => Effect.logError("effentic: releasing a cancelled run's thread failed", cause)),
+        Effect.catchCause((cause) =>
+          Effect.logError("effect-agent-harness: releasing a cancelled run's thread failed", cause),
+        ),
       ),
 });

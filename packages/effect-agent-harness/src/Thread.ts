@@ -91,7 +91,7 @@ export class Thread extends Context.Service<
      */
     readonly runEnded: (threadId: string, runId: string, outcome: RunOutcome) => Effect.Effect<void, ThreadError>;
   }
->()("effentic/Thread") {}
+>()("effect-agent-harness/Thread") {}
 
 /** Keeps every thread in memory for the lifetime of the process. For tests, local development and examples. */
 export const layerMemory: Layer.Layer<Thread> = Layer.sync(Thread, () => {

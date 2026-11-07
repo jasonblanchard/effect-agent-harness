@@ -86,7 +86,7 @@ export interface FrontendTool {
  * it, and so can a tool handler whose tool declares
  * `dependencies: [Agent.CurrentRun]`. Never provide it yourself.
  */
-export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effentic/Agent/CurrentRun") {}
+export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effect-agent-harness/Agent/CurrentRun") {}
 
 /**
  * What a run emits. Events derived from a checkpoint served from the store
@@ -258,7 +258,10 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       const frontend = new Map<string, Tool.Any>();
       for (const tool of frontendTools) {
         if (Object.hasOwn(toolkit.tools, tool.name)) {
-          yield* Effect.logWarning("effentic: frontend tool ignored, a server tool has its name", tool.name);
+          yield* Effect.logWarning(
+            "effect-agent-harness: frontend tool ignored, a server tool has its name",
+            tool.name,
+          );
         } else if (!frontend.has(tool.name)) {
           frontend.set(
             tool.name,
@@ -513,7 +516,9 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       }),
       Effect.andThen(Queue.end(queue)),
       Effect.provideService(CurrentRun, info),
-      Effect.withSpan("effentic/Agent.run", { attributes: { runId: input.runId, threadId: input.threadId } }),
+      Effect.withSpan("effect-agent-harness/Agent.run", {
+        attributes: { runId: input.runId, threadId: input.threadId },
+      }),
     );
   });
 
@@ -663,8 +668,8 @@ export const orderToolResults = (prompt: Prompt.Prompt): Prompt.Prompt => {
 // Frontend calls
 // -----------------------------------------------------------------------------
 
-/** The options key of effentic's own marks on stored parts. Removed before the model is called. */
-const MARK = "effentic";
+/** The options key of the library's own marks on stored parts. Removed before the model is called. */
+const MARK = "agent";
 
 /** The call, marked as the client's to answer. */
 const markFrontend = (part: Prompt.ToolCallPart): Prompt.ToolCallPart =>

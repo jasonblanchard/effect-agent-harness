@@ -17,7 +17,7 @@
     "@ag-ui/client": "^1.0.3",
     "@effect/ai-anthropic": "4.0.5",
     "effect": "catalog:",
-    "effentic": "workspace:*"
+    "effect-agent-harness": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

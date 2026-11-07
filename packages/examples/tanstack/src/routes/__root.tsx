@@ -7,7 +7,7 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "effentic × TanStack AI" },
+      { title: "effect-agent-harness × TanStack AI" },
     ],
     links: [{ rel: "stylesheet", href: css }],
   }),

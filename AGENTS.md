@@ -1,10 +1,10 @@
-# effentic
+# effect-agent-harness
 
 Effect-based AG-UI agent library. pnpm monorepo:
 
-- `packages/effentic` — the library (`Agent`, `AgUi`, `AgUiSchema`, `Messages`, `History`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Sse` modules). Its only runtime dependency is `effect`; `AgUiSchema` is generated from the AG-UI JSON Schema. See its `AGENTS.md`.
+- `packages/effect-agent-harness` — the library (`Agent`, `AgUi`, `AgUiSchema`, `Messages`, `History`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Sse` modules). Its only runtime dependency is `effect`; `AgUiSchema` is generated from the AG-UI JSON Schema. See its `AGENTS.md`.
 - `packages/examples/ag-ui` — a runnable example wiring the library to Anthropic. See its `AGENTS.md`.
-- `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effentic backend. See its `AGENTS.md`.
+- `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effect-agent-harness backend. See its `AGENTS.md`.
 - `openspec/` — spec-driven change proposals (see "Planning changes" below).
 
 ## Commands
@@ -21,7 +21,7 @@ Run from the repo root. Each one delegates to the packages via `pnpm -r --if-pre
 
 Before calling work done, run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check`, and fix every finding. Lint runs with `--deny-warnings`, so warnings fail too. Don't silence a lint rule without saying why. CI (`.github/workflows/ci.yml`) runs the same four commands on every push to `main` and on every pull request.
 
-To target one package, filter by name: `pnpm --filter effentic test`. The root package is `effentic-monorepo`, so `--filter effentic` matches only the library.
+To target one package, filter by name: `pnpm --filter effect-agent-harness test`. The root package is `effect-agent-harness-monorepo`, so `--filter effect-agent-harness` matches only the library.
 
 ## Tooling rules
 

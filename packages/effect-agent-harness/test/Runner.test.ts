@@ -541,7 +541,7 @@ describe("Runner.makeAttached approvals", () => {
         {
           level: "Warn",
           message: [
-            "effentic: resolved answers that are not approval responses were denied",
+            "effect-agent-harness: resolved answers that are not approval responses were denied",
             [Agent.approvalIdFor("c_email")],
           ],
         },
@@ -2310,13 +2310,16 @@ describe("Runner client history", () => {
           {
             level: "Warn",
             message: [
-              "effentic: tool calls whose arguments are not a JSON object were dropped from the client's history",
+              "effect-agent-harness: tool calls whose arguments are not a JSON object were dropped from the client's history",
               ["c_cut"],
             ],
           },
           {
             level: "Warn",
-            message: ["effentic: tool messages with no call in the client's history were dropped", ["t_orphan"]],
+            message: [
+              "effect-agent-harness: tool messages with no call in the client's history were dropped",
+              ["t_orphan"],
+            ],
           },
         ]);
       }),

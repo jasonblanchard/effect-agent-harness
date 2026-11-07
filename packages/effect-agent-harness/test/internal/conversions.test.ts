@@ -86,7 +86,7 @@ const frontendCalls = (id: string, ...callIds: Array<string>): Messages.Entry =>
         name: "pick-file",
         params: {},
         providerExecuted: false,
-        options: { effentic: { frontend: true } },
+        options: { agent: { frontend: true } },
       }),
     ),
   }),

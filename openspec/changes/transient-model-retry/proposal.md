@@ -20,7 +20,7 @@ A transient model failure, such as a 429 or `overloaded`, ends a run, and nothin
 
 ## Impact
 
-- **`packages/effentic/src/Agent.ts`:**
+- **`packages/effect-agent-harness/src/Agent.ts`:**
   - The model step catches `AiError` before `orDie`.
   - It tracks whether a part has been emitted, and retries with the configured schedule.
   - Its `StepStarted` and `messageId` are generated once per step, not once per attempt.
