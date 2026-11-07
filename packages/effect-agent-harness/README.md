@@ -1,5 +1,39 @@
 # effect-agent-harness
 
+This is an experimental library that answers the question: what would it look like to have an effect native agent harness that is AG-UI compatible and has first class, pluggable extension points for 3 planes of durability:
+
+- **Durable message history** - for recovering the full conversation state
+- **Durable streaming** - for reading and reconnecting to streaming output
+- **Durable compute** - for graceful handling of compute interrupts (i.e. a rolling deploy or a crashe)
+
+## Core primitives
+
+- **Agent** - the behavior (tools and system prompt) of the agent itself. Defined outside its runner so that it can be evaluated in isolation without runtime concerns like state, durability, etc.
+  - **Plugin (todo)** - a wrapper for adding behavior to an agent (agent)(args) => agent
+  - Subagents (todo) - a thin wrapper around tools that make them behave like subagents per the AG-UI spec
+- **Runner** - the container that orchestrates the agent loop. This is where the Agent is decorated with runtime concerns like state, durability, etc. Choose between in-process, detached, effect workflow, or bring your own.
+- **History** - how messages state is prepared for a run. Choose between client authoritative history or server authoritative history.
+- **Thread** - abstract thread storage and lifecycle. Use the built ins or bring your own.
+- **Checkpoint** - captures moments of the agent lifecycle that you would joirnal in a durable compute log.
+- **EventLog** - Stream of AG-UI events. Use the built ins (ie SSE, in memory) or bring your own (durable streams)
+
+All other agent harness functionality is a composition of these core primitives or effect’s core primitives:
+
+- Compaction - Thread lifecycle / system prompt construction
+- Generated media capture and display- Thread lifecycle
+- Memory - tool definitions, system prompt construction, Thread lifecycle
+- Model provider compatibility - delegated to Effect core
+- Skills - tool definitions and system prompt construction
+- ...TBD
+
+In some cases, this may trade off “batteries included” library completeness for simplicity. That’s ok. The goal is simple ideas that avoid library sprawl while encapsulating just enough to provide a “pit success” for making agents with effect.
+
+## Stability
+
+⚠️ Under construction ⚠️
+
+# Robo documentation
+
 Build [AG-UI](https://docs.ag-ui.com) agents with [Effect](https://effect.website).
 
 effect-agent-harness runs an agent (a model, a set of tools, a system prompt) and streams the run to any AG-UI client, such as `@ag-ui/client`'s `HttpAgent` or CopilotKit. It is built on `effect/ai`, so it works with any Effect model provider.
