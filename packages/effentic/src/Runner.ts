@@ -29,7 +29,7 @@ export type AnyRunContext = RunContextClass<any, string, any>;
 export type AnyService = Context.Key<any, any>;
 
 /**
- * Declares a per-run dependency a {@link workflow} can persist, such as the
+ * Declares a per-run dependency a {@link makeWorkflow} can persist, such as the
  * verified principal: a service key plus the schema of its value.
  *
  * ```ts
@@ -41,7 +41,7 @@ export type AnyService = Context.Key<any, any>;
  * A workflow's {@link DetachedOptions.dependencies} must be run contexts,
  * because the engine persists each one in the run's payload, encoded with its
  * schema. The detached runner takes any service, so a plain `Context.Service`
- * is enough there; a run context works too. A request-scoped {@link run}
+ * is enough there; a run context works too. A request-scoped {@link makeAttached}
  * declares nothing: the agent requires the service, and the route provides it.
  */
 export const RunContext =
@@ -57,7 +57,7 @@ export const RunContext =
 /** The services a runner's {@link DetachedOptions.dependencies} name. */
 export type DependencyServices<Dependencies extends ReadonlyArray<AnyService>> = Dependencies[number]["Identifier"];
 
-/** Options of every runner. {@link run} takes exactly these. */
+/** Options of every runner. {@link makeAttached} takes exactly these. */
 export interface Options<ROut = never, E = never, RIn = never> {
   /**
    * What to do with `system` and `developer` messages sent by the client.
@@ -72,11 +72,11 @@ export interface Options<ROut = never, E = never, RIn = never> {
    * lives until the attempt ends. It is not memoised: a run executed again
    * builds it again. A failure to build it ends the run with `RUN_ERROR`.
    *
-   * With {@link run} you can instead provide the layer on the run's stream
+   * With {@link makeAttached} you can instead provide the layer on the run's stream
    * (`Stream.provide`), but then a failure to build it fails the stream
    * instead of ending the run with `RUN_ERROR`. A detached run needs `layer`,
    * so its services live as long as the run rather than the call to `start`,
-   * and so does a {@link workflow}, which rebuilds its services from the
+   * and so does a {@link makeWorkflow}, which rebuilds its services from the
    * persisted dependencies on every replay.
    */
   readonly layer?: Layer.Layer<ROut, E, RIn>;
@@ -84,7 +84,7 @@ export interface Options<ROut = never, E = never, RIn = never> {
 
 /**
  * Options of the runners that capture their services when they're built
- * ({@link makeDetached}, {@link workflow}), which therefore name the services
+ * ({@link makeDetached}, {@link makeWorkflow}), which therefore name the services
  * to leave out of the capture.
  */
 export interface DetachedOptions<
@@ -97,7 +97,7 @@ export interface DetachedOptions<
    * Services each run requires from whoever starts it, such as the verified
    * principal, instead of capturing them when the runner is built, as a tool's
    * `dependencies` are required per call. Provide them around each `start`
-   * (`Effect.provideService`). Any service key, except for a {@link workflow},
+   * (`Effect.provideService`). Any service key, except for a {@link makeWorkflow},
    * which takes {@link RunContext}s.
    */
   readonly dependencies?: Dependencies;
@@ -110,7 +110,7 @@ export interface DetachedOptions<
  * outside, because the run uses it before its per-run services exist. No
  * thread store: the run's {@link History.History} is optional, and
  * `History.layerServer` brings its own. A detached or workflow runner captures
- * this when it's built; {@link run} has no dependencies and leaves it on each
+ * this when it's built; {@link makeAttached} has no dependencies and leaves it on each
  * stream.
  */
 export type Requirements<
@@ -261,9 +261,11 @@ const pipeline =
   };
 
 /**
- * Runs an agent for one AG-UI `RunAgentInput`, scoped to the stream: when the
- * consumer stops reading (a client disconnects, `abortRun()`), the run is
- * cancelled, including any model request or tool call in progress.
+ * A runner whose runs are attached to their consumer. It gives a function from
+ * an AG-UI `RunAgentInput` to the run's event stream, and the run is scoped to
+ * that stream: when the consumer stops reading (a client disconnects,
+ * `abortRun()`), the run is cancelled, including any model request or tool call
+ * in progress.
  *
  * Nothing is captured: the function is plain, and each stream requires the
  * agent's services (a per-run service such as the verified principal among
@@ -280,7 +282,7 @@ const pipeline =
  * `effect/http`, keep those services in the app layer's output
  * (`Layer.provideMerge`), which the web handler provides to every request.
  */
-export const run = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
+export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
   agent: Agent.Agent<Tools, R>,
   options?: Options<ROut, E, RIn>,
 ) => {
@@ -360,7 +362,7 @@ const detached =
  * services again; the dependencies are not stored, so provide the ones the first call had. With a durable
  * `Checkpoint` (e.g. `Checkpoint.layerLedger`) completed steps are replayed
  * rather than executed again. Do not start the same run twice concurrently:
- * supervising runs is the caller's concern here, or use {@link workflow}.
+ * supervising runs is the caller's concern here, or use {@link makeWorkflow}.
  *
  * The run's {@link History.History} is the one in the context the runner was
  * built in, unless one is provided around `start`, which wins: the context
@@ -422,7 +424,7 @@ export interface WorkflowOptions<
 }
 
 /**
- * The fields of what {@link workflow} persists per run: the AG-UI input and,
+ * The fields of what {@link makeWorkflow} persists per run: the AG-UI input and,
  * when the runner has dependencies, their values keyed by each run context's
  * key, encoded with their schemas.
  */
@@ -464,7 +466,7 @@ interface PayloadParts {
  * execution has only its persisted payload, which can't hold a service, so the
  * history can't vary per run: register a second workflow for the other one.
  */
-export const workflow = <
+export const makeWorkflow = <
   Tools extends Record<string, Tool.Any>,
   R,
   const Dependencies extends ReadonlyArray<AnyRunContext> = readonly [],

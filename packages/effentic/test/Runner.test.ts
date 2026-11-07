@@ -131,7 +131,7 @@ const spyThread = (
 
 const loadThread = Effect.flatMap(Thread.Thread, (thread) => thread.load("t1"));
 
-describe("Runner.run", () => {
+describe("Runner.makeAttached", () => {
   it.effect("builds the second run's prompt from the stored first run", () =>
     Effect.gen(function* () {
       const model = scriptedModel([...weatherTurn, [...text("0", "Still 18°C."), finish("stop")]]);
@@ -226,7 +226,7 @@ describe("Runner.run", () => {
   );
 });
 
-describe("Runner.run commits", () => {
+describe("Runner.makeAttached commits", () => {
   it.effect("commits the delta, then each step's entries, then reports the end", () =>
     Effect.gen(function* () {
       const spy = spyThread();
@@ -331,7 +331,7 @@ describe("Runner.run commits", () => {
     Effect.gen(function* () {
       const spy = spyThread();
       const model = scriptedModel([...weatherTurn]);
-      yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "Weather in Paris?")])).pipe(
+      yield* Runner.makeAttached(weatherAgent)(input("r1", [userMessage("u1", "Weather in Paris?")])).pipe(
         Stream.takeUntil((event) => event.type === "TOOL_CALL_RESULT"),
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
@@ -368,7 +368,7 @@ describe("Runner one run per thread", () => {
         [...text("0", "Hi again."), finish("stop")],
       ]);
       yield* Effect.gen(function* () {
-        const first = yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
+        const first = yield* Runner.makeAttached(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
           Stream.tap((event) =>
             event.type === "TEXT_MESSAGE_CONTENT"
               ? Deferred.succeed(streaming, undefined)
@@ -435,7 +435,7 @@ describe("Runner one run per thread", () => {
   });
 });
 
-describe("Runner.run approvals", () => {
+describe("Runner.makeAttached approvals", () => {
   const emailStep: Step = [
     ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
     finish("tool-calls"),
@@ -601,7 +601,7 @@ describe("Runner.run approvals", () => {
   );
 });
 
-describe("Runner.run frontend tools", () => {
+describe("Runner.makeAttached frontend tools", () => {
   const withTools = (runInput: AgUi.RunAgentInput): AgUi.RunAgentInput => ({ ...runInput, tools: [PickFile] });
   const pickStep: Step = [...toolCall("c_pick", "pick-file", {}), finish("tool-calls")];
   const clientAfterPickTurn: ReadonlyArray<AgUi.Message> = [
@@ -1077,7 +1077,7 @@ describe("Runner thread history", () => {
   );
 });
 
-describe("Runner.run prompt memo", () => {
+describe("Runner.makeAttached prompt memo", () => {
   it.effect("uses the original projection when a run is executed again after the thread changed", () => {
     const spy = spyThread();
     return Effect.gen(function* () {
@@ -1085,7 +1085,7 @@ describe("Runner.run prompt memo", () => {
       const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUi.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Runner.run(weatherAgent)(run1);
+          const events = Runner.makeAttached(weatherAgent)(run1);
           yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer]),
@@ -1119,7 +1119,7 @@ describe("Runner.run prompt memo", () => {
   });
 });
 
-describe("Runner.run run ids", () => {
+describe("Runner.makeAttached run ids", () => {
   const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
 
   it.effect("replays nothing from a run id reused on another thread", () =>
@@ -1391,7 +1391,7 @@ describe("Runner.makeDetached", () => {
   );
 });
 
-describe("Runner.workflow", () => {
+describe("Runner.makeWorkflow", () => {
   const run1 = input("r1", [userMessage("u1", "Weather in Paris?")]);
 
   it.effect("runs inside the in-memory engine like the request-scoped runner", () =>
@@ -1403,7 +1403,7 @@ describe("Runner.workflow", () => {
 
       const model = scriptedModel(weatherTurn);
       const weather = countingWeatherLayer();
-      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
+      const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       const events = yield* Effect.gen(function* () {
         yield* workflow.execute({ input: run1 }, { discard: true });
         const log = yield* EventLog.EventLog;
@@ -1442,8 +1442,8 @@ describe("Runner.workflow", () => {
         [...text("0", "Hi."), finish("stop")],
         [...text("0", "Hi."), finish("stop")],
       ]);
-      const weather = Runner.workflow(weatherAgent, { name: "weather" });
-      const brief = Runner.workflow(briefAgent, { name: "brief" });
+      const weather = Runner.makeWorkflow(weatherAgent, { name: "weather" });
+      const brief = Runner.makeWorkflow(briefAgent, { name: "brief" });
       yield* Effect.gen(function* () {
         yield* weather.workflow.execute({ input: input("r1", [userMessage("u1", "hi")]) });
         yield* brief.workflow.execute({ input: { threadId: "t2", runId: "r1", messages: [userMessage("u1", "hi")] } });
@@ -1473,7 +1473,7 @@ describe("Runner.workflow", () => {
   it.effect("runs a run id reused on another thread as its own execution", () =>
     Effect.gen(function* () {
       const weather = countingWeatherLayer();
-      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
+      const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
         const log = yield* EventLog.EventLog;
         yield* workflow.execute({ input: run1 });
@@ -1547,7 +1547,7 @@ describe("Runner run info", () => {
     runInput: AgUi.RunAgentInput,
   ) =>
     Effect.gen(function* () {
-      const events = Array.from(yield* Stream.runCollect(Runner.run(agent)(runInput)));
+      const events = Array.from(yield* Stream.runCollect(Runner.makeAttached(agent)(runInput)));
       yield* Effect.promise(() => verify(events));
       return events;
     });
@@ -1661,7 +1661,7 @@ describe("Runner run contexts", () => {
   it("leaves the run context on each stream for the caller to provide", () => {
     const run1 = input("r1", []);
     // Made outside any Effect: nothing is captured, and each stream requires the services.
-    const runner = Runner.run(userAgent, { layer: userLayer().layer });
+    const runner = Runner.makeAttached(userAgent, { layer: userLayer().layer });
     const unprovided = runner(run1);
     expectTypeOf<StreamRequires<typeof unprovided, AuthContext>>().toEqualTypeOf<true>();
     // The history is optional: the stream requires neither it nor a thread store.
@@ -1671,17 +1671,17 @@ describe("Runner run contexts", () => {
     expectTypeOf<StreamRequires<typeof provided, AuthContext>>().toEqualTypeOf<false>();
     expectTypeOf<StreamRequires<typeof provided, CurrentUser>>().toEqualTypeOf<false>();
     // An agent without per-run services adds no requirement.
-    const plain = Runner.run(weatherAgent)(run1);
+    const plain = Runner.makeAttached(weatherAgent)(run1);
     expectTypeOf<StreamRequires<typeof plain, AuthContext>>().toEqualTypeOf<false>();
     // There is nothing to declare: the route provides what the stream requires.
-    // @ts-expect-error `run` takes no dependencies
-    Runner.run(userAgent, { dependencies: [AuthContext] });
+    // @ts-expect-error `makeAttached` takes no dependencies
+    Runner.makeAttached(userAgent, { dependencies: [AuthContext] });
   });
 
   it("leaves what the per-run layer doesn't provide on each stream", () => {
     const run1 = input("r1", []);
     const { layer } = userLayer();
-    const stream = Runner.run(userAgent, { layer })(run1);
+    const stream = Runner.makeAttached(userAgent, { layer })(run1);
     expectTypeOf<StreamRequires<typeof stream, CurrentUser>>().toEqualTypeOf<false>();
     expectTypeOf<StreamRequires<typeof stream, Tenant>>().toEqualTypeOf<false>();
     expectTypeOf<StreamRequires<typeof stream, AuthContext>>().toEqualTypeOf<true>();
@@ -1694,21 +1694,21 @@ describe("Runner run contexts", () => {
         return { userId: directory.known.includes(auth.userId) ? auth.userId : "guest" };
       }),
     );
-    const withDirectory = Runner.run(userAgent, {
+    const withDirectory = Runner.makeAttached(userAgent, {
       layer: Layer.effect(Tenant)(Effect.succeed({ id: "acme" })).pipe(Layer.provideMerge(fromDirectory)),
     })(run1);
     expectTypeOf<StreamRequires<typeof withDirectory, Directory>>().toEqualTypeOf<true>();
     expectTypeOf<StreamRequires<typeof withDirectory, AuthContext>>().toEqualTypeOf<true>();
 
     // Without a layer providing them, the agent's per-run services stay required.
-    const unprovided = Runner.run(userAgent)(run1);
+    const unprovided = Runner.makeAttached(userAgent)(run1);
     expectTypeOf<StreamRequires<typeof unprovided, CurrentUser>>().toEqualTypeOf<true>();
   });
 
   it.effect("builds each run's services from the run context it was provided", () => {
     const handlers = userHandlers();
     const { layer, counts } = userLayer();
-    const runAgent = Runner.run(userAgent, { layer });
+    const runAgent = Runner.makeAttached(userAgent, { layer });
     return Effect.gen(function* () {
       for (const [threadId, userId] of [
         ["t1", "u1"],
@@ -1739,7 +1739,7 @@ describe("Runner run contexts", () => {
     const handlers = userHandlers();
     const { layer, counts } = userLayer();
     // No `layer` option: the caller provides the layer on the stream, and what it reads.
-    const runAgent = Runner.run(userAgent);
+    const runAgent = Runner.makeAttached(userAgent);
     return Effect.gen(function* () {
       const events = Array.from(
         yield* Stream.runCollect(
@@ -1754,7 +1754,7 @@ describe("Runner run contexts", () => {
 
   it.effect("forwards a run context the caller already holds, closing over the rest", () => {
     const handlers = userHandlers();
-    const runAgent = Runner.run(userAgent, { layer: userLayer().layer });
+    const runAgent = Runner.makeAttached(userAgent, { layer: userLayer().layer });
     return Effect.gen(function* () {
       // As a route does when auth middleware provided `AuthContext` to it: the
       // handler closes over its own context, and the stream is consumed after it returned.
@@ -1776,7 +1776,7 @@ describe("Runner run contexts", () => {
       const forwardedProps = { [AuthContext.key]: { userId: "u2" }, userId: "u2" };
       const events = Array.from(
         yield* Stream.runCollect(
-          Runner.run(userAgent, { layer: userLayer().layer })({
+          Runner.makeAttached(userAgent, { layer: userLayer().layer })({
             ...input("r1", [userMessage("u1", "hi")]),
             forwardedProps,
           }).pipe(asUser("u1")),
@@ -1795,7 +1795,9 @@ describe("Runner run contexts", () => {
       const failing = userLayer({ fail: true });
       const events = Array.from(
         yield* Stream.runCollect(
-          Runner.run(userAgent, { layer: failing.layer })(input("r1", [userMessage("u1", "hi")])).pipe(asUser("u1")),
+          Runner.makeAttached(userAgent, { layer: failing.layer })(input("r1", [userMessage("u1", "hi")])).pipe(
+            asUser("u1"),
+          ),
         ).pipe(Effect.provide([model.layer, handlers.layer, spy.layer])),
       );
       yield* Effect.promise(() => verify(events));
@@ -1807,9 +1809,9 @@ describe("Runner run contexts", () => {
       // The input was not memoised: the same run id with another input is not a mismatch.
       const retried = Array.from(
         yield* Stream.runCollect(
-          Runner.run(userAgent, { layer: userLayer().layer })(input("r1", [userMessage("u2", "hi again")])).pipe(
-            asUser("u1"),
-          ),
+          Runner.makeAttached(userAgent, { layer: userLayer().layer })(
+            input("r1", [userMessage("u2", "hi again")]),
+          ).pipe(asUser("u1")),
         ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, handlers.layer, spy.layer])),
       );
       expect(retried.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
@@ -1828,14 +1830,16 @@ describe("Runner run contexts", () => {
     Effect.gen(function* () {
       const finished = userLayer();
       yield* Stream.runDrain(
-        Runner.run(userAgent, { layer: finished.layer })(input("r1", [userMessage("u1", "hi")])).pipe(asUser("u1")),
+        Runner.makeAttached(userAgent, { layer: finished.layer })(input("r1", [userMessage("u1", "hi")])).pipe(
+          asUser("u1"),
+        ),
       ).pipe(Effect.provide([scriptedModel(whoIsUserTurn()).layer, userHandlers().layer, evalLayers, serverStores]));
       expect(finished.counts).toEqual({ builds: 1, finalized: 1 });
 
       const cancelled = userLayer();
       const model = scriptedModel([Stream.fromIterable(text("0", "Hel", "lo")).pipe(Stream.concat(Stream.never))]);
       const firstEvents = yield* Stream.runCollect(
-        Runner.run(userAgent, { layer: cancelled.layer })(input("r1", [userMessage("u1", "hi")])).pipe(
+        Runner.makeAttached(userAgent, { layer: cancelled.layer })(input("r1", [userMessage("u1", "hi")])).pipe(
           asUser("u1"),
           Stream.takeUntil((event) => event.type === "TEXT_MESSAGE_CONTENT"),
         ),
@@ -1849,7 +1853,7 @@ describe("Runner run contexts", () => {
     Effect.gen(function* () {
       const handlers = userHandlers();
       const run1 = input("r1", [userMessage("u1", "hi")]);
-      const runner = Runner.run(userAgent, { layer: userLayer().layer });
+      const runner = Runner.makeAttached(userAgent, { layer: userLayer().layer });
       // Attempt 1 stops while step 2 is streaming, after step 1's tool call ran as u1.
       yield* Stream.runDrain(
         runner(run1).pipe(
@@ -2007,7 +2011,7 @@ describe("Runner run contexts", () => {
       Effect.gen(function* () {
         const handlers = userHandlers();
         const perRun = userLayer();
-        const { start, layer } = Runner.workflow(userAgent, {
+        const { start, layer } = Runner.makeWorkflow(userAgent, {
           name: "who-is-user",
           dependencies: [AuthContext],
           layer: perRun.layer,
@@ -2034,16 +2038,20 @@ describe("Runner run contexts", () => {
       // Never called: only their types matter, and the second would fail without a schema.
       const workflows = [
         () =>
-          Runner.workflow(userAgent, { name: "who-is-user", dependencies: [AuthContext], layer: userLayer().layer }),
+          Runner.makeWorkflow(userAgent, {
+            name: "who-is-user",
+            dependencies: [AuthContext],
+            layer: userLayer().layer,
+          }),
         // @ts-expect-error A plain service has no schema to persist it with.
-        () => Runner.workflow(userAgent, { name: "who-is-user", dependencies: [Principal] }),
+        () => Runner.makeWorkflow(userAgent, { name: "who-is-user", dependencies: [Principal] }),
       ];
       expect(workflows).toHaveLength(2);
     });
 
     it.effect("gives a run's execution id from its input", () =>
       Effect.gen(function* () {
-        const { workflow, executionId } = Runner.workflow(userAgent, {
+        const { workflow, executionId } = Runner.makeWorkflow(userAgent, {
           name: "who-is-user",
           dependencies: [AuthContext],
           layer: userLayer().layer,
@@ -2057,7 +2065,7 @@ describe("Runner run contexts", () => {
     it.effect("fails to start a run whose run context fails its schema", () =>
       Effect.gen(function* () {
         const handlers = userHandlers();
-        const { start, layer } = Runner.workflow(userAgent, {
+        const { start, layer } = Runner.makeWorkflow(userAgent, {
           name: "who-is-user",
           dependencies: [AuthContext],
           layer: userLayer().layer,
@@ -2339,7 +2347,7 @@ describe("Runner client history", () => {
         textTurn("Hi again."),
       ]);
       yield* Effect.gen(function* () {
-        const first = yield* Runner.run(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
+        const first = yield* Runner.makeAttached(weatherAgent)(input("r1", [userMessage("u1", "hi")])).pipe(
           Stream.tap((event) =>
             event.type === "TEXT_MESSAGE_CONTENT" ? Deferred.succeed(streaming, undefined) : Effect.void,
           ),
@@ -2362,7 +2370,7 @@ describe("Runner client history", () => {
       const spy = spyThread();
       return Effect.gen(function* () {
         const model = scriptedModel([textTurn("Stored."), textTurn("Not stored.")]);
-        const runner = Runner.run(weatherAgent);
+        const runner = Runner.makeAttached(weatherAgent);
         yield* Effect.gen(function* () {
           const server = Array.from(
             yield* Stream.runCollect(
@@ -2410,7 +2418,7 @@ describe("Runner client history", () => {
   it.effect("gives a workflow the server history provided to its layer", () =>
     Effect.gen(function* () {
       const model = scriptedModel([textTurn("Hi."), textTurn("Hi again.")]);
-      const { workflow, layer } = Runner.workflow(weatherAgent, { name: "weather" });
+      const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
         const log = yield* EventLog.EventLog;
         yield* workflow.execute({ input: input("r1", [userMessage("u1", "hi")]) });

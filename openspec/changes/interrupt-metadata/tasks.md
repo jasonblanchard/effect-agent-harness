@@ -3,7 +3,7 @@
 - [ ] 1.1 Add `interruptMetadata?: (interrupt: Interrupt, run: { threadId; runId }) => Record<string, unknown> | undefined` to `Runner.Options`, documented as a pure function of its arguments, applied by every runner and unable to change any field but `metadata`
 - [ ] 1.2 Give `AgUi.fold` an optional options argument carrying the hook. On `Finished` with approvals, call it for each built interrupt and set `metadata` only when it returns an object
 - [ ] 1.3 Catch a throwing hook in `fold`: emit that interrupt without `metadata` and log `Effect.logWarning` with the interrupt id and error, keeping the stream's error type `never` and the other events on the pure path
-- [ ] 1.4 Pass `Options.interruptMetadata` to `fold` from `run`/`make`, `makeDetached` and `workflow` (`WorkflowOptions` extends `Options`, so it inherits the field)
+- [ ] 1.4 Pass `Options.interruptMetadata` to `fold` from `makeAttached`/`make`, `makeDetached` and `makeWorkflow` (`WorkflowOptions` extends `Options`, so it inherits the field)
 
 ## 2. Library: tests
 

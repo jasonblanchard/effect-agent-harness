@@ -1,6 +1,6 @@
 ## Why
 
-A transient model failure, such as a 429 or `overloaded`, ends a run, and nothing on the way can retry it (review finding #8). The model step calls `Effect.orDie` before `Checkpoint.memo`, so the typed `AiError` becomes a defect, and the memo stores it like any other non-interrupt exit. Re-executing the run replays the stored failure. This hurts `Runner.workflow` most, since durability is the point of using it. The README's advice to "retry with a new `runId`" still works, but it hands every transient fault to the client and the user.
+A transient model failure, such as a 429 or `overloaded`, ends a run, and nothing on the way can retry it (review finding #8). The model step calls `Effect.orDie` before `Checkpoint.memo`, so the typed `AiError` becomes a defect, and the memo stores it like any other non-interrupt exit. Re-executing the run replays the stored failure. This hurts `Runner.makeWorkflow` most, since durability is the point of using it. The README's advice to "retry with a new `runId`" still works, but it hands every transient fault to the client and the user.
 
 ## What Changes
 

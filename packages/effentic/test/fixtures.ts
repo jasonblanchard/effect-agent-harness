@@ -226,7 +226,7 @@ export const verify = async (events: ReadonlyArray<AgUi.Event>): Promise<Array<B
 };
 
 /**
- * Runs each input through `Runner.run`, one after another, and returns each
+ * Runs each input through `Runner.makeAttached`, one after another, and returns each
  * run's AG-UI events, already verified. The runs use the client history,
  * unless a history is provided around it: provide one `serverStores` so the
  * runs share a thread store.
@@ -238,7 +238,7 @@ export const runAgUi = <Tools extends Record<string, Tool.Any>, R>(
 ) =>
   Effect.forEach(inputs, (input) =>
     Effect.gen(function* () {
-      const events = Array.from(yield* Stream.runCollect(Runner.run(agent, options)(input)));
+      const events = Array.from(yield* Stream.runCollect(Runner.makeAttached(agent, options)(input)));
       yield* Effect.promise(() => verify(events));
       return events;
     }),

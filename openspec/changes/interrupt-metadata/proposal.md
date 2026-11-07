@@ -4,7 +4,7 @@ effentic's approval interrupts are plain AG-UI interrupts, and some clients won'
 
 ## What Changes
 
-- **New runner option `interruptMetadata`.** It goes on the construction-time `Runner.Options`, not on the per-run `RunOptions`, so it applies to every runner (`run`, `make`, `makeDetached`, `workflow`). It's a pure function from an interrupt the library has built (`id`, `reason`, `toolCallId`, `message`, `responseSchema`) and the run's `{ threadId, runId }` to a metadata object, or `undefined` for none. The runner puts the result on that interrupt's `metadata`.
+- **New runner option `interruptMetadata`.** It goes on the construction-time `Runner.Options`, not on the per-run `RunOptions`, so it applies to every runner (`makeAttached`, `make`, `makeDetached`, `makeWorkflow`). It's a pure function from an interrupt the library has built (`id`, `reason`, `toolCallId`, `message`, `responseSchema`) and the run's `{ threadId, runId }` to a metadata object, or `undefined` for none. The runner puts the result on that interrupt's `metadata`.
 - **Default unchanged.** Without the option, interrupts are emitted exactly as today, with no `metadata` field.
 - **Safe by construction.** If the function throws, the interrupt is emitted without metadata, the failure is logged as a warning, and the run still ends with its normal `RUN_FINISHED` interrupt outcome. The event streams keep their error type `never`.
 - **Stored with the event.** The metadata is part of the emitted event, so the `EventLog` stores it, and a client following a detached run sees the same interrupt as one that streamed it.

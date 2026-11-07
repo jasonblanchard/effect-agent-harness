@@ -52,7 +52,9 @@ describe("Sse.encode", () => {
   it.effect("encodes each event as one SSE data frame, in order", () =>
     Effect.gen(function* () {
       const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
-      const frames = yield* Stream.runCollect(Sse.encode(Runner.run(weatherAgent)(input))).pipe(Effect.provide(layer));
+      const frames = yield* Stream.runCollect(Sse.encode(Runner.makeAttached(weatherAgent)(input))).pipe(
+        Effect.provide(layer),
+      );
       expect(parseSse(frames.join(""))).toEqual([
         { type: "RUN_STARTED", threadId: "t1", runId: "r1", protocolVersion: "1.0" },
         { type: "STEP_STARTED", stepName: "step-1" },
@@ -115,7 +117,7 @@ describe("Sse.response", () => {
   it.effect("gives the body the services of the context it was built in", () =>
     Effect.gen(function* () {
       const { layer } = services([[...text("0", "Hello"), finish("stop")]]);
-      const runAgent = Runner.run(weatherAgent);
+      const runAgent = Runner.makeAttached(weatherAgent);
       const built = Sse.response(Sse.encode(runAgent(input)));
       // The effect requires what the run needs; the response it builds requires nothing.
       expectTypeOf<Effect.Services<typeof built>>().toEqualTypeOf<Stream.Services<ReturnType<typeof runAgent>>>();
@@ -136,12 +138,12 @@ describe("Sse.response", () => {
   );
 });
 
-describe("Runner.run", () => {
+describe("Runner.makeAttached", () => {
   it.effect("returns a stream the route closes over and consumes after its handler has returned", () =>
     Effect.gen(function* () {
       const { layer } = services([[...text("0", "Hel", "lo"), finish("stop")]]);
       // Made outside any Effect: nothing is captured until a request runs it.
-      const runAgent = Runner.run(weatherAgent);
+      const runAgent = Runner.makeAttached(weatherAgent);
       // As a request handler does: it provides its own context to the stream and returns it.
       const handler = Effect.gen(function* () {
         const stream = runAgent(input);
@@ -174,7 +176,7 @@ describe("Runner.run", () => {
           Stream.ensuring(Effect.sync(() => (interrupted = true))),
         ),
       ]);
-      const events = yield* Stream.runCollect(Runner.run(weatherAgent)(input).pipe(Stream.take(3))).pipe(
+      const events = yield* Stream.runCollect(Runner.makeAttached(weatherAgent)(input).pipe(Stream.take(3))).pipe(
         Effect.provide(layer),
       );
       expect(events.map((e) => e.type)).toEqual(["RUN_STARTED", "STEP_STARTED", "TEXT_MESSAGE_START"]);
@@ -194,7 +196,7 @@ afterEach(async () => {
 
 /** The agent's route. The handler requires what the run's stream needs; the router's layer provides it. */
 const agentRoute = <Tools extends Record<string, Tool.Any>>(agent: Agent.Agent<Tools>) => {
-  const runAgent = Runner.run(agent);
+  const runAgent = Runner.makeAttached(agent);
   return HttpRouter.use((router) =>
     router.add(
       "POST",

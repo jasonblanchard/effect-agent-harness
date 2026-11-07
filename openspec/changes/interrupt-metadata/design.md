@@ -1,6 +1,6 @@
 ## Context
 
-`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `AgUiSchema.Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `run`/`make` stream it, and `makeDetached` and `workflow` publish it to the `EventLog`. `Interrupt.metadata` is already an optional, open `Metadata` (`Record<string, Schema.Json>`) in `AgUiSchema`, so the hook's values must be JSON; effentic never sets it.
+`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `AgUiSchema.Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `makeAttached`/`make` stream it, and `makeDetached` and `makeWorkflow` publish it to the `EventLog`. `Interrupt.metadata` is already an optional, open `Metadata` (`Record<string, Schema.Json>`) in `AgUiSchema`, so the hook's values must be JSON; effentic never sets it.
 
 TanStack AI 1.0's client (read from the installed 1.0.0 source) treats an interrupt as resolvable only when `metadata["tanstack:interruptBinding"]` holds a binding of a version it knows. The minimal form is:
 
@@ -36,7 +36,7 @@ TanStack AI 1.0's client (read from the installed 1.0.0 source) treats an interr
 `interruptMetadata` is set when the runner is built: `Runner.make(agent, { interruptMetadata })`.
 - **Why not per run:** the workflow runner persists `RunOptions` (`WorkflowPayload.context`), and a function can't be persisted. Which client protocol a server speaks is a deployment choice made once, not something each request decides.
 - **Per-run data still reaches it:** the run's `threadId` and `runId` are passed in, which is everything the TanStack binding needs.
-- **Alternative considered:** `RunOptions.interruptMetadata`, which allows per-request variation. Rejected: it can't work for `workflow`, so the four runners would differ.
+- **Alternative considered:** `RunOptions.interruptMetadata`, which allows per-request variation. Rejected: it can't work for `makeWorkflow`, so the four runners would differ.
 
 ### A synchronous, pure function
 

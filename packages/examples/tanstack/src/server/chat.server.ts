@@ -67,7 +67,7 @@ const toUIMessages = (messages: History.Restored["messages"]) =>
 
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const runAgent = Runner.run(assistant);
+    const runAgent = Runner.makeAttached(assistant);
 
     // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
     // true`). On mount, the page restores the thread's messages and its open

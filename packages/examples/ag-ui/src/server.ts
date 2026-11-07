@@ -56,7 +56,7 @@ const unauthorized = () => Effect.succeed(HttpServerResponse.empty({ status: 401
 
 const AgentRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const runAgent = Runner.run(assistant);
+    const runAgent = Runner.makeAttached(assistant);
 
     // POST /agent: the run streams back as SSE, and ends if the client disconnects.
     yield* router.add(
