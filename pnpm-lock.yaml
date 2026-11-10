@@ -192,10 +192,6 @@ importers:
         version: 7.0.2
 
   packages/effect-agent-harness:
-    dependencies:
-      effect:
-        specifier: 'catalog:'
-        version: 4.0.5
     devDependencies:
       '@ag-ui/client':
         specifier: ^1.0.3
@@ -206,6 +202,9 @@ importers:
       '@types/node':
         specifier: ^26.6.5
         version: 26.6.5
+      effect:
+        specifier: 'catalog:'
+        version: 4.0.5
       rxjs:
         specifier: 7.8.1
         version: 7.8.1

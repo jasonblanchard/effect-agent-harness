@@ -17,15 +17,16 @@
     "format:check": "oxfmt -c ../../.oxfmtrc.json --check",
     "generate:schema": "node scripts/generate-schema.ts && oxfmt -c ../../.oxfmtrc.json src/AgUiSchema.ts"
   },
-  "dependencies": {
-    "effect": "catalog:"
-  },
   "devDependencies": {
     "@ag-ui/client": "^1.0.3",
     "@effect/vitest": "4.0.5",
     "@types/node": "^26.6.5",
+    "effect": "catalog:",
     "rxjs": "7.8.1",
     "typescript": "catalog:",
     "vitest": "^5.0.5"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.5"
   }
 }

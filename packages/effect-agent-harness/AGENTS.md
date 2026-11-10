@@ -1,6 +1,6 @@
 # packages/effect-agent-harness
 
-The library. The public API is `src/index.ts`, which re-exports each module as a namespace (`AgUi`, `AgUiSchema`, `Messages`, `Agent`, `Sse`, `Thread`, `History`, `Checkpoint`, `EventLog`, `Runner`). Its only runtime dependency is `effect`. Consumers import from `"effect-agent-harness"`, which resolves straight to the `.ts` sources (there's no build step).
+The library. The public API is `src/index.ts`, which re-exports each module as a namespace (`AgUi`, `AgUiSchema`, `Messages`, `Agent`, `Sse`, `Thread`, `History`, `Checkpoint`, `EventLog`, `Runner`). Its only runtime dependency is `effect`, declared as a peer dependency (and a dev dependency for local work) so consumers share one copy. Consumers import from `"effect-agent-harness"`, which resolves straight to the `.ts` sources (there's no build step).
 
 ## Modules
 
