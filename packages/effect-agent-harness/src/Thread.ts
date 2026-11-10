@@ -67,6 +67,12 @@ export class Thread extends Context.Service<
      * with `ThreadBusy` if another run is active.
      */
     readonly claim: (threadId: string, runId: string) => Effect.Effect<void, ThreadBusy | ThreadError>;
+    /**
+     * The run holding the thread's claim, or `undefined` if it has none. Only a
+     * read: it never changes the claim. A store that lets claims expire reports
+     * `undefined` once the claim has expired.
+     */
+    readonly activeRun: (threadId: string) => Effect.Effect<string | undefined, ThreadError>;
     /** Ends `runId`'s claim. Does nothing if `runId` is not the active run. */
     readonly release: (threadId: string, runId: string) => Effect.Effect<void, ThreadError>;
     /**
@@ -108,6 +114,7 @@ export const layerMemory: Layer.Layer<Thread> = Layer.sync(Thread, () => {
         active.set(threadId, runId);
         return Effect.void;
       }),
+    activeRun: (threadId) => Effect.sync(() => active.get(threadId)),
     release: (threadId, runId) =>
       Effect.sync(() => {
         if (active.get(threadId) === runId) {

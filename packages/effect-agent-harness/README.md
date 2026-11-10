@@ -368,6 +368,16 @@ The library doesn't serve this route. Expose it as a `GET` of your own, and auth
 
 TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effect-agent-harness rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
+A run still going can be rejoined if it was started with `Runner.makeDetached` or `Runner.makeWorkflow`, which write to the `EventLog`. Ask for it on the route that serves those joins:
+
+```ts
+const { messages, interrupts, activeRun } = yield * History.restore(threadId, { rejoin: true });
+// activeRun: { runId } for the run holding the thread, or undefined
+// messages: leaves out what activeRun's log will replay, so applying them and then the log from its start shows each message once
+```
+
+Then serve the client's join from `EventLog.subscribe`, with an idle timeout, because a crashed run holds its thread until the claim expires and its log never ends. Don't use `rejoin` with `Runner.makeAttached`: it claims the thread but never writes to the log, so a client told to join would wait for events that never come. TanStack AI joins with `GET <chat url>?offset=-1&runId=…`, where `-1` means from the start and is not a cursor. The join has no thread id, so put it in the connection URL. See `packages/examples/tanstack`.
+
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
 
 The system prompt is never stored in the thread: the agent adds it to every model call.
@@ -703,6 +713,8 @@ const ThreadLive = Layer.effect(
       load: (threadId) => db.loadEntries(threadId),
       // set active_run_id when it is null, already runId, or expired; else fail with ThreadBusy
       claim: (threadId, runId) => db.claimThread(threadId, runId),
+      // active_run_id, or undefined if it is null or expired
+      activeRun: (threadId) => db.activeRun(threadId),
       // clear active_run_id if it is runId
       release: (threadId, runId) => db.releaseThread(threadId, runId),
       // append each entry whose id is not stored yet, in order, recording runId on it

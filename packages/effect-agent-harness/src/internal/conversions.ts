@@ -548,6 +548,11 @@ export interface Restored {
   readonly pendingToolCalls:
     | { readonly runId: string | undefined; readonly toolCallIds: ReadonlyArray<string> }
     | undefined;
+  /**
+   * The run holding the thread, for a client to join. Only a rejoining read
+   * reports one; `undefined` otherwise, and when the thread has no active run.
+   */
+  readonly activeRun: { readonly runId: string } | undefined;
 }
 
 /**
@@ -633,7 +638,8 @@ const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
  * arguments are re-encoded, so their formatting may differ from the streamed
  * deltas.
  */
-export const restore = (entries: ReadonlyArray<Entry>): Restored => {
+export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Restored => {
+  const entries = activeRunId === undefined ? stored : withoutReplayed(stored, activeRunId);
   const messages = entries.flatMap((entry): ReadonlyArray<Message> => {
     const message = shown(entry);
     return message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
@@ -696,7 +702,41 @@ export const restore = (entries: ReadonlyArray<Entry>): Restored => {
             runId: frontend.at(-1)!.entry.runId,
             toolCallIds: frontend.map((call) => call.toolCallId),
           },
+    activeRun: activeRunId === undefined ? undefined : { runId: activeRunId },
   };
+};
+
+/**
+ * The entries without what `runId`'s event log replays: the assistant entries
+ * it committed and the results of the calls they hold. Its user messages stay,
+ * and so do its results and approval responses for earlier runs' calls: the
+ * log does not show what came from the client, and those answers keep
+ * {@link restore} from reporting an answered call as open.
+ */
+const withoutReplayed = (entries: ReadonlyArray<Entry>, runId: string): ReadonlyArray<Entry> => {
+  const calls = new Set(
+    entries.flatMap(({ runId: committedBy, message }) =>
+      committedBy === runId && message.role === "assistant"
+        ? message.content.flatMap((part) => (part.type === "tool-call" ? [part.id] : []))
+        : [],
+    ),
+  );
+  return entries.filter(({ runId: committedBy, message }) => {
+    if (committedBy !== runId) {
+      return true;
+    }
+    switch (message.role) {
+      case "assistant": {
+        return false;
+      }
+      case "tool": {
+        return !message.content.every((part) => part.type === "tool-result" && calls.has(part.id));
+      }
+      default: {
+        return true;
+      }
+    }
+  });
 };
 
 const TextPart = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String });

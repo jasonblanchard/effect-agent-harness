@@ -25,11 +25,13 @@ function Chat() {
 function ChatThread({ threadId }: { readonly threadId: string }) {
   // The server owns the thread's history. With `persistence: true`, the client
   // loads it on mount (`GET /api/chat?threadId=…`), open approvals included,
-  // and still sends its whole history on every run. Don't set `history`:
+  // rejoins a run still going, and still sends its whole history on every run.
+  // The URL carries the thread id because the join request doesn't add it, and
+  // the server's event log is keyed by thread. Don't set `history`:
   // paging makes the client send only new messages, which the server rejects.
   // `tools` are frontend tools: the browser runs them and answers in the next run.
-  const { messages, sendMessage, isLoading, error, stop, interrupts, resumeInterruptsUnsafe } = useChat({
-    connection: fetchServerSentEvents("/api/chat"),
+  const { messages, sendMessage, isLoading, error, interrupts, resumeInterruptsUnsafe } = useChat({
+    connection: fetchServerSentEvents(`/api/chat?threadId=${encodeURIComponent(threadId)}`),
     threadId,
     persistence: true,
     tools: [getBrowserTime],
@@ -111,13 +113,10 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
           aria-label="Message"
           autoFocus
         />
-        {isLoading ? (
-          <button type="button" onClick={stop}>
-            Stop
-          </button>
-        ) : (
-          <button type="submit">Send</button>
-        )}
+        {/* A run outlives its request and can't be cancelled, and the thread is busy until it ends. */}
+        <button type="submit" disabled={isLoading}>
+          Send
+        </button>
       </form>
     </main>
   );

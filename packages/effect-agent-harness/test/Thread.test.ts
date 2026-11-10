@@ -56,6 +56,23 @@ describe("Thread.layerMemory", () => {
 });
 
 describe("Thread.layerMemory claims", () => {
+  it.effect("reports the run holding a thread without changing the claim", () =>
+    Effect.gen(function* () {
+      const thread = yield* Thread.Thread;
+      expect(yield* thread.activeRun("t1")).toBeUndefined();
+
+      yield* thread.claim("t1", "r1");
+      expect(yield* thread.activeRun("t1")).toBe("r1");
+      expect(yield* Effect.flip(thread.claim("t1", "r2"))).toEqual(new Thread.ThreadBusy({ activeRunId: "r1" }));
+      // Other threads are unaffected.
+      expect(yield* thread.activeRun("t2")).toBeUndefined();
+
+      yield* thread.release("t1", "r1");
+      expect(yield* thread.activeRun("t1")).toBeUndefined();
+      yield* thread.claim("t1", "r2");
+    }).pipe(Effect.provide(Thread.layerMemory)),
+  );
+
   it.effect("lets one run hold a thread at a time", () =>
     Effect.gen(function* () {
       const thread = yield* Thread.Thread;

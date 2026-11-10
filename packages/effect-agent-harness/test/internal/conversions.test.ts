@@ -414,6 +414,58 @@ describe("restore", () => {
   });
 });
 
+describe("restore with an active run", () => {
+  const ids = (restored: Conversions.Restored) => restored.messages.map((message) => message.id);
+  const by = (runId: string, ...entries: ReadonlyArray<Messages.Entry>) =>
+    entries.map((entry) => ({ ...entry, runId }));
+
+  it("leaves out the run's steps and keeps its user message", () => {
+    const entries = [
+      ...by("r0", user("u0", "Hi"), assistantText("a0", "Hello")),
+      ...by(
+        "r1",
+        user("u1", "Weather?"),
+        assistantCall("a1", "c1"),
+        toolResult("t1", "c1", 21),
+        assistantCall("a2", "c2"),
+        toolResult("t2", "c2", 25),
+      ),
+    ];
+    const restored = Conversions.restore(entries, "r1");
+    expect(ids(restored)).toEqual(["u0", "a0", "u1"]);
+    expect(restored.activeRun).toEqual({ runId: "r1" });
+  });
+
+  it("keeps an earlier run's call and its answered approval on a continuation", () => {
+    const entries = [
+      ...by("r1", user("u1", "Email Ada"), assistantCall("a1", "c1", "ap1")),
+      ...by("r2", approvalResponse("ap1"), toolResult("t1", "c1", "sent"), assistantText("a2", "Sent.")),
+    ];
+    const restored = Conversions.restore(entries, "r2");
+    expect(ids(restored)).toEqual(["u1", "a1", "t1"]);
+    expect(restored.interrupts).toBeUndefined();
+  });
+
+  it("keeps a frontend result the active run committed for an earlier run's call", () => {
+    const entries = [
+      ...by("r1", user("u1", "Pick a file"), frontendCalls("a1", "c1")),
+      ...by("r2", toolResult("t1", "c1", "a.txt"), assistantText("a2", "Got it.")),
+    ];
+    const restored = Conversions.restore(entries, "r2");
+    expect(ids(restored)).toEqual(["u1", "a1", "t1"]);
+    expect(restored.pendingToolCalls).toBeUndefined();
+  });
+
+  it("keeps entries with no run id", () => {
+    const entries = [
+      system("s1", "Summary"),
+      assistantText("a0", "Earlier"),
+      ...by("r1", user("u1", "Next"), assistantText("a1", "Reply")),
+    ];
+    expect(ids(Conversions.restore(entries, "r1"))).toEqual(["a0", "u1"]);
+  });
+});
+
 describe("ingest", () => {
   it("keeps user text and drops assistant, tool and unsupported roles", () => {
     const entries = Conversions.ingest([

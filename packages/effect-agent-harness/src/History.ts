@@ -88,6 +88,26 @@ export const layerServer: Layer.Layer<History, never, Thread.Thread> = Layer.eff
   Effect.map(Thread.Thread, internal.server),
 );
 
+export interface RestoreOptions {
+  /**
+   * Set this only on a route that serves joins from the `EventLog`, which means
+   * runs started with `Runner.makeDetached` or `Runner.makeWorkflow`. `Runner.makeAttached` claims the thread but never
+   * writes to the log, so a client told to join one of its runs waits for
+   * events that never come.
+   *
+   * The read then reports the run holding the thread as `activeRun`, and leaves
+   * out the assistant messages and tool results that run committed, so the
+   * returned messages followed by the run's log from its start show each
+   * message once. The run's user messages stay, because the log doesn't show
+   * them, and so do its answers to earlier runs' calls. Open interrupts and
+   * pending frontend calls are computed from what remains.
+   *
+   * A claim is not proof of life: a crashed run holds its thread until the
+   * claim expires, and its log never ends, so a join needs an idle timeout.
+   */
+  readonly rejoin?: boolean | undefined;
+}
+
 /**
  * The thread as its runs' events showed it, with its open interrupts and
  * pending frontend calls, for a client that has lost its state (a reload,
@@ -109,9 +129,19 @@ export const layerServer: Layer.Layer<History, never, Thread.Thread> = Layer.eff
  * responses are not returned, and neither is provider metadata such as a
  * reasoning signature. A client may send `reasoning` messages back or drop
  * them: they are never committed, and neither choice is a mismatch.
+ *
+ * With `rejoin` (see {@link RestoreOptions}), a thread with an active run reads
+ * as if that run had not produced anything yet, and `activeRun` names it.
  */
-export const restore = (threadId: string): Effect.Effect<Conversions.Restored, Thread.ThreadError, Thread.Thread> =>
-  Effect.map(
-    Effect.flatMap(Thread.Thread, (thread) => thread.load(threadId)),
-    Conversions.restore,
-  );
+export const restore = (
+  threadId: string,
+  options?: RestoreOptions,
+): Effect.Effect<Conversions.Restored, Thread.ThreadError, Thread.Thread> =>
+  Effect.gen(function* () {
+    const thread = yield* Thread.Thread;
+    // The claim first. A run that ends between the two reads is then left out
+    // and joined through its finished log. The other order could report no
+    // active run alongside messages that miss the run's last step.
+    const activeRunId = options?.rejoin === true ? yield* thread.activeRun(threadId) : undefined;
+    return Conversions.restore(yield* thread.load(threadId), activeRunId);
+  });

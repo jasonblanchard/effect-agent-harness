@@ -95,6 +95,7 @@ const spyThread = (
           const entries = rewritten.get(threadId);
           return entries === undefined ? inner.load(threadId) : Effect.succeed(entries);
         },
+        activeRun: inner.activeRun,
         claim: (threadId, runId) =>
           Effect.suspend(() => {
             log.push(`claim ${runId}`);
@@ -196,6 +197,7 @@ describe("Runner.makeAttached", () => {
       const model = scriptedModel([]);
       const failing = Layer.succeed(Thread.Thread)({
         load: () => Effect.fail(new Thread.ThreadError({ cause: new Error("db down") })),
+        activeRun: () => Effect.undefined,
         claim: () => Effect.void,
         release: () => Effect.void,
         commit: () => Effect.void,
@@ -1184,6 +1186,33 @@ describe("Runner.makeDetached", () => {
 
   const subscribe = (after?: string) =>
     Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1", after))));
+
+  it.effect("a rejoining read and the run's log show each message once", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      yield* start(scope, weatherTurn);
+      const stored = yield* subscribe();
+      const events = stored.map((s) => s.event);
+      yield* Effect.promise(() => verify(events));
+      const logged = events.flatMap((event) =>
+        event.type === "TEXT_MESSAGE_START" || event.type === "TOOL_CALL_RESULT" ? [event.messageId] : [],
+      );
+      expect(logged.length).toBeGreaterThan(1);
+
+      // The run has ended by now, so claim the thread for it again, as if it were still going.
+      const thread = yield* Thread.Thread;
+      yield* thread.claim("t1", "r1");
+
+      const rejoining = yield* History.restore("t1", { rejoin: true });
+      expect(rejoining.activeRun).toEqual({ runId: "r1" });
+      expect(rejoining.messages.map((message) => message.id)).toEqual(["u1"]);
+
+      // A plain read still holds everything the run committed.
+      const plain = yield* History.restore("t1");
+      expect(plain.activeRun).toBeUndefined();
+      expect(plain.messages.map((message) => message.id)).toEqual(["u1", ...logged]);
+    }).pipe(Effect.provide(shared())),
+  );
 
   it.effect("makes the run observable through the event log", () =>
     Effect.gen(function* () {
