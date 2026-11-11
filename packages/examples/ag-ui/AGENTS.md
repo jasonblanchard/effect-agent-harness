@@ -22,5 +22,16 @@ This package has no tests; `pnpm tsc` and `pnpm lint` are its checks. After chan
 1. **Client-owned history:** ask "What's the weather in Paris?", then "Which city did I just ask about?". The second answer must name Paris, which the model only knows from the history the client resent.
 2. **Approval, approved:** ask "Email ada@example.com saying hello". The run stops at `❓ Approve call to send-email? (y/n)`. Answer `y`: the tool prints `📧 (not really) sending ... from Demo User to ada@example.com`, its result is `{"sent":true}`, and the assistant confirms. "from Demo User" shows the route's `AuthContext` reached the tool.
 3. **Approval, denied:** repeat and answer `n`: the tool does not print, its result is `{"type":"execution-denied","reason":"denied"}`, and the assistant says it could not send.
+4. **Tracing:** with a PostHog token set, run the scripted command in "Tracing" below. In PostHog's AI observability, the session `main-conversation` holds three traces named `invoke_agent assistant`, each with a latency and the person `demo`. The weather trace has two generations and an `execute_tool get-weather` span whose input and output are shown. The email interrupt trace has one generation and no tool span. The approval trace has an `execute_tool send-email` span and one generation.
+
+## Tracing
+
+`src/telemetry.ts` exports each run's spans to PostHog AI observability when `POSTHOG_PROJECT_TOKEN` (and optionally `POSTHOG_HOST`, default `https://us.i.posthog.com`) is set in the repo-root `.env`. Without it, nothing is exported. It uses Effect's `OtlpTracer` against PostHog's `/i/v0/ai/otel` endpoint (at most 100 spans per export), turns on `Telemetry.layerCaptureContent`, and wraps the tracer to add PostHog's own properties. Those are tool input and output, plus cache-token accounting. The file's comments say why each is needed. The routes give each run `Telemetry.SpanAttributes` with `posthog.distinct_id`, the principal's user id: on the stream for `POST /agent`, and through the detached runner's `layer` for `POST /runs`. The agent is named `assistant`, so each run is a trace named `invoke_agent assistant`.
+
+`src/index.ts` also takes command-line arguments as scripted input lines (messages, then `y`/`n` answers) and exits when they run out, flushing spans on the way out:
+
+```
+pnpm --filter ag-ui dev "What's the weather in Paris?" "Email ada@example.com saying hello" y
+```
 
 This package exists to show how to use the library, so keep it idiomatic and minimal. Changes to library behaviour belong in `packages/effect-agent-harness`, with tests there.

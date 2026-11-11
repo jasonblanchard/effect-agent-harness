@@ -8,3 +8,4 @@ export * as History from "./History.ts";
 export * as Checkpoint from "./Checkpoint.ts";
 export * as EventLog from "./EventLog.ts";
 export * as Runner from "./Runner.ts";
+export * as Telemetry from "./Telemetry.ts";

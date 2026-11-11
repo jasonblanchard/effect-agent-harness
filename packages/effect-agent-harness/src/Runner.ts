@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Option, Schema, Scope, Stream } from "effect";
+import { Cause, Clock, Context, Effect, Exit, Layer, Option, Schema, Scope, Stream, Tracer } from "effect";
 import { Prompt } from "effect/ai";
 import type { Tool } from "effect/ai";
 import { Workflow } from "effect/workflow";
@@ -9,7 +9,11 @@ import * as Checkpoint from "./Checkpoint.ts";
 import * as EventLog from "./EventLog.ts";
 import * as History from "./History.ts";
 import * as internal from "./internal/history.ts";
+import * as internalTelemetry from "./internal/telemetry.ts";
 import * as Messages from "./Messages.ts";
+import * as Telemetry from "./Telemetry.ts";
+
+const { Attr } = internalTelemetry;
 
 /**
  * A declared slice of a run's trusted context: a service whose value is the
@@ -249,18 +253,77 @@ const agUiRun =
           { threadId, runId, name: "input", success: Schema.String, error: Schema.Never },
           Effect.succeed(fingerprint),
         );
+
         if (first.value !== fingerprint) {
           return yield* new RunInputMismatch();
         }
+
+        // Span attributes the per-run layer provides win over the caller's.
+        const layerSpanAttributes = Context.getOption(services as Context.Context<never>, Telemetry.SpanAttributes);
+        if (Option.isSome(layerSpanAttributes)) {
+          yield* Effect.annotateCurrentSpan(internalTelemetry.callerAttributes(layerSpanAttributes.value));
+        }
+
         const history = yield* currentHistory;
         const attempt = yield* history.beginAttempt(input, { clientSystem: options?.clientSystem });
         return opened(attempt, checkpoint).pipe(Stream.provideContext(services));
       }),
     ).pipe(failInBand);
-    return AgUi.fold(input)(events).pipe(
-      Stream.withSpan("effect-agent-harness/Runner.run", { attributes: { threadId, runId } }),
-    );
+    return traced(agent, input, (onFailed) => AgUi.fold(input)(Stream.tap(events, onFailed)));
   };
+
+/**
+ * Runs an attempt under its root span: `invoke_agent {name}`, in a new trace
+ * linked to the caller's span, so a backend sees the run as its own GenAI
+ * trace. The event stream never fails, so the span's outcome is set from the
+ * `Failed` event (`error.type` and a failed exit) rather than from the
+ * stream's exit.
+ */
+const traced = <R>(
+  agent: Agent.Agent<any, any>,
+  input: AgUi.RunAgentInput,
+  run: (onFailed: (event: Agent.Event) => Effect.Effect<void>) => Stream.Stream<AgUi.Event, never, R>,
+): Stream.Stream<AgUi.Event, never, R> =>
+  Stream.unwrap(
+    Effect.gen(function* () {
+      const caller = yield* Effect.option(Effect.currentParentSpan);
+      const span = yield* Effect.makeSpan(internalTelemetry.agentSpanName(agent.name), {
+        kind: "internal",
+        root: true,
+        links: Option.isSome(caller) ? [{ span: caller.value, attributes: {} }] : [],
+        attributes: {
+          // The caller's attributes. The per-run layer isn't built yet, so its attributes are added
+          // once it is (`layerSpanAttributes` above). Set here too so a run that fails first keeps them.
+          ...internalTelemetry.callerAttributes(yield* Telemetry.SpanAttributes),
+          [Attr.operationName]: "invoke_agent",
+          ...(agent.name === undefined ? {} : { [Attr.agentName]: agent.name }),
+          [Attr.conversationId]: input.threadId,
+          [Attr.runId]: input.runId,
+        },
+      });
+      let failed: Extract<Agent.Event, { _tag: "Failed" }> | undefined;
+      const onFailed = (event: Agent.Event) =>
+        Effect.sync(() => {
+          if (event._tag === "Failed") {
+            failed = event;
+          }
+        });
+
+      return run(onFailed).pipe(
+        Stream.provideService(Tracer.ParentSpan, span),
+        Stream.onExit((exit) =>
+          Effect.map(Clock.currentTimeNanos, (now) => {
+            if (failed !== undefined && Exit.isSuccess(exit)) {
+              span.attribute(Attr.errorType, failed.code ?? "Error");
+              span.end(now, Exit.fail(failed.error));
+            } else {
+              span.end(now, exit);
+            }
+          }),
+        ),
+      );
+    }),
+  );
 
 /**
  * A runner whose runs are attached to their consumer. It gives a function from

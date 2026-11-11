@@ -4,7 +4,7 @@
 Runs an agent's defined behaviour (system prompt, tools, step limit) from a model prompt to a stream of step events, independent of AG-UI, of any transport and of any durability mechanism, so the same behaviour can run in production and in an eval.
 ## Requirements
 ### Requirement: Behaviour is defined once as a value
-An agent definition SHALL consist of a tool set, an optional system prompt and a step limit (a positive integer, default 10), and SHALL NOT reference any model provider, thread store, checkpoint store or event log. The system prompt SHALL be either fixed text or computed for each run, reading the current run and services the definition declares; those services SHALL be part of what the definition requires to run. The same definition SHALL be runnable under different sets of provided services without modification.
+An agent definition SHALL consist of a tool set, an optional system prompt, a step limit (a positive integer, default 10) and an optional name. The definition SHALL NOT reference any model provider, thread store, checkpoint store or event log. The name SHALL identify the agent in telemetry only; it SHALL NOT be sent to the model or change the events a run emits. The system prompt SHALL be either fixed text or computed for each run, reading the current run and services the definition declares; those services SHALL be part of what the definition requires to run. The same definition SHALL be runnable under different sets of provided services without modification.
 
 #### Scenario: Same definition, two environments
 - **WHEN** one agent definition is run against a scripted model with passthrough checkpoints and again with a ledger-backed checkpoint store
@@ -17,6 +17,10 @@ An agent definition SHALL consist of a tool set, an optional system prompt and a
 #### Scenario: Same definition, different service values
 - **WHEN** an agent whose system prompt includes the name from a user directory service is run once with a directory returning "Ada" and once with one returning "Grace"
 - **THEN** the first run's system prompt names Ada, the second's names Grace, and the definition is unchanged
+
+#### Scenario: Name does not reach the model
+- **WHEN** the same definition is run once with the name `assistant` and once without a name
+- **THEN** the model receives identical prompts and the runs emit identical events
 
 ### Requirement: Run from a prompt to step events
 Given a run's info, a prompt and the frontend tools the client advertised for the run (none when it advertised none), the run SHALL produce an event stream that never fails. The run info SHALL consist of a run id, a thread id and optional properties supplied by the client. The prompt SHALL NOT contain the agent's system prompt; the run adds it. Each model step SHALL begin with a step-started event carrying the step number and that step's assistant message id. The stream SHALL end with exactly one terminal event: finished (with an outcome) or failed (with the error's message and code), and SHALL emit nothing after it.

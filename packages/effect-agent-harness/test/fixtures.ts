@@ -1,6 +1,6 @@
 import { verifyEvents } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
-import { Effect, Layer, Schema, Stream } from "effect";
+import { Effect, Layer, Option, Schema, Stream, Tracer } from "effect";
 import { AiError, IdGenerator, LanguageModel, Response, Tool, Toolkit } from "effect/ai";
 import type { Prompt } from "effect/ai";
 import type * as Agent from "../src/Agent.ts";
@@ -24,25 +24,68 @@ export type Step =
   | ReadonlyArray<Response.StreamPartEncoded>
   | Stream.Stream<Response.StreamPartEncoded, AiError.AiError>;
 
-export const scriptedModel = (steps: ReadonlyArray<Step>) => {
+export const scriptedModel = (
+  steps: ReadonlyArray<Step>,
+  options?: {
+    /** Streams each step inside a span of this name, as a provider's HTTP client span would be. */
+    readonly requestSpan?: string | undefined;
+  },
+) => {
   const prompts: Array<Prompt.Prompt> = [];
   const tools: Array<ReadonlyArray<Tool.Any>> = [];
   const layer = Layer.effect(
     LanguageModel.LanguageModel,
     LanguageModel.make({
       generateText: () => Effect.die("generateText is not scripted"),
-      streamText: (options) => {
+      streamText: (call) => {
         const step = steps[prompts.length];
-        prompts.push(options.prompt);
-        tools.push(options.tools);
+        prompts.push(call.prompt);
+        tools.push(call.tools);
         if (step === undefined) {
           return Stream.die(`no scripted step ${prompts.length}`);
         }
-        return Stream.isStream(step) ? step : Stream.fromIterable(step);
+        const stream = Stream.isStream(step) ? step : Stream.fromIterable(step);
+        return options?.requestSpan === undefined ? stream : Stream.withSpan(stream, options.requestSpan);
       },
     }),
   );
   return { layer, prompts, tools };
+};
+
+// -----------------------------------------------------------------------------
+// Recording tracer
+// -----------------------------------------------------------------------------
+
+/** A tracer that keeps every span it creates, for tests to inspect once they have ended. */
+export const recordingTracer = () => {
+  const spans: Array<Tracer.NativeSpan> = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      spans.push(span);
+      return span;
+    },
+  });
+  const named = (name: string) => spans.filter((span) => span.name === name);
+  const one = (name: string) => {
+    const found = named(name);
+    if (found.length !== 1) {
+      throw new Error(`expected one span named ${name}, found ${found.length}`);
+    }
+    return found[0]!;
+  };
+  /** The names of a span's ancestors, nearest first. */
+  const ancestors = (span: Tracer.AnySpan): Array<string> => {
+    const names: Array<string> = [];
+    let parent = span._tag === "Span" ? span.parent : Option.none();
+    while (Option.isSome(parent)) {
+      const value: Tracer.AnySpan = parent.value;
+      names.push(value._tag === "Span" ? value.name : `external:${value.spanId}`);
+      parent = value._tag === "Span" ? value.parent : Option.none();
+    }
+    return names;
+  };
+  return { layer: Layer.succeed(Tracer.Tracer, tracer), spans, named, one, ancestors };
 };
 
 export const text = (id: string, ...deltas: Array<string>): Array<Response.StreamPartEncoded> => [

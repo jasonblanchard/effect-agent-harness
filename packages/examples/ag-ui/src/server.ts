@@ -2,8 +2,9 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse } from "effect-agent-harness";
+import { Agent, AgUi, Checkpoint, EventLog, Runner, Sse, Telemetry } from "effect-agent-harness";
 import { AuthContext, authenticate } from "./auth.ts";
+import { spanAttributes, TracingLayer } from "./telemetry.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
 import { GetWeather, getWeather } from "./tools/weather.tool.ts";
 
@@ -11,6 +12,8 @@ import { GetWeather, getWeather } from "./tools/weather.tool.ts";
 const AssistantToolkit = Toolkit.make(GetWeather, SendEmail);
 
 const assistant = Agent.define({
+  // Names the agent in traces only.
+  name: "assistant",
   toolkit: AssistantToolkit,
   // Resolved once per run, from the run's user and the clock.
   system: Effect.gen(function* () {
@@ -65,7 +68,12 @@ const AgentRoutes = HttpRouter.use((router) =>
       Effect.gen(function* () {
         const principal = yield* authenticate;
         const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        return yield* runAgent(input).pipe(Stream.provideService(AuthContext, principal), Sse.encode, Sse.response);
+        return yield* runAgent(input).pipe(
+          Stream.provideService(AuthContext, principal),
+          Stream.provideService(Telemetry.SpanAttributes, spanAttributes(principal)),
+          Sse.encode,
+          Sse.response,
+        );
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
@@ -74,7 +82,16 @@ const AgentRoutes = HttpRouter.use((router) =>
     // client's `Last-Event-ID`.
     // A detached run outlives the request, so the runner captures its services
     // now and names the one each `start` provides instead.
-    const detached = yield* Runner.makeDetached(assistant, { dependencies: [AuthContext] });
+    // Its span attributes are built per run from that dependency.
+    const detached = yield* Runner.makeDetached(assistant, {
+      dependencies: [AuthContext],
+      layer: Layer.effect(
+        Telemetry.SpanAttributes,
+        Effect.gen(function* () {
+          return spanAttributes(yield* AuthContext);
+        }),
+      ),
+    });
     const log = yield* EventLog.EventLog;
 
     yield* router.add(
@@ -113,7 +130,7 @@ const AgentRoutes = HttpRouter.use((router) =>
       ),
     );
   }),
-).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
+).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer, TracingLayer)));
 
 /**
  * The AG-UI endpoints as an in-process web handler (`Request => Promise<Response>`).

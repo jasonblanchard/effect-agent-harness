@@ -1,9 +1,13 @@
 import { Cause, Context, Effect, Option, Predicate, Queue, Schema, Stream } from "effect";
-import { IdGenerator, LanguageModel, Prompt, Tool } from "effect/ai";
+import { IdGenerator, LanguageModel, Prompt, Telemetry as AiTelemetry, Tool } from "effect/ai";
 import type { Response, Toolkit } from "effect/ai";
 import type { JsonSchema } from "effect";
 import * as Checkpoint from "./Checkpoint.ts";
+import * as internalTelemetry from "./internal/telemetry.ts";
 import type * as Messages from "./Messages.ts";
+import * as Telemetry from "./Telemetry.ts";
+
+const { Attr } = internalTelemetry;
 
 // -----------------------------------------------------------------------------
 // Definition
@@ -30,6 +34,11 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
   readonly system: string | Effect.Effect<string, never, R> | undefined;
   /** Maximum number of model steps per run. */
   readonly maxSteps: number;
+  /**
+   * Identifies the agent in telemetry only (`gen_ai.agent.name` and the name
+   * of a run's root span). Never sent to the model.
+   */
+  readonly name: string | undefined;
 }
 
 /** Defines an agent. Throws a `RangeError` if `maxSteps` (default 10) is not a positive integer. */
@@ -37,12 +46,13 @@ export const define = <Tools extends Record<string, Tool.Any>, R = never>(option
   readonly toolkit: Toolkit.Toolkit<Tools>;
   readonly system?: string | Effect.Effect<string, never, R> | undefined;
   readonly maxSteps?: number | undefined;
+  readonly name?: string | undefined;
 }): Agent<Tools, R> => {
   const maxSteps = options.maxSteps ?? 10;
   if (!Number.isInteger(maxSteps) || maxSteps < 1) {
     throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
   }
-  return { toolkit: options.toolkit, system: options.system, maxSteps };
+  return { toolkit: options.toolkit, system: options.system, maxSteps, name: options.name };
 };
 
 // -----------------------------------------------------------------------------
@@ -214,6 +224,15 @@ const ToolStep = Schema.Union([
 type ToolStep = typeof ToolStep.Type;
 
 /**
+ * Internal: carries a failed tool result out of its `execute_tool` span, so the span ends with an error
+ * status. It's caught just outside the span and never escapes `Agent.run`.
+ */
+class ToolResultFailure extends Schema.TaggedError<ToolResultFailure, { readonly brand: unique symbol }>()(
+  "ToolResultFailure",
+  { step: ToolStep },
+) {}
+
+/**
  * The id of the approval request for a tool call, and of the AG-UI interrupt
  * carrying it. Derived from the call, so a client's history alone links an
  * interrupt to its call. Treat it as opaque.
@@ -281,6 +300,23 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
         Effect.map(Option.getOrElse(() => IdGenerator.defaultIdGenerator)),
       );
+
+      // Telemetry: the attributes every span this run creates or annotates carries.
+      const capture = yield* Telemetry.ContentCapture;
+      const runAttributes = {
+        ...internalTelemetry.callerAttributes(yield* Telemetry.SpanAttributes),
+        [Attr.conversationId]: input.threadId,
+      };
+      const outerTransformer = yield* Effect.serviceOption(AiTelemetry.CurrentSpanTransformer);
+      // Reaches only the model call's own span, unlike span annotations, which would also reach the
+      // provider's HTTP spans. Runs any transformer the caller provided first. One provided only when
+      // the LanguageModel layer was built can't be seen here, so it's replaced (see the README).
+      const modelSpanTransformer: AiTelemetry.SpanTransformer = (options) => {
+        if (Option.isSome(outerTransformer)) {
+          outerTransformer.value(options);
+        }
+        annotateModelSpan(options, runAttributes, capture);
+      };
       // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
       const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
         checkpoint.memo(
@@ -309,13 +345,46 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             } else if (!decision.approved) {
               return yield* result({ type: "execution-denied", reason: decision.reason }, true);
             }
-            const results = yield* toolkit.handle(call.name, call.params as never, call.id);
-            const final = yield* Stream.runLast(Stream.filter(results, (r) => !r.preliminary));
-            if (Option.isNone(final)) {
-              return yield* Effect.die("Tool handler did not produce a final result");
-            }
-            return yield* result(final.value.encodedResult, final.value.isFailure);
+            return yield* handleTool(call);
           }),
+        );
+
+      // Only an executed handler is traced: a replayed, denied, interrupted or pending call has no span.
+      const handleTool = (call: ToolCall) =>
+        Effect.gen(function* () {
+          const results = yield* toolkit.handle(call.name, call.params as never, call.id);
+          const final = yield* Stream.runLast(Stream.filter(results, (r) => !r.preliminary));
+          if (Option.isNone(final)) {
+            return yield* Effect.die("Tool handler did not produce a final result");
+          }
+          const { encodedResult, isFailure } = final.value;
+          yield* Effect.annotateCurrentSpan({
+            ...(isFailure ? { [Attr.errorType]: internalTelemetry.toolFailure } : {}),
+            // Also on a failure, unlike the conventions' description: it's what the model was given, and the
+            // most useful thing to see when a call fails.
+            ...(capture ? internalTelemetry.jsonAttribute(Attr.toolCallResult, encodedResult) : {}),
+          });
+          const step = yield* result(encodedResult, isFailure);
+          // A failure result fails the span's effect, so the span ends with an error status as the conventions
+          // require. It's turned back into a result just outside the span, so the run sees no difference.
+          return isFailure ? yield* new ToolResultFailure({ step }) : step;
+        }).pipe(
+          Effect.withSpan(internalTelemetry.toolSpanName(call.name), {
+            kind: "internal",
+            attributes: {
+              ...runAttributes,
+              [Attr.operationName]: "execute_tool",
+              [Attr.toolName]: call.name,
+              [Attr.toolCallId]: call.id,
+              [Attr.toolType]: "function",
+              ...(agent.name === undefined ? {} : { [Attr.agentName]: agent.name }),
+              ...(toolkit.tools[call.name]?.description === undefined
+                ? {}
+                : { [Attr.toolDescription]: toolkit.tools[call.name]?.description }),
+              ...(capture ? internalTelemetry.jsonAttribute(Attr.toolCallArguments, call.params) : {}),
+            },
+          }),
+          Effect.catchTag("ToolResultFailure", (failure) => Effect.succeed(failure.step)),
         );
 
       // The model stopped for a reason that does not complete the response.
@@ -364,6 +433,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
               toolkit: modelToolkit,
               disableToolCallResolution: true,
             }).pipe(
+              Stream.provideService(AiTelemetry.CurrentSpanTransformer, modelSpanTransformer),
               Stream.runForEach((streamed) => {
                 // The toolkit's own part type is narrower; this only widens tool names and parameters.
                 const part = streamed as Response.AnyPart;
@@ -515,12 +585,41 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         return emit({ _tag: "Failed", error, code: errorCode(error) });
       }),
       Effect.andThen(Queue.end(queue)),
+      // No span of its own: model and tool spans are children of the caller's span (a runner's
+      // `invoke_agent` root), so a backend that keeps only GenAI spans sees an unbroken tree.
       Effect.provideService(CurrentRun, info),
-      Effect.withSpan("effect-agent-harness/Agent.run", {
-        attributes: { runId: input.runId, threadId: input.threadId },
-      }),
     );
   });
+
+/**
+ * Writes the run's attributes, and the call's content when capture is on, on
+ * a model call's span. Never throws: telemetry must not change the run.
+ */
+const annotateModelSpan = (
+  options: Parameters<AiTelemetry.SpanTransformer>[0],
+  runAttributes: Readonly<Record<string, unknown>>,
+  capture: boolean,
+): void => {
+  const { span } = options;
+  try {
+    internalTelemetry.setAttributes(span, runAttributes);
+    if (!capture) {
+      return;
+    }
+    const system = internalTelemetry.systemInstructions(options.prompt);
+    internalTelemetry.setAttributes(span, {
+      ...(system.length > 0 ? internalTelemetry.jsonAttribute(Attr.systemInstructions, system) : {}),
+      ...internalTelemetry.jsonAttribute(Attr.inputMessages, internalTelemetry.inputMessages(options.prompt)),
+      ...internalTelemetry.jsonAttribute(
+        Attr.outputMessages,
+        internalTelemetry.outputMessages(options.response as ReadonlyArray<Response.AnyPart>),
+      ),
+      ...internalTelemetry.jsonAttribute(Attr.toolDefinitions, internalTelemetry.toolDefinitions(options.tools)),
+    });
+  } catch {
+    // A span left without some attributes is better than a failed run.
+  }
+};
 
 const toolResultEvent = (
   step: number,

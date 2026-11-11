@@ -1,5 +1,6 @@
 import * as readline from "readline";
 import { agent } from "./agent.ts";
+import { dispose } from "./server.ts";
 import { randomUUID } from "@ag-ui/client";
 import type { AgentSubscriber, RunAgentParameters } from "@ag-ui/client";
 
@@ -8,7 +9,23 @@ const rl = readline.createInterface({
   output: process.stdout,
 });
 
-const ask = (question: string) => new Promise<string>((resolve) => rl.question(question, resolve));
+// Scripted mode, for repeatable manual checks: command-line arguments are fed
+// in as input lines (chat messages and y/n approval answers, in order), then
+// the client exits.
+const script = process.argv.slice(2).filter((arg) => arg !== "--");
+const scripted = script.length > 0;
+
+const ask = (question: string) => {
+  if (!scripted) {
+    return new Promise<string>((resolve) => rl.question(question, resolve));
+  }
+  const line = script.shift();
+  if (line === undefined) {
+    return Promise.reject(new Error("End of script"));
+  }
+  console.log(`${question}${line}`);
+  return Promise.resolve(line);
+};
 
 const subscriber: AgentSubscriber = {
   onTextMessageStartEvent() {
@@ -86,10 +103,16 @@ async function chatLoop() {
   }
 }
 
-// Handle Ctrl+D to quit
-rl.on("close", () => {
+// Disposing the handler's layers flushes pending spans.
+const quit = () => {
   console.log("\n👋 Thanks for using AG-UI Assistant!");
-  process.exit(0);
-});
+  void dispose().finally(() => process.exit(0));
+};
 
-chatLoop().catch(console.error);
+if (scripted) {
+  chatLoop().catch(console.error).finally(quit);
+} else {
+  // Handle Ctrl+D to quit
+  rl.on("close", quit);
+  chatLoop().catch(console.error);
+}

@@ -61,6 +61,7 @@ The same agent runs in a unit test with none of these (in-memory or passthrough 
 - [Frontend tools](#frontend-tools)
 - [Durable runs](#durable-runs)
 - [Reconnecting to a run](#reconnecting-to-a-run)
+- [Tracing](#tracing)
 - [Testing and evals](#testing-and-evals)
 - [Writing your own stores](#writing-your-own-stores)
 - [Module reference](#module-reference)
@@ -137,6 +138,7 @@ const agent = Agent.define({
   toolkit: Tools, // an effect/ai Toolkit
   system: "…", // optional system prompt: text, or an effect (below)
   maxSteps: 10, // optional, a positive integer; default 10
+  name: "assistant", // optional, identifies the agent in traces only
 });
 ```
 
@@ -648,6 +650,72 @@ yield *
 
 `EventLog.layerMemory` keeps logs in process memory.
 
+## Tracing
+
+Runs trace themselves whenever the application provides an Effect `Tracer`, following the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). Backends that read those conventions, such as PostHog AI observability, show each run as a trace and each thread as a session. Without a tracer, nothing is exported.
+
+Each runner attempt produces:
+
+| Span                                          | Attributes                                                                                                                                                                                                            |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invoke_agent {name}` (the root)              | `gen_ai.operation.name`, `gen_ai.agent.name` (when the agent has a `name`), `gen_ai.conversation.id` (the thread id), `effect_agent_harness.run.id`; `error.type` and error status when the run ends with `RUN_ERROR` |
+| `LanguageModel.streamText`, per model call    | what the provider writes (model, usage, finish reasons), plus `gen_ai.conversation.id`                                                                                                                                |
+| `execute_tool {tool}`, per executed tool call | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`, `gen_ai.conversation.id`; `error.type` when the result is a failure                                                                                    |
+
+The root span starts a new trace, linked to the span the runner was called in (for example the HTTP request's), so a backend sees the run as its own trace. Only work an attempt actually does is traced: a step replayed from a checkpoint, a call awaiting approval, a denied call and a frontend call get no span, so tokens and cost are never counted twice. A resumed attempt is a separate trace with the same `gen_ai.conversation.id`.
+
+Export with Effect's own OTLP exporter; no `@opentelemetry/*` packages are needed:
+
+```ts
+import { OtlpSerialization, OtlpTracer } from "effect/observability";
+import { FetchHttpClient } from "effect/http";
+
+const TracingLayer = OtlpTracer.layer({
+  url: "https://collector.example.com/v1/traces",
+  resource: { serviceName: "my-agent" },
+}).pipe(Layer.provide(OtlpSerialization.layerJson), Layer.provide(FetchHttpClient.layer));
+```
+
+### Capturing content
+
+`Telemetry.layerCaptureContent` adds the prompt (`gen_ai.input.messages`), the response (`gen_ai.output.messages`), the system prompt (`gen_ai.system_instructions`) and the tools offered (`gen_ai.tool.definitions`) to model call spans, and the arguments and result to tool spans, as JSON in the conventions' formats. A system message placed later in the prompt stays in `gen_ai.input.messages`, in its position. It's off by default: turning it on exports what users and tools said, which may include personal data, to your telemetry backend. Every model call span holds the whole prompt, so spans grow with the conversation; check your backend's size limits. File contents are never exported, only their media type.
+
+### Per-run attributes
+
+`Telemetry.SpanAttributes` adds your own attributes, such as a user id, to a run's root, model and tool spans, and to no other span. Keys starting with `gen_ai.` are ignored, because the library sets those. Provide it per run: on the stream for `makeAttached`, or through the runner's `layer` for `makeDetached` and `makeWorkflow`:
+
+```ts
+// makeAttached
+runAgent(input).pipe(Stream.provideService(Telemetry.SpanAttributes, { "user.id": principal.userId }));
+
+// makeDetached / makeWorkflow: built per run from a dependency
+Runner.makeDetached(agent, {
+  dependencies: [AuthContext],
+  layer: Layer.effect(
+    Telemetry.SpanAttributes,
+    Effect.gen(function* () {
+      const principal = yield* AuthContext;
+      return { "user.id": principal.userId };
+    }),
+  ),
+});
+```
+
+The `ag-ui` example shows a full PostHog setup, including the PostHog-specific properties its trace view and cost accounting need.
+
+### Known limitations
+
+These come from `effect/ai` and its providers, not from this library:
+
+- Model call spans are named `LanguageModel.streamText` rather than the conventions' `chat {model}`.
+- When streaming, `@effect/ai-anthropic` writes `effect/ai`'s own finish reasons (`tool-calls`, `content-filter`) to `gen_ai.response.finish_reasons`, not the conventions' values (`tool_call`, `content_filter`).
+- A provider's HTTP request span is a sibling of its model call span, not its child.
+- The root `invoke_agent` span doesn't carry the run's totals (model, token usage, finish reasons) or, with capture on, its overall input and output. Backends that sum generations still show them per trace. Totals on the root could be counted twice by a backend that treats any span with usage as a generation, so they wait until that's checked.
+- A failed tool call's result is recorded in `gen_ai.tool.call.result` with content capture on, although the conventions describe that attribute for successful calls. It's what the model was given, and the most useful thing to see when a call fails.
+- `effect/ai` runs only one `Telemetry.CurrentSpanTransformer` per model call. `Agent.run` provides its own, and that one first runs any transformer it finds in the run's context. A transformer provided only when the `LanguageModel` layer was built isn't visible to it, so it no longer runs. Provide your transformer around the run instead, for example on the runner's stream or in its `layer`.
+
+The root span was named `effect-agent-harness/Runner.run` before this tracing support; update any filter that uses that name.
+
 ## Testing and evals
 
 The core loop doesn't depend on AG-UI or any store. `Agent.run(agent, { runId, threadId, props?, prompt })` takes the run info and an effect/ai `Prompt` (without the system prompt, which the agent adds) and emits `Agent.Event`s:
@@ -754,4 +822,5 @@ Everything is exported from `"effect-agent-harness"` as namespaces.
 | `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                          |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                            |
 | `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompt                                                      |
+| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                |
 | `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                               |
