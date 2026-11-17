@@ -38,6 +38,9 @@ export class ThreadBusy extends Schema.TaggedError<ThreadBusy, { readonly brand:
  * - every assistant entry with an unanswered approval request. The client's
  *   `resume` answers are matched against those; an answer to a request that is
  *   not loaded is ignored.
+ * - every entry of a suspended subagent, and the assistant entry holding the
+ *   call that spawned it, with its tool-call `options` intact. The subagent is
+ *   resumed from those.
  *
  * And it must not put a user, assistant or tool entry the client has never
  * seen after the latest one it has: the client's next run would fail with

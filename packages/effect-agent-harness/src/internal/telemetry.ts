@@ -11,6 +11,7 @@ import type { Tracer } from "effect";
 export const Attr = {
   operationName: "gen_ai.operation.name",
   agentName: "gen_ai.agent.name",
+  agentDescription: "gen_ai.agent.description",
   conversationId: "gen_ai.conversation.id",
   toolName: "gen_ai.tool.name",
   toolCallId: "gen_ai.tool.call.id",

@@ -217,6 +217,15 @@ describe("run root span", () => {
       const { tracer } = yield* traced(weatherTurn, [run1], { agent: unnamed });
       const root = tracer.one("invoke_agent");
       expect(root.attributes.has("gen_ai.agent.name")).toBe(false);
+      expect(root.attributes.has("gen_ai.agent.description")).toBe(false);
+    }),
+  );
+
+  it.effect("carries the agent's description", () =>
+    Effect.gen(function* () {
+      const described = Agent.define({ toolkit: WeatherToolkit, name: "assistant", description: "Answers questions" });
+      const { tracer } = yield* traced(weatherTurn, [run1], { agent: described });
+      expect(attr(tracer.one("invoke_agent assistant"), "gen_ai.agent.description")).toBe("Answers questions");
     }),
   );
 
@@ -657,5 +666,94 @@ describe("tracing and behaviour", () => {
       const unnamed = yield* runWith(Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." }));
       expect(named).toEqual(unnamed);
     }),
+  );
+});
+
+// -----------------------------------------------------------------------------
+// Subagents
+// -----------------------------------------------------------------------------
+
+describe("subagent spans", () => {
+  const researcher = Agent.define({
+    name: "researcher",
+    description: "Looks things up",
+    toolkit: WeatherToolkit,
+    system: "You research.",
+  });
+  const lead = Agent.define({
+    toolkit: WeatherToolkit,
+    name: "assistant",
+    subagents: { agents: [researcher] },
+  }) as unknown as typeof assistant;
+  const delegation: ReadonlyArray<Step> = [
+    [...toolCall("c1", "researcher", { prompt: "Find the weather in Paris" }), finish("tool-calls")],
+    [...toolCall("c2", "get-weather", { location: "Paris" }), finish("tool-calls")],
+    [...text("0", "Paris is 18°C"), finish("stop")],
+    [...text("0", "It's 18°C."), finish("stop")],
+  ];
+
+  it.effect("nests the child's model and tool spans under an invoke_agent span for the call", () =>
+    Effect.gen(function* () {
+      const { tracer } = yield* traced(delegation, [run1], { agent: lead });
+      const span = tracer.one("invoke_agent researcher");
+      expect(tracer.ancestors(span)).toEqual(["invoke_agent assistant"]);
+      expect(attr(span, "gen_ai.operation.name")).toBe("invoke_agent");
+      expect(attr(span, "gen_ai.agent.name")).toBe("researcher");
+      expect(attr(span, "gen_ai.agent.description")).toBe("Looks things up");
+      expect(attr(span, "gen_ai.tool.call.id")).toBe("c1");
+      expect(attr(span, "gen_ai.conversation.id")).toBe("t1");
+      expect(span.status._tag).toBe("Ended");
+      expect(tracer.ancestors(tracer.one("execute_tool get-weather"))[0]).toBe("invoke_agent researcher");
+      const models = tracer.named(MODEL_SPAN).map((model) => tracer.ancestors(model)[0]);
+      expect(models).toEqual([
+        "invoke_agent assistant",
+        "invoke_agent researcher",
+        "invoke_agent researcher",
+        "invoke_agent assistant",
+      ]);
+    }),
+  );
+
+  it.effect("ends a failed child's span with an error", () =>
+    Effect.gen(function* () {
+      const hasty = Agent.define({ ...researcher, name: "researcher", maxSteps: 1 });
+      const withHasty = Agent.define({
+        toolkit: WeatherToolkit,
+        name: "assistant",
+        subagents: { agents: [hasty] },
+      }) as unknown as typeof assistant;
+      const { tracer } = yield* traced(
+        [delegation[0]!, delegation[1]!, [...text("0", "Sorry."), finish("stop")]],
+        [run1],
+        { agent: withHasty },
+      );
+      const span = tracer.one("invoke_agent researcher");
+      expect(attr(span, "error.type")).toBe("StepLimitExceeded");
+      expect(span.status._tag === "Ended" && Exit.isFailure(span.status.exit)).toBe(true);
+      const root = tracer.one("invoke_agent assistant");
+      expect(root.status._tag === "Ended" && Exit.isSuccess(root.status.exit)).toBe(true);
+    }),
+  );
+
+  it.effect("opens no model or tool span for a child's replayed steps", () =>
+    Effect.gen(function* () {
+      const attempt = (steps: ReadonlyArray<Step>) =>
+        Effect.gen(function* () {
+          const tracer = recordingTracer();
+          yield* Agent.run(lead, { runId: "r1", threadId: "t1", prompt: Prompt.make("Weather?") }).pipe(
+            Stream.runDrain,
+            Effect.provide([scriptedModel(steps).layer, WeatherToolkitLayer, tracer.layer]),
+          );
+          return tracer;
+        });
+      yield* attempt(delegation);
+      const again = yield* attempt([]);
+      expect(again.named(MODEL_SPAN)).toEqual([]);
+      expect(again.named("execute_tool get-weather")).toEqual([]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+      ),
+    ),
   );
 });

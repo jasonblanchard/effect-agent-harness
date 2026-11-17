@@ -127,11 +127,11 @@ The agent SHALL work with any configured language model and SHALL NOT depend on 
 ### Requirement: Thread history from the server store
 Under the server history, the agent SHALL keep the history of each `threadId` in the thread store and SHALL rebuild the model prompt on every run from the store, not from the client's full history. The prompt SHALL be:
 1. the agent's system prompt as resolved for this run;
-2. the stored entries' messages, in order;
-3. the approval responses recorded for this run;
+2. the stored entries' messages, in order, leaving out entries owned by a subagent;
+3. the approval responses recorded for this run that answer the agent's own requests;
 4. the ingested client delta.
 
-Every tool result SHALL be placed directly after the assistant message holding its tool call. Every tool call sent to the model SHALL have a result: a stored tool call with no result and no approval request SHALL be sent with a failed result.
+Every tool result SHALL be placed directly after the assistant message holding its tool call. Every tool call sent to the model SHALL have a result: a stored tool call with no result, no approval request and no record of a suspended subagent call SHALL be sent with a failed result.
 
 #### Scenario: Follow-up question uses earlier context
 - **WHEN** a second run on the same thread arrives after a first run that made a tool call
@@ -156,6 +156,10 @@ Every tool result SHALL be placed directly after the assistant message holding i
 #### Scenario: System prompt is not stored
 - **WHEN** a run on a new thread finishes
 - **THEN** the thread's stored entries do not include the agent's system prompt
+
+#### Scenario: Child entries are not in the parent prompt
+- **WHEN** a thread holds a `researcher` call, the child's entries and the call's result, and a new user message arrives
+- **THEN** the model receives the call, its result and the new user message, and none of the child's messages
 
 ### Requirement: Client messages are ingested as a delta
 Under the server history, a client message SHALL be known to the store when a stored entry has its id, or when it is a `tool` message and a stored tool result has its `toolCallId`. Every other client message SHALL be ignored for matching. The agent SHALL treat as new only the client messages after the last known client message; when the store is empty, every client message is new. From the delta it SHALL accept:
@@ -197,7 +201,7 @@ Under the server history, when the store is not empty and no client message id m
 - **THEN** the run emits `RUN_STARTED` then `RUN_ERROR` with code `HistoryMismatch`, and the model is not called
 
 ### Requirement: Divergent history is rejected
-Under the server history, when the client's history has a known message, the agent SHALL find the stored entry matched by the last known client message. It SHALL then check every stored entry after it that holds a user message, an assistant message with text or tool calls, or a tool result. An assistant entry holding only reasoning SHALL NOT be checked, and reasoning messages SHALL NOT count as known or as missing. Entries committed by the run itself SHALL NOT be checked, because a run executed again after a crash meets the steps its earlier attempt committed. If any checked entry is not matched by some client message, the agent SHALL NOT commit anything, SHALL NOT call the model, and SHALL end the run with `RUN_ERROR` whose `code` is `HistoryDiverged`. The store SHALL be told the run ended, as for any failure after the claim.
+Under the server history, when the client's history has a known message, the agent SHALL find the stored entry matched by the last known client message. It SHALL then check every stored entry after it that holds a user message, an assistant message with text or tool calls, or a tool result. An assistant entry holding only reasoning SHALL NOT be checked, and reasoning messages SHALL NOT count as known or as missing. Entries owned by a subagent SHALL NOT be checked. Entries committed by the run itself SHALL NOT be checked, because a run executed again after a crash meets the steps its earlier attempt committed. If any checked entry is not matched by some client message, the agent SHALL NOT commit anything, SHALL NOT call the model, and SHALL end the run with `RUN_ERROR` whose `code` is `HistoryDiverged`. The store SHALL be told the run ended, as for any failure after the claim.
 
 #### Scenario: Edited earlier turn
 - **WHEN** the store holds five messages m1 to m5 and the client sends m1 followed by a new user message m2' in place of m2
@@ -230,6 +234,14 @@ Under the server history, when the client's history has a known message, the age
 #### Scenario: Entry holding only reasoning
 - **WHEN** the store ends with an assistant entry holding only reasoning, and the client's history ends before it
 - **THEN** the run is not rejected for divergence
+
+#### Scenario: Client dropped child messages
+- **WHEN** the store holds a `researcher` call, the child's entries and the call's result, and the client resends the call and its result without the child's messages, plus a new user message
+- **THEN** the run is not rejected, and only the new user message is committed
+
+#### Scenario: Client kept child messages
+- **WHEN** the client resends the child's messages, tagged with their `subagentRunId`, as well
+- **THEN** the run is not rejected, and only the new user message is committed
 
 ### Requirement: Per-step commit
 Under the server history, after each model step completes, the agent SHALL commit that step's assistant entry and tool entries to the store before continuing. A run that stops mid-step SHALL leave no partial entries for that step.
@@ -265,10 +277,11 @@ Under the server history, the agent SHALL notify the thread store once when a ru
 - **THEN** the run ends with `RUN_ERROR` whose `code` is `ThreadError` and the store is not notified
 
 ### Requirement: Tool approval interrupts the run
-When the model calls a tool that requires approval, the agent SHALL NOT run it. Under the server history, it SHALL record an approval request on the assistant entry. Under either history, it SHALL end the run with `RUN_FINISHED` whose outcome is `interrupt`, listing one interrupt per pending approval with:
+When the model calls a tool that requires approval, the agent SHALL NOT run it. Under the server history, it SHALL record an approval request on the assistant entry. Under either history, it SHALL end the run with `RUN_FINISHED` whose outcome is `interrupt`, listing one interrupt per pending approval, including the approvals of suspended subagents, with:
 - `id` set to the approval id;
 - `reason` `tool-approval`;
-- `toolCallId` set to the tool call.
+- `toolCallId` set to the tool call;
+- `subagentRunId` set to the owning subagent, for an approval a subagent requested.
 
 The approval id SHALL be determined by the tool call's id alone, so that a later run can match it to the call from the client's history. The tool call's `TOOL_CALL_START`/`ARGS`/`END` events SHALL still be streamed.
 
@@ -280,8 +293,12 @@ The approval id SHALL be determined by the tool call's id alone, so that a later
 - **WHEN** two runs on different threads each interrupt for a "send-email" call with the same tool call id
 - **THEN** both interrupts carry the same `id`, and interrupts for calls with different ids carry different `id`s
 
+#### Scenario: Child needs approval
+- **WHEN** a child of the agent calls "send-email"
+- **THEN** the run ends with `RUN_FINISHED` whose outcome is `interrupt` with one interrupt for that call carrying the child's `subagentRunId`
+
 ### Requirement: Resume entries answer approvals
-A run input MAY carry `resume` entries. Under the server history, for each pending approval request whose approval id equals an entry's `interruptId`, the agent SHALL record an approval response. The response SHALL be approved only when `status` is `resolved` and `payload.approved` is `true`; otherwise it SHALL be denied with `payload.reason` or a default reason. Entries matching no pending request SHALL be ignored. Under the client history, resume entries SHALL be matched against the calls in the client's history instead (see the run-history capability).
+A run input MAY carry `resume` entries. Under the server history, for each pending approval request whose approval id equals an entry's `interruptId`, the agent SHALL record an approval response, owned by the same subagent as the request when a subagent requested it. The response SHALL be approved only when `status` is `resolved` and `payload.approved` is `true`; otherwise it SHALL be denied with `payload.reason` or a default reason. Entries matching no pending request SHALL be ignored. Under the client history, resume entries SHALL be matched against the calls in the client's history instead (see the run-history capability).
 
 #### Scenario: Resolved with approval
 - **WHEN** the next run carries `resume: [{ interruptId, status: "resolved", payload: { approved: true } }]` for the pending email approval
@@ -294,6 +311,10 @@ A run input MAY carry `resume` entries. Under the server history, for each pendi
 #### Scenario: Unknown interrupt id
 - **WHEN** a resume entry names an interrupt id with no pending request
 - **THEN** it is ignored and the run proceeds
+
+#### Scenario: Child's approval answered
+- **WHEN** the next run approves the interrupt a child raised
+- **THEN** the approving response is recorded as owned by the child, and the parent's model does not receive it
 
 ### Requirement: Approval decisions execute before the first model step
 Approved calls SHALL execute before the first model step of the run and emit `TOOL_CALL_RESULT`; denied calls SHALL emit a failed `TOOL_CALL_RESULT` naming the reason. The model SHALL then be called with those results in the prompt.

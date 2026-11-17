@@ -12,6 +12,9 @@ import type {
   RunStartedEvent,
   StepFinishedEvent,
   StepStartedEvent,
+  SubagentErrorEvent,
+  SubagentFinishedEvent,
+  SubagentStartedEvent,
   TextMessageContentEvent,
   TextMessageEndEvent,
   TextMessageStartEvent,
@@ -49,6 +52,8 @@ export const Message = Schema.Struct({
   toolCallId: Schema.optional(Schema.String),
   /** Set on a `tool` message whose tool call failed. */
   error: Schema.optional(Schema.String),
+  /** The subagent that produced the message; absent for the agent's own. */
+  subagentRunId: Schema.optional(Schema.String),
 });
 export type Message = typeof Message.Type;
 
@@ -71,18 +76,21 @@ const approvalResponseSchema = {
 
 /**
  * The interrupt for a tool call waiting for approval, as `RUN_FINISHED` carries
- * it and as `History.restore` returns it for an open request.
+ * it and as `History.restore` returns it for an open request. A subagent's
+ * call carries the subagent's `subagentRunId`.
  */
 export const approvalInterrupt = (approval: {
   readonly approvalId: string;
   readonly toolCallId: string;
   readonly toolName: string;
+  readonly subagentRunId?: string | undefined;
 }): Interrupt => ({
   id: approval.approvalId,
   reason: "tool-approval",
   toolCallId: approval.toolCallId,
   message: `Approve call to ${approval.toolName}?`,
   responseSchema: approvalResponseSchema,
+  ...(approval.subagentRunId === undefined ? {} : { subagentRunId: approval.subagentRunId }),
 });
 
 /**
@@ -144,7 +152,10 @@ export type Event =
   | ToolCallStartEvent
   | ToolCallArgsEvent
   | ToolCallEndEvent
-  | ToolCallResultEvent;
+  | ToolCallResultEvent
+  | SubagentStartedEvent
+  | SubagentFinishedEvent
+  | SubagentErrorEvent;
 
 /** Whether the event ends a run (`RUN_FINISHED` or `RUN_ERROR`). */
 export const isTerminal = (event: Event): boolean => event.type === "RUN_FINISHED" || event.type === "RUN_ERROR";
@@ -286,39 +297,125 @@ export const reasoningMessageId = (stepMessageId: string, n: number): string => 
  * reasoning message, both under {@link reasoningMessageId}. Only its text is
  * sent: provider metadata such as a signature stays on the stored part.
  *
+ * A subagent's events are tagged with its `subagentRunId`, between
+ * `SUBAGENT_STARTED` (on its first event) and `SUBAGENT_ERROR` or
+ * `SUBAGENT_FINISHED` (`suspended`, naming the interrupts it owns, or
+ * `success`, with the result its parent receives, just before that
+ * `TOOL_CALL_RESULT`). Each subagent's spans and steps are tracked apart, so
+ * concurrent ones never close each other's. Its own run lifecycle is not
+ * emitted.
+ *
  * Replayed events are dropped: they were already published by the attempt
- * that executed them.
+ * that executed them. `resumed` is the log of an earlier attempt this one
+ * completes: a subagent it left open is continued without a second
+ * `SUBAGENT_STARTED`, and one it closed is not closed again.
  *
  * `RUN_ERROR.message` carries the underlying error's message, which may include
  * provider details; callers serving untrusted clients can rewrite it by mapping
  * the stream. `RUN_ERROR.code` is the error's tag.
  */
 export const fold =
-  (input: { readonly threadId: string; readonly runId: string }) =>
+  (
+    input: { readonly threadId: string; readonly runId: string },
+    options?: { readonly resumed?: ReadonlyArray<Event> | undefined },
+  ) =>
   <E, R>(events: Stream.Stream<Agent.Event, E, R>): Stream.Stream<Event, E, R> =>
     Stream.suspend(() => {
-      let current: StepState | undefined;
-      const started = new Set<number>();
+      // The step state of the agent (no key) and of each subagent.
+      const levels = new Map<string | undefined, { current: StepState | undefined; readonly started: Set<number> }>();
+      const level = (owner: string | undefined) => {
+        let found = levels.get(owner);
+        if (found === undefined) {
+          found = { current: undefined, started: new Set() };
+          levels.set(owner, found);
+        }
+        return found;
+      };
+      const { open, closed } = subagentsIn(options?.resumed ?? []);
+      // The calls whose results an earlier attempt published, when its log is known.
+      const published =
+        options?.resumed === undefined
+          ? undefined
+          : new Set(options.resumed.flatMap((e) => (e.type === "TOOL_CALL_RESULT" ? [e.toolCallId] : [])));
+      // Subagents whose events an earlier attempt published.
+      const replayed = new Set<string>();
+      // Finished subagents waiting for their parent's result, by the call that spawned them.
+      const awaitingResult = new Map<string, string>();
 
-      const project = (event: Agent.Event): ReadonlyArray<Event> => {
+      // Closes the spans and steps of `owner`, as the end of a subagent or of the run requires.
+      const closeLevel = (owner: string | undefined): Array<Event> => {
+        const state = level(owner);
+        const events = state.current?.close() ?? [];
+        state.current = undefined;
+        for (const step of state.started) {
+          events.push(stepFinished(stepName(step)));
+        }
+        state.started.clear();
+        return events.map((event) => attribute(event, owner));
+      };
+
+      const project = (event: Agent.Event, owner: string | undefined): ReadonlyArray<Event> => {
+        if (event._tag === "Subagent") {
+          return projectSubagent(event, owner);
+        }
+        if (event._tag === "ToolResult" && event.replayed) {
+          // A step's results go out only once all its calls have finished, so an attempt can stop after a result
+          // was checkpointed and before it was published. Such a result goes out now: one the earlier attempt's
+          // log lacks, or one a subagent the earlier attempt left open is waiting for (it can't have been
+          // published, as it follows the subagent's end).
+          const finished = awaitingResult.get(event.toolCallId);
+          const unpublished = published !== undefined && !published.has(event.toolCallId);
+          if (finished === undefined && !unpublished) {
+            return [];
+          }
+          const events: Array<Event> = [];
+          if (finished !== undefined) {
+            awaitingResult.delete(event.toolCallId);
+            open.delete(finished);
+            closed.add(finished);
+            events.push(subagentFinished(finished, event.encodedResult));
+          }
+          published?.add(event.toolCallId);
+          events.push(
+            attribute(
+              toolCallResult(event.messageId, event.toolCallId, JSON.stringify(event.encodedResult ?? null)),
+              owner,
+            ),
+          );
+          return events;
+        }
         if ("replayed" in event && event.replayed) {
           return [];
         }
+        const state = level(owner);
+        const own = (events: ReadonlyArray<Event>) => events.map((e) => attribute(e, owner));
         switch (event._tag) {
           case "StepStarted": {
-            current = new StepState(event.messageId);
-            started.add(event.step);
-            return [stepStarted(stepName(event.step))];
+            state.current = new StepState(event.messageId);
+            state.started.add(event.step);
+            return own([stepStarted(stepName(event.step))]);
           }
           case "ModelPart": {
-            return current === undefined ? [] : handlePart(current, event.part);
+            return state.current === undefined ? [] : own(handlePart(state.current, event.part));
           }
           case "ToolResult": {
             const events: Array<Event> = [];
-            if (current?.openTools.delete(event.toolCallId) === true) {
-              events.push(toolCallEnd(event.toolCallId));
+            if (state.current?.openTools.delete(event.toolCallId) === true) {
+              events.push(attribute(toolCallEnd(event.toolCallId), owner));
             }
-            events.push(toolCallResult(event.messageId, event.toolCallId, JSON.stringify(event.encodedResult ?? null)));
+            const finished = awaitingResult.get(event.toolCallId);
+            if (finished !== undefined) {
+              awaitingResult.delete(event.toolCallId);
+              open.delete(finished);
+              closed.add(finished);
+              events.push(subagentFinished(finished, event.encodedResult));
+            }
+            events.push(
+              attribute(
+                toolCallResult(event.messageId, event.toolCallId, JSON.stringify(event.encodedResult ?? null)),
+                owner,
+              ),
+            );
             return events;
           }
           case "ApprovalRequested": {
@@ -326,20 +423,24 @@ export const fold =
             return [];
           }
           case "StepFinished": {
-            const events = current?.close() ?? [];
-            current = undefined;
-            if (started.delete(event.step)) {
+            const events = state.current?.close() ?? [];
+            state.current = undefined;
+            if (state.started.delete(event.step)) {
               events.push(stepFinished(stepName(event.step)));
             }
-            return events;
+            return own(events);
           }
           case "Finished": {
+            // Every subagent closes before the run does; one still open never got its parent's result.
+            const unclosed = [...open].map((id) => subagentFinished(id, undefined));
+            open.clear();
             if (event.outcome._tag === "Interrupted") {
               // AG-UI's interrupt outcome carries no pending calls: the client finds them in the stream.
-              return [runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
+              return [...unclosed, runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
             }
             const pendingToolCallIds = event.outcome.pendingToolCalls.map((call) => call.toolCallId);
             return [
+              ...unclosed,
               runFinished(
                 input,
                 pendingToolCallIds.length === 0 ? { type: "success" } : { type: "success", pendingToolCallIds },
@@ -347,41 +448,163 @@ export const fold =
             ];
           }
           case "Failed": {
-            const events = current?.close() ?? [];
-            current = undefined;
+            // A subagent left open is the expected shape of a failed run; spans are not.
+            const events = [...levels.keys()].filter((key) => key !== undefined).flatMap(closeLevel);
+            const state = level(undefined);
+            events.push(...(state.current?.close() ?? []));
+            state.current = undefined;
             events.push(runError(Agent.errorMessage(event.error), event.code));
             return events;
           }
         }
       };
 
-      return Stream.make(runStarted(input)).pipe(Stream.concat(Stream.flattenIterable(Stream.map(events, project))));
+      const projectSubagent = (
+        wrapped: Extract<Agent.Event, { _tag: "Subagent" }>,
+        enclosing: string | undefined,
+      ): ReadonlyArray<Event> => {
+        const id = wrapped.subagentRunId;
+        const event = wrapped.event;
+        const start = (): Array<Event> => {
+          if (open.has(id) || closed.has(id)) {
+            return [];
+          }
+          open.add(id);
+          return [
+            {
+              type: "SUBAGENT_STARTED",
+              subagentRunId: id,
+              name: wrapped.name,
+              ...(wrapped.description === undefined ? {} : { description: wrapped.description }),
+              ...(enclosing === undefined ? {} : { parentSubagentRunId: enclosing }),
+              parentToolCallId: wrapped.parentToolCallId,
+              parentMessageId: wrapped.parentMessageId,
+            },
+          ];
+        };
+        if (event._tag === "Finished" || event._tag === "Failed") {
+          if (!open.has(id) && (closed.has(id) || replayed.has(id))) {
+            // An earlier attempt published this subagent.
+            return [];
+          }
+          const opening = start();
+          const closers = closeLevel(id);
+          if (event._tag === "Failed") {
+            open.delete(id);
+            closed.add(id);
+            return [
+              ...opening,
+              ...closers,
+              {
+                type: "SUBAGENT_ERROR",
+                subagentRunId: id,
+                message: Agent.errorMessage(event.error),
+                ...(event.code === undefined ? {} : { code: event.code }),
+              },
+            ];
+          }
+          if (event.outcome._tag === "Interrupted") {
+            open.delete(id);
+            closed.add(id);
+            // Only the interrupts it owns directly; a descendant's are its own.
+            const interruptIds = event.outcome.approvals
+              .filter((approval) => approval.subagentRunId === undefined)
+              .map((approval) => approval.approvalId);
+            return [
+              ...opening,
+              ...closers,
+              {
+                type: "SUBAGENT_FINISHED",
+                subagentRunId: id,
+                outcome: interruptIds.length === 0 ? { type: "suspended" } : { type: "suspended", interruptIds },
+              },
+            ];
+          }
+          // Finished when its parent receives the result, which carries it.
+          awaitingResult.set(wrapped.parentToolCallId, id);
+          return [...opening, ...closers];
+        }
+        if ("replayed" in event && event.replayed) {
+          replayed.add(id);
+          if (event._tag !== "ToolResult") {
+            return [];
+          }
+        }
+        const projected = project(event, id);
+        return projected.length === 0 ? projected : [...start(), ...projected];
+      };
+
+      return Stream.make(runStarted(input)).pipe(
+        Stream.concat(Stream.flattenIterable(Stream.map(events, (event) => project(event, undefined)))),
+      );
     });
 
 const stepName = (step: number) => `step-${step}`;
 
+/** The event, attributed to `subagentRunId` when there is one. */
+const attribute = (event: Event, subagentRunId: string | undefined): Event =>
+  subagentRunId === undefined ? event : ({ ...event, subagentRunId } as Event);
+
+const subagentFinished = (subagentRunId: string, result: unknown): SubagentFinishedEvent => ({
+  type: "SUBAGENT_FINISHED",
+  subagentRunId,
+  // AG-UI's `result` is any JSON value except null.
+  ...(result === undefined || result === null ? {} : { result: result as Schema.Json }),
+  outcome: { type: "success" },
+});
+
+/** The subagents a log started and has not closed, and those it closed. */
+const subagentsIn = (history: ReadonlyArray<Event>): { open: Set<string>; closed: Set<string> } => {
+  const open = new Set<string>();
+  const closed = new Set<string>();
+  for (const event of history) {
+    if (event.type === "SUBAGENT_STARTED") {
+      open.add(event.subagentRunId);
+    } else if (event.type === "SUBAGENT_FINISHED" || event.type === "SUBAGENT_ERROR") {
+      open.delete(event.subagentRunId);
+      closed.add(event.subagentRunId);
+    }
+  }
+  return { open, closed };
+};
+
+/** The subagent an event is attributed to, if any. */
+const ownerOf = (event: Event): string | undefined =>
+  "subagentRunId" in event &&
+  event.type !== "SUBAGENT_STARTED" &&
+  event.type !== "SUBAGENT_FINISHED" &&
+  event.type !== "SUBAGENT_ERROR"
+    ? event.subagentRunId
+    : undefined;
+
 /**
  * Events that close every text message, reasoning message, reasoning span,
  * tool call and step left open in `history`, e.g. by an attempt of the run that
- * crashed. Empty when nothing is open.
+ * crashed, each attributed to the subagent that opened it. Empty when nothing
+ * is open. Subagents are left open: the attempt that completes the run
+ * continues them (see `fold`'s `resumed`).
  */
 export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
-  const text = new Set<string>();
+  // Each open span's owner, by its id.
+  const text = new Map<string, string | undefined>();
   // Tracked apart, because a log can stop between a block's two starts.
   const reasoningMessages = new Set<string>();
-  const reasoningSpans = new Set<string>();
-  const tools = new Set<string>();
-  const steps = new Set<string>();
+  const reasoningSpans = new Map<string, string | undefined>();
+  const tools = new Map<string, string | undefined>();
+  // Steps are scoped to their owner.
+  const steps = new Map<string, { readonly stepName: string; readonly owner: string | undefined }>();
+  const stepKey = (stepName: string, owner: string | undefined) => JSON.stringify([owner ?? null, stepName]);
   for (const event of history) {
+    const owner = ownerOf(event);
     switch (event.type) {
       case "TEXT_MESSAGE_START":
-        text.add(event.messageId);
+        text.set(event.messageId, owner);
         break;
       case "TEXT_MESSAGE_END":
         text.delete(event.messageId);
         break;
       case "REASONING_START":
-        reasoningSpans.add(event.messageId);
+        reasoningSpans.set(event.messageId, owner);
         break;
       case "REASONING_END":
         reasoningSpans.delete(event.messageId);
@@ -393,24 +616,26 @@ export const closeOpen = (history: ReadonlyArray<Event>): Array<Event> => {
         reasoningMessages.delete(event.messageId);
         break;
       case "TOOL_CALL_START":
-        tools.add(event.toolCallId);
+        tools.set(event.toolCallId, owner);
         break;
       case "TOOL_CALL_END":
         tools.delete(event.toolCallId);
         break;
       case "STEP_STARTED":
-        steps.add(event.stepName);
+        steps.set(stepKey(event.stepName, owner), { stepName: event.stepName, owner });
         break;
       case "STEP_FINISHED":
-        steps.delete(event.stepName);
+        steps.delete(stepKey(event.stepName, owner));
         break;
     }
   }
   return [
-    ...[...text].map(textMessageEnd),
-    ...[...reasoningSpans].flatMap((id) => (reasoningMessages.has(id) ? closeReasoning(id) : [reasoningEnd(id)])),
-    ...[...tools].map(toolCallEnd),
-    ...[...steps].map(stepFinished),
+    ...[...text].map(([id, owner]) => attribute(textMessageEnd(id), owner)),
+    ...[...reasoningSpans].flatMap(([id, owner]) =>
+      (reasoningMessages.has(id) ? closeReasoning(id) : [reasoningEnd(id)]).map((event) => attribute(event, owner)),
+    ),
+    ...[...tools].map(([id, owner]) => attribute(toolCallEnd(id), owner)),
+    ...[...steps.values()].map(({ stepName, owner }) => attribute(stepFinished(stepName), owner)),
   ];
 };
 

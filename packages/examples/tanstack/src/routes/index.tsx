@@ -76,7 +76,7 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
         <h1>effect-agent-harness × TanStack AI</h1>
         <p>
           Ask about the weather anywhere, what time it is where you are (your browser answers), or ask it to send an
-          email (it asks you first).
+          email (it asks you first). For a report on several places, it asks its weather desk, a subagent.
         </p>
       </header>
       <ol className="messages">
@@ -122,6 +122,13 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
   );
 }
 
+const SUBAGENT_STATUS = {
+  running: "working…",
+  finished: "done",
+  error: "failed",
+  suspended: "waiting for approval",
+} as const;
+
 function Message({ message }: { readonly message: UIMessage }) {
   // The client adds an empty assistant message when a run starts.
   if (message.parts.length === 0) return null;
@@ -145,6 +152,22 @@ function Message({ message }: { readonly message: UIMessage }) {
                   🔧 {part.name} {part.arguments}
                 </summary>
                 {part.output !== undefined && <pre>{JSON.stringify(part.output, null, 2)}</pre>}
+              </details>
+            );
+          case "subagent":
+            // A subagent's work, as TanStack builds it from the `SUBAGENT_*` events (and the server's
+            // hydrate rebuilds it after a reload): its own messages, rendered like the assistant's.
+            return (
+              <details key={part.subagent.id} className="tool subagent" open={part.subagent.status !== "finished"}>
+                <summary>
+                  🤖 {part.subagent.name} · {SUBAGENT_STATUS[part.subagent.status]}
+                </summary>
+                {part.subagent.error && <p className="error">{part.subagent.error.message}</p>}
+                <ol className="messages">
+                  {part.subagent.messages.map((child) => (
+                    <Message key={child.id} message={child} />
+                  ))}
+                </ol>
               </details>
             );
           default:

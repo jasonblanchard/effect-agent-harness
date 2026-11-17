@@ -374,6 +374,35 @@ describe("restore", () => {
     expect(Conversions.restore(entries).messages.map((message) => message.id)).toEqual(["m1", "t1", "u2"]);
   });
 
+  it("marks a failed result with its error, and its read is accepted back", () => {
+    const failed: Messages.Entry = {
+      id: "t1",
+      message: Prompt.makeMessage("tool", {
+        content: [
+          Prompt.makePart("tool-result", {
+            id: "c1",
+            name: "get-weather",
+            isFailure: true,
+            result: "Out of range",
+            providerExecuted: false,
+          }),
+        ],
+      }),
+    };
+    const entries = [assistantCall("m1", "c1"), failed];
+    const { messages } = Conversions.restore(entries);
+    expect(messages[1]).toEqual({
+      id: "t1",
+      role: "tool",
+      toolCallId: "c1",
+      content: '"Out of range"',
+      error: "Out of range",
+    });
+    expect(Conversions.delta(entries, [...messages, clientMessage("u3", "user", "Thanks")])).toEqual(
+      Result.succeed([clientMessage("u3", "user", "Thanks")]),
+    );
+  });
+
   it("keeps a result whose call is not loaded, and its read is accepted back", () => {
     const entries = [system("s1", "Summary"), toolResult("t1", "c1", 1), assistantText("a2", "Done.")];
     const { messages } = Conversions.restore(entries);

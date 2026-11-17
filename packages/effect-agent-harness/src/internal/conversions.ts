@@ -90,11 +90,13 @@ export const delta = (
   }
   const anchor = positions[last]!;
   const matched = new Set(positions);
+  // A client may hold a subagent's messages or not: only the agent's own are required.
   const missing = stored.some(
     (entry, index) =>
       index > anchor &&
       !matched.has(index) &&
       (runId === undefined || entry.runId !== runId) &&
+      entry.subagentRunId === undefined &&
       shown(entry) !== undefined,
   );
   return missing ? Result.fail(new HistoryDiverged()) : Result.succeed(client.slice(last + 1));
@@ -179,16 +181,21 @@ export const resume = (
   entries: ReadonlyArray<AgUi.ResumeEntry>,
 ): Result.Result<ReadonlyArray<Entry>, UnansweredInterrupt> => {
   const answers = new Map(entries.map((entry) => [entry.interruptId, entry]));
-  const pending = pendingApprovals(stored).map((request) => request.approvalId);
-  const unanswered = pending.filter((approvalId) => !answers.has(approvalId));
+  const pending = pendingApprovals(stored);
+  const unanswered = pending.filter((request) => !answers.has(request.approvalId));
   if (unanswered.length > 0) {
-    return Result.fail(new UnansweredInterrupt({ interruptIds: unanswered }));
+    return Result.fail(new UnansweredInterrupt({ interruptIds: unanswered.map((request) => request.approvalId) }));
   }
-  return Result.succeed(pending.map((approvalId) => decision(answers.get(approvalId)!)));
+  return Result.succeed(
+    pending.map((request) => decision(answers.get(request.approvalId)!, request.entry.subagentRunId)),
+  );
 };
 
-/** The approval response entry a resume entry gives the request it answers (see {@link resume}). */
-const decision = (answer: AgUi.ResumeEntry): Entry => {
+/**
+ * The approval response entry a resume entry gives the request it answers
+ * (see {@link resume}), owned by the subagent that owns the request, if any.
+ */
+const decision = (answer: AgUi.ResumeEntry, owner: string | undefined): Entry => {
   const approvalId = answer.interruptId;
   const payload = Option.getOrUndefined(decodeApprovalResponse(answer.payload));
   const approved = answer.status === "resolved" && payload?.approved === true;
@@ -200,6 +207,7 @@ const decision = (answer: AgUi.ResumeEntry): Entry => {
         Prompt.toolApprovalResponsePart(approved ? { approvalId, approved } : { approvalId, approved, reason }),
       ],
     }),
+    ...(owner === undefined ? {} : { subagentRunId: owner }),
   };
 };
 
@@ -439,7 +447,11 @@ export const fromHistory = (
   }
   const dropped = new Set(droppedCalls);
   const answered = new Set<string>();
-  // Each converted assistant entry, with the calls it holds, so approval requests can be added to it.
+  // The subagents whose messages the client sent back.
+  const owners = new Set(
+    messages.flatMap((message) => (message.subagentRunId === undefined ? [] : [message.subagentRunId])),
+  );
+  // Each converted assistant entry, with the calls it holds, so approval requests and marks can be added to it.
   const assistants: Array<{
     readonly index: number;
     readonly callIds: ReadonlyArray<string>;
@@ -447,6 +459,9 @@ export const fromHistory = (
   }> = [];
   const entries: Array<Entry> = [];
   for (const message of messages) {
+    // A subagent's message stays its own: `Messages.project` keeps it out of the agent's prompt.
+    const owned = (entry: Entry): Entry =>
+      message.subagentRunId === undefined ? entry : { ...entry, subagentRunId: message.subagentRunId };
     switch (message.role) {
       case "assistant": {
         const text = textOf(message.content);
@@ -462,7 +477,7 @@ export const fromHistory = (
           }),
         ];
         assistants.push({ index: entries.length, callIds, content });
-        entries.push({ id: message.id, message: Prompt.makeMessage("assistant", { content }) });
+        entries.push(owned({ id: message.id, message: Prompt.makeMessage("assistant", { content }) }));
         break;
       }
       case "tool": {
@@ -483,11 +498,11 @@ export const fromHistory = (
         if (result.dropped) {
           droppedParts.push(toolCallId);
         }
-        entries.push(result.entry);
+        entries.push(owned(result.entry));
         break;
       }
       default: {
-        entries.push(...ingest([message], options));
+        entries.push(...ingest([message], options).map(owned));
       }
     }
   }
@@ -495,6 +510,16 @@ export const fromHistory = (
   const answers = new Map(resume.map((entry) => [entry.interruptId, entry]));
   const responses: Array<Entry> = [];
   for (const { index, callIds, content } of assistants) {
+    const { id, subagentRunId: owner } = entries[index]!;
+    let changed = false;
+    const marked = content.map((part) => {
+      // A call whose child's messages are here, with no result: the child is suspended, and the run resumes it.
+      if (part.type === "tool-call" && !answered.has(part.id) && owners.has(Agent.subagentIdFor(part.id))) {
+        changed = true;
+        return Agent.markSuspendedSubagent(part, id);
+      }
+      return part;
+    });
     const requests = callIds.flatMap((toolCallId) => {
       const approvalId = Agent.approvalIdFor(toolCallId);
       const answer = answers.get(approvalId);
@@ -502,12 +527,14 @@ export const fromHistory = (
         return [];
       }
       answered.add(toolCallId);
-      responses.push(decision(answer));
+      responses.push(decision(answer, owner));
       return [Prompt.toolApprovalRequestPart({ approvalId, toolCallId })];
     });
-    if (requests.length > 0) {
-      const { id } = entries[index]!;
-      entries[index] = { id, message: Prompt.makeMessage("assistant", { content: [...content, ...requests] }) };
+    if (changed || requests.length > 0) {
+      entries[index] = {
+        ...entries[index]!,
+        message: Prompt.makeMessage("assistant", { content: [...marked, ...requests] }),
+      };
     }
   }
   return { entries: [...entries, ...responses], droppedCalls, orphanResults, droppedParts };
@@ -597,10 +624,20 @@ const shown = (entry: Entry): Message | undefined => {
     }
     case "tool": {
       const result = message.content.find((part) => part.type === "tool-result");
-      // Encoded as `TOOL_CALL_RESULT` encodes it.
-      return result === undefined
-        ? undefined
-        : { id, role: "tool", toolCallId: result.id, content: JSON.stringify(result.result ?? null) };
+      if (result === undefined) {
+        return undefined;
+      }
+      // Encoded as `TOOL_CALL_RESULT` encodes it. A failed result also carries its error, which is how a
+      // client's history marks one (see `answers`).
+      return {
+        id,
+        role: "tool",
+        toolCallId: result.id,
+        content: JSON.stringify(result.result ?? null),
+        ...(result.isFailure
+          ? { error: typeof result.result === "string" ? result.result : JSON.stringify(result.result ?? null) }
+          : {}),
+      };
     }
     case "system": {
       return undefined;
@@ -637,34 +674,54 @@ const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
  * joined, and a tool result is its `TOOL_CALL_RESULT` content. Tool call
  * arguments are re-encoded, so their formatting may differ from the streamed
  * deltas.
+ *
+ * A subagent's messages carry its `subagentRunId` and come directly after the
+ * assistant message holding the call that spawned it, before that call's
+ * result, nested the same way at any depth.
  */
 export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Restored => {
   const entries = activeRunId === undefined ? stored : withoutReplayed(stored, activeRunId);
   const messages = entries.flatMap((entry): ReadonlyArray<Message> => {
     const message = shown(entry);
-    return message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
+    const all = message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
+    const owner = entry.subagentRunId;
+    return owner === undefined ? all : all.map((m) => ({ ...m, subagentRunId: owner }));
   });
-  // Each tool result goes after the assistant message holding its call.
+  // Each tool result goes after the assistant message holding its call, and so do the messages of the
+  // subagent the call spawned, before the result.
   const caller = new Map<string, string>();
+  const spawner = new Map<string, string>();
   for (const message of messages) {
     if (message.role === "assistant") {
       for (const call of message.toolCalls ?? []) {
         caller.set(call.id, message.id);
+        spawner.set(Agent.subagentIdFor(call.id), message.id);
       }
     }
   }
   const results = new Map<string, Array<Message>>();
+  const nested = new Map<string, Array<Message>>();
   const rest: Array<Message> = [];
+  const push = (map: Map<string, Array<Message>>, key: string, message: Message) =>
+    map.set(key, [...(map.get(key) ?? []), message]);
   for (const message of messages) {
-    const owner = message.role === "tool" ? caller.get(message.toolCallId) : undefined;
-    if (owner === undefined) {
+    const resultOf = message.role === "tool" ? caller.get(message.toolCallId) : undefined;
+    const host = message.subagentRunId === undefined ? undefined : spawner.get(message.subagentRunId);
+    if (resultOf !== undefined) {
+      push(results, resultOf, message);
+    } else if (host !== undefined) {
+      push(nested, host, message);
+    } else {
       // Includes a result whose call is not loaded (compacted away): it stays where it is.
       rest.push(message);
-    } else {
-      results.set(owner, [...(results.get(owner) ?? []), message]);
     }
   }
-  const ordered = rest.flatMap((message) => [message, ...(results.get(message.id) ?? [])]);
+  const place = (message: Message): Array<Message> => [
+    message,
+    ...(nested.get(message.id) ?? []).flatMap(place),
+    ...(results.get(message.id) ?? []),
+  ];
+  const ordered = rest.flatMap(place);
 
   const pending = pendingApprovals(entries);
   const frontend = pendingFrontendCalls(entries);
@@ -691,6 +748,7 @@ export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Res
                 approvalId: request.approvalId,
                 toolCallId: request.toolCallId,
                 toolName: toolNames.get(request.toolCallId) ?? "",
+                subagentRunId: request.entry.subagentRunId,
               }),
             ),
           },

@@ -212,6 +212,8 @@ const agUiRun =
   ) =>
   (
     input: AgUi.RunAgentInput,
+    // The log of an earlier attempt this one completes.
+    resumed?: ReadonlyArray<AgUi.Event>,
   ): Stream.Stream<
     AgUi.Event,
     never,
@@ -226,6 +228,17 @@ const agUiRun =
             { threadId, runId, name: "prompt", success: Prompt.Prompt, error: Schema.Never },
             Effect.sync(() => Messages.project([...attempt.stored, ...attempt.added])),
           );
+          // Memoised like the prompt, so a resumed subagent sees the same history on every attempt.
+          const subagentPrompts = yield* checkpoint.memo(
+            {
+              threadId,
+              runId,
+              name: "subagent-prompts",
+              success: Schema.Record(Schema.String, Prompt.Prompt),
+              error: Schema.Never,
+            },
+            Effect.sync(() => Messages.projectSuspended([...attempt.stored, ...attempt.added])),
+          );
 
           return Agent.run(agent, {
             runId,
@@ -233,6 +246,7 @@ const agUiRun =
             props: input.forwardedProps,
             prompt: prompt.value,
             frontendTools: input.tools,
+            subagentPrompts: subagentPrompts.value,
           }).pipe(Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)));
         }),
       ).pipe(
@@ -269,7 +283,7 @@ const agUiRun =
         return opened(attempt, checkpoint).pipe(Stream.provideContext(services));
       }),
     ).pipe(failInBand);
-    return traced(agent, input, (onFailed) => AgUi.fold(input)(Stream.tap(events, onFailed)));
+    return traced(agent, input, (onFailed) => AgUi.fold(input, { resumed })(Stream.tap(events, onFailed)));
   };
 
 /**
@@ -297,6 +311,7 @@ const traced = <R>(
           ...internalTelemetry.callerAttributes(yield* Telemetry.SpanAttributes),
           [Attr.operationName]: "invoke_agent",
           ...(agent.name === undefined ? {} : { [Attr.agentName]: agent.name }),
+          ...(agent.description === undefined ? {} : { [Attr.agentDescription]: agent.description }),
           [Attr.conversationId]: input.threadId,
           [Attr.runId]: input.runId,
         },
@@ -407,7 +422,7 @@ const detached =
         return;
       }
       yield* Effect.forEach(AgUi.closeOpen(history), append, { discard: true });
-      const events = history.length === 0 ? runWith(input) : Stream.drop(runWith(input), 1);
+      const events = history.length === 0 ? runWith(input) : Stream.drop(runWith(input, history), 1);
       yield* Stream.runForEach(events, append);
     });
   };

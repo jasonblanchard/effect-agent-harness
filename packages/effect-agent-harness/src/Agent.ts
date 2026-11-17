@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Option, Predicate, Queue, Schema, Stream } from "effect";
+import { Cause, Context, Effect, Option, Predicate, Queue, Result, Schema, Stream } from "effect";
 import { IdGenerator, LanguageModel, Prompt, Telemetry as AiTelemetry, Tool } from "effect/ai";
 import type { Response, Toolkit } from "effect/ai";
 import type { JsonSchema } from "effect";
@@ -35,24 +35,123 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
   /** Maximum number of model steps per run. */
   readonly maxSteps: number;
   /**
-   * Identifies the agent in telemetry only (`gen_ai.agent.name` and the name
-   * of a run's root span). Never sent to the model.
+   * Identifies the agent in telemetry (`gen_ai.agent.name` and the name of a
+   * run's root span). Never sent to the agent's own model. When the agent is a
+   * subagent, it is also the tool name its parent's model calls and its name in
+   * the parent's events.
    */
   readonly name: string | undefined;
+  /** What the agent is for: the subagent tool's description, and `gen_ai.agent.description`. */
+  readonly description: string | undefined;
+  /**
+   * As a subagent, the parameters its parent's model calls it with. Without
+   * one, it takes `{ prompt: string }`. Must need no services to decode.
+   */
+  readonly input: Schema.Top | undefined;
+  /** As a subagent, what its prompt starts from (see {@link ContextMode}). */
+  readonly context: ContextMode;
+  /**
+   * As a subagent, the value its parent receives as the call's result when it
+   * finishes. Without one, its last assistant text. A value that isn't JSON
+   * gives the parent a failed result.
+   */
+  readonly result: ((reply: SubagentReply) => unknown) | undefined;
+  /** Agents this agent may delegate to, each offered to its model as a tool named after the agent. */
+  readonly subagents: Subagents | undefined;
 }
 
-/** Defines an agent. Throws a `RangeError` if `maxSteps` (default 10) is not a positive integer. */
-export const define = <Tools extends Record<string, Tool.Any>, R = never>(options: {
+/** An agent of any tools and requirements, as a list of subagents holds it. */
+// `Toolkit` is invariant in its tools, so only `any` admits every agent.
+export type Any = Agent<any, any>;
+
+/** The subagents of an agent, and room for settings that apply to all of them. */
+export interface Subagents {
+  readonly agents: ReadonlyArray<Any>;
+}
+
+/**
+ * What a subagent's prompt starts from: `brief`, the call's input alone; or
+ * `conversation`, the user's messages and the assistant's text from the
+ * prompt its parent's model received for the step that made the call,
+ * followed by the input. Tool calls and results are left out: they name
+ * tools the child may not have.
+ */
+export type ContextMode = "brief" | "conversation";
+
+/** What a subagent's `result` receives when it finishes. */
+export interface SubagentReply {
+  /** The text of its last assistant message. */
+  readonly text: string;
+  /** The call's decoded input. */
+  readonly input: unknown;
+}
+
+/** What running the agents in a list of subagents requires. */
+export type SubagentRequirements<Agents extends ReadonlyArray<Any>> = Agents[number] extends infer A
+  ? A extends Agent<infer T, infer CR>
+    ? Requirements<T, CR>
+    : never
+  : never;
+
+/** A name a model provider accepts for a tool. */
+const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** A subagent's parameters when it declares no `input`. */
+const PromptInput = Schema.Struct({
+  prompt: Schema.String.annotate({ description: "The task to delegate, with everything needed to do it." }),
+});
+
+/**
+ * Defines an agent. Throws a `RangeError` if `maxSteps` (default 10) is not a
+ * positive integer, or if a subagent has no name, has a name that is not 1 to
+ * 64 letters, digits, `_` or `-`, or has the name of a tool or of another
+ * subagent. What the subagents require is part of what the agent requires.
+ */
+export const define = <
+  Tools extends Record<string, Tool.Any>,
+  R = never,
+  const Agents extends ReadonlyArray<Any> = readonly [],
+>(options: {
   readonly toolkit: Toolkit.Toolkit<Tools>;
   readonly system?: string | Effect.Effect<string, never, R> | undefined;
   readonly maxSteps?: number | undefined;
   readonly name?: string | undefined;
-}): Agent<Tools, R> => {
+  readonly description?: string | undefined;
+  readonly input?: Schema.Top | undefined;
+  readonly context?: ContextMode | undefined;
+  readonly result?: ((reply: SubagentReply) => unknown) | undefined;
+  readonly subagents?: { readonly agents: Agents } | undefined;
+}): Agent<Tools, R | SubagentRequirements<Agents>> => {
   const maxSteps = options.maxSteps ?? 10;
   if (!Number.isInteger(maxSteps) || maxSteps < 1) {
     throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
   }
-  return { toolkit: options.toolkit, system: options.system, maxSteps, name: options.name };
+  const names = new Set<string>();
+  for (const child of options.subagents?.agents ?? []) {
+    if (child.name === undefined) {
+      throw new RangeError("A subagent must have a name");
+    }
+    if (!TOOL_NAME.test(child.name)) {
+      throw new RangeError(
+        `A subagent's name must be 1 to 64 letters, digits, "_" or "-", got ${JSON.stringify(child.name)}`,
+      );
+    }
+    if (Object.hasOwn(options.toolkit.tools, child.name) || names.has(child.name)) {
+      throw new RangeError(`The subagent name ${JSON.stringify(child.name)} is already used by a tool or a subagent`);
+    }
+    names.add(child.name);
+  }
+  return {
+    toolkit: options.toolkit,
+    system: options.system,
+    maxSteps,
+    name: options.name,
+    description: options.description,
+    input: options.input,
+    context: options.context ?? "brief",
+    result: options.result,
+    subagents: options.subagents,
+  };
 };
 
 // -----------------------------------------------------------------------------
@@ -81,6 +180,13 @@ export interface RunInput extends RunInfo {
    * answer in a later run. Set by the client, so untrusted.
    */
   readonly frontendTools?: ReadonlyArray<FrontendTool> | undefined;
+  /**
+   * The prompts of the suspended subagents in the history, at any depth, by
+   * `subagentRunId` (see `Messages.projectSuspended`). A suspended subagent
+   * call is resumed from its prompt here; one without is answered with a
+   * failed result.
+   */
+  readonly subagentPrompts?: Readonly<Record<string, Prompt.Prompt>> | undefined;
 }
 
 /** A tool the client advertised and runs itself. */
@@ -138,12 +244,30 @@ export type Event =
       readonly replayed: boolean;
     }
   | { readonly _tag: "Finished"; readonly outcome: Outcome }
-  | { readonly _tag: "Failed"; readonly error: unknown; readonly code: string | undefined };
+  | { readonly _tag: "Failed"; readonly error: unknown; readonly code: string | undefined }
+  /**
+   * An event of a subagent the run is running, as that subagent's own run
+   * emitted it. A subagent's subagents arrive wrapped once more. Every child
+   * run ends with its own `Finished` or `Failed`, which ends only the child.
+   */
+  | {
+      readonly _tag: "Subagent";
+      readonly subagentRunId: string;
+      readonly name: string;
+      readonly description: string | undefined;
+      /** The call that spawned the subagent. */
+      readonly parentToolCallId: string;
+      /** The message id of the step holding that call. */
+      readonly parentMessageId: string;
+      readonly event: Event;
+    };
 
 export interface Approval {
   readonly approvalId: string;
   readonly toolCallId: string;
   readonly toolName: string;
+  /** The subagent whose call waits for approval; absent for the agent's own calls. */
+  readonly subagentRunId?: string | undefined;
 }
 
 /** A call to a frontend tool, left for the client to run and answer. */
@@ -220,8 +344,25 @@ const ToolStep = Schema.Union([
     isFailure: Schema.Boolean,
   }),
   Schema.TaggedStruct("ApprovalRequested", { approvalId: Schema.String }),
+  /** A subagent call whose child waits for these approvals, its own or its descendants'. */
+  Schema.TaggedStruct("Suspended", {
+    approvals: Schema.Array(
+      Schema.Struct({
+        approvalId: Schema.String,
+        toolCallId: Schema.String,
+        toolName: Schema.String,
+        subagentRunId: Schema.optional(Schema.String),
+      }),
+    ),
+  }),
 ]);
 type ToolStep = typeof ToolStep.Type;
+
+/** A tool call's step, with the entries of the subagent it ran, if any. */
+type ToolOutcome = Checkpoint.Memoized<ToolStep> & { readonly entries: ReadonlyArray<Messages.Entry> };
+
+/** Result sent to the model for a suspended subagent call whose child can't be resumed from the history. */
+const INCOMPLETE_SUBAGENT_RESULT = "The subagent did not complete and could not be resumed";
 
 /**
  * Internal: carries a failed tool result out of its `execute_tool` span, so the span ends with an error
@@ -230,6 +371,15 @@ type ToolStep = typeof ToolStep.Type;
 class ToolResultFailure extends Schema.TaggedError<ToolResultFailure, { readonly brand: unique symbol }>()(
   "ToolResultFailure",
   { step: ToolStep },
+) {}
+
+/**
+ * Internal: carries a subagent's failure out of its `invoke_agent` span, so the span ends with an error
+ * status. It's caught just outside the span and never escapes `Agent.run`.
+ */
+class SubagentFailure extends Schema.TaggedError<SubagentFailure, { readonly brand: unique symbol }>()(
+  "SubagentFailure",
+  { error: Schema.Unknown },
 ) {}
 
 /**
@@ -269,14 +419,16 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
 ): Stream.Stream<Event, never, Requirements<Tools, R>> =>
   Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
     const emit = (event: Event) => Queue.offer(queue, event);
-    const { prompt: _, frontendTools = [], ...info } = input;
+    const { prompt: _, frontendTools = [], subagentPrompts, ...info } = input;
     return Effect.gen(function* () {
       const checkpoint = yield* Checkpoint.Checkpoint;
       const toolkit = yield* agent.toolkit;
-      // The model is offered the agent's tools plus the client's. A server tool wins a name clash.
+      // `define` checked that every subagent has a name.
+      const subagents = new Map((agent.subagents?.agents ?? []).map((child) => [child.name ?? "", child]));
+      // The model is offered the agent's tools and subagents plus the client's. The agent's own win a name clash.
       const frontend = new Map<string, Tool.Any>();
       for (const tool of frontendTools) {
-        if (Object.hasOwn(toolkit.tools, tool.name)) {
+        if (Object.hasOwn(toolkit.tools, tool.name) || subagents.has(tool.name)) {
           yield* Effect.logWarning(
             "effect-agent-harness: frontend tool ignored, a server tool has its name",
             tool.name,
@@ -291,10 +443,19 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           );
         }
       }
-      // Typed as the agent's toolkit: frontend tools have no handlers and need no services, and since
-      // tool calls are not resolved by the model call, `handle` is never called for one.
+      // Typed as the agent's toolkit: frontend and subagent tools have no handlers and need no services, and
+      // since tool calls are not resolved by the model call, `handle` is never called for one.
       const modelToolkit = {
-        tools: { ...toolkit.tools, ...Object.fromEntries(frontend) },
+        tools: {
+          ...toolkit.tools,
+          ...Object.fromEntries(
+            [...subagents].map(([name, child]) => [
+              name,
+              Tool.dynamic(name, { description: child.description, parameters: child.input ?? PromptInput }),
+            ]),
+          ),
+          ...Object.fromEntries(frontend),
+        },
         handle: toolkit.handle,
       } as Toolkit.WithHandler<Tools>;
       const ids = yield* Effect.serviceOption(IdGenerator.IdGenerator).pipe(
@@ -415,6 +576,211 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }),
       });
 
+      // -- Subagents --------------------------------------------------------------------------------------
+
+      const withoutEntries = (step: Checkpoint.Memoized<ToolStep>): ToolOutcome => ({ ...step, entries: [] });
+      const failedCall = (call: ToolCall, message: string) =>
+        Effect.map(memoTool(`tool:${call.id}`, result(message, true)), withoutEntries);
+
+      // The call's decoded input, or a failed result for the model to correct.
+      const decodeInput = (call: ToolCall, child: Any) =>
+        Schema.decodeUnknownEffect((child.input ?? PromptInput) as Schema.Codec<unknown, unknown>)(call.params).pipe(
+          Effect.mapError((error) => `Invalid input for subagent ${call.name}: ${error.message}`),
+        );
+
+      // The child's terminal event as the call's tool step.
+      const childStep = (
+        call: ToolCall,
+        child: Any,
+        decoded: unknown,
+        own: ReadonlyArray<Messages.Entry>,
+        terminal: Extract<Event, { _tag: "Finished" | "Failed" }>,
+      ): Effect.Effect<ToolStep> => {
+        if (terminal._tag === "Failed") {
+          return result(errorMessage(terminal.error), true);
+        }
+        if (terminal.outcome._tag === "Interrupted") {
+          const subagentRunId = subagentIdFor(call.id);
+          return Effect.succeed({
+            _tag: "Suspended",
+            approvals: terminal.outcome.approvals.map((approval) => ({
+              approvalId: approval.approvalId,
+              toolCallId: approval.toolCallId,
+              toolName: approval.toolName,
+              subagentRunId: approval.subagentRunId ?? subagentRunId,
+            })),
+          });
+        }
+        const text = lastText(own);
+        const convert = child.result;
+        if (convert === undefined) {
+          return result(text, false);
+        }
+        return Effect.try(() => convert({ text, input: decoded })).pipe(
+          Effect.matchEffect({
+            onFailure: (error) => result(errorMessage(error.cause), true),
+            onSuccess: (value) =>
+              isJson(value)
+                ? result(value, false)
+                : result(`The result of subagent ${call.name} is not a JSON value`, true),
+          }),
+        );
+      };
+
+      // Runs the child a subagent call spawns, forwarding its events, and records how it ended as the call's
+      // tool step. Its prompt is the parent's conversation (under the `conversation` mode), then its brief, rebuilt from the
+      // call every time so it is never stored, then `history`: what it did in earlier runs, if it is resumed.
+      // Its entries are those of its steps, owned by it unless a deeper subagent owns them already. Not inside
+      // a checkpoint: the child's own steps are, under names prefixed by the call, so running it again replays
+      // them.
+      const callSubagent = (
+        call: ToolCall,
+        child: Any,
+        parentMessageId: string,
+        parentPrompt: Prompt.Prompt,
+        history: Prompt.Prompt,
+      ) =>
+        Effect.gen(function* () {
+          const parsed = yield* Effect.result(decodeInput(call, child));
+          if (Result.isFailure(parsed)) {
+            return yield* failedCall(call, parsed.failure);
+          }
+          const decoded = parsed.success;
+          const text =
+            child.input === undefined ? (decoded as typeof PromptInput.Type).prompt : JSON.stringify(call.params ?? {});
+          const brief = Prompt.fromMessages([
+            Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }),
+          ]);
+          const childPrompt = Prompt.concat(
+            child.context === "conversation" ? Prompt.concat(conversationOf(parentPrompt), brief) : brief,
+            history,
+          );
+          const subagentRunId = subagentIdFor(call.id);
+          const own: Array<Messages.Entry> = [];
+          let terminal: Extract<Event, { _tag: "Finished" | "Failed" }> | undefined;
+          // `define` made the child's requirements part of the agent's.
+          const events = run(child, {
+            ...info,
+            prompt: childPrompt,
+            subagentPrompts,
+          }) as Stream.Stream<Event, never, RunServices<Tools, R>>;
+          // The child's model and tool spans are children of one agent span for the call, as a run's are of its
+          // root. A failed child fails the span's effect, so the span ends with an error status; it's caught just
+          // outside, so the run sees no difference.
+          yield* events.pipe(
+            Stream.provideService(Checkpoint.Checkpoint, prefixed(checkpoint, `sub:${call.id}/`)),
+
+            Stream.runForEach((event) => {
+              if (event._tag === "StepFinished") {
+                own.push(...event.entries);
+              } else if (event._tag === "Finished" || event._tag === "Failed") {
+                terminal = event;
+              }
+
+              return emit({
+                _tag: "Subagent",
+                subagentRunId,
+                name: call.name,
+                description: child.description,
+                parentToolCallId: call.id,
+                parentMessageId,
+                event,
+              });
+            }),
+            Effect.andThen(
+              Effect.suspend(() => {
+                const ended = terminal;
+                return ended?._tag === "Failed"
+                  ? Effect.andThen(
+                      Effect.annotateCurrentSpan({ [Attr.errorType]: ended.code ?? "Error" }),
+                      new SubagentFailure({ error: ended.error }),
+                    )
+                  : Effect.void;
+              }),
+            ),
+            Effect.withSpan(internalTelemetry.agentSpanName(call.name), {
+              kind: "internal",
+              attributes: {
+                ...runAttributes,
+                [Attr.operationName]: "invoke_agent",
+                [Attr.agentName]: call.name,
+                ...(child.description === undefined ? {} : { [Attr.agentDescription]: child.description }),
+                [Attr.toolCallId]: call.id,
+              },
+            }),
+            Effect.catchTag("SubagentFailure", () => Effect.void),
+          );
+
+          if (terminal === undefined) {
+            return yield* Effect.die("A subagent run ended without a terminal event");
+          }
+
+          const ended = terminal;
+          const step = yield* memoTool(
+            `tool:${call.id}`,
+            Effect.suspend(() =>
+              childStep(
+                call,
+                child,
+                decoded,
+                own.filter((entry) => entry.subagentRunId === undefined),
+                ended,
+              ),
+            ),
+          );
+          const entries = own.map((entry) => (entry.subagentRunId === undefined ? { ...entry, subagentRunId } : entry));
+
+          return { ...step, entries } satisfies ToolOutcome;
+        });
+
+      // A suspended subagent call in the prompt: the child resumes from what it did in earlier runs.
+      const resumeSubagent = (call: ToolCall, parentMessageId: string, parentPrompt: Prompt.Prompt) => {
+        const child = subagents.get(call.name);
+        const history = subagentPrompts?.[subagentIdFor(call.id)];
+        return child === undefined || history === undefined
+          ? failedCall(call, INCOMPLETE_SUBAGENT_RESULT)
+          : callSubagent(call, child, parentMessageId, forModel(promptBefore(parentPrompt, call.id)), history);
+      };
+
+      // Emits the outcome of each call of a step, in call order, and sorts the step's approvals and entries.
+      const settle = (step: number, calls: ReadonlyArray<ToolCall>, outcomes: ReadonlyArray<ToolOutcome>) =>
+        Effect.gen(function* () {
+          const approvals: Array<Approval> = [];
+          const childEntries: Array<Messages.Entry> = [];
+          const toolEntries: Array<Messages.Entry> = [];
+          const suspended = new Set<string>();
+          for (const [i, call] of calls.entries()) {
+            const { value, replayed, entries } = outcomes[i]!;
+            childEntries.push(...entries);
+            switch (value._tag) {
+              case "ApprovalRequested": {
+                approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
+                yield* emit({
+                  _tag: "ApprovalRequested",
+                  step,
+                  approvalId: value.approvalId,
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  replayed,
+                });
+                break;
+              }
+              case "Suspended": {
+                // The child's events reported its approvals.
+                suspended.add(call.id);
+                approvals.push(...value.approvals);
+                break;
+              }
+              case "Result": {
+                toolEntries.push(toolEntry(call, value));
+                yield* emit(toolResultEvent(step, call, value, replayed));
+                break;
+              }
+            }
+          }
+          return { approvals, childEntries, toolEntries, suspended };
+        });
+
       const modelStep = (step: number, prompt: Prompt.Prompt) =>
         checkpoint.memo(
           {
@@ -477,25 +843,42 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           ? prompt
           : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
 
-      // Step 0: approval answers carried by the prompt are resolved before the model is called.
+      // Step 0: approval answers carried by the prompt, and suspended subagents, are resolved before the model
+      // is called.
       let prompt = input.prompt;
       const decided = pendingDecisions(prompt);
-      if (decided.length > 0) {
-        const steps = yield* Effect.forEach(decided, ({ call, decision }) => executeTool(call, prompt, decision), {
-          concurrency: "unbounded",
+      const suspended = suspendedCalls(prompt);
+      if (decided.length > 0 || suspended.length > 0) {
+        const opening = prompt;
+        const outcomes = yield* Effect.all(
+          [
+            ...decided.map(({ call, decision }) => Effect.map(executeTool(call, opening, decision), withoutEntries)),
+            ...suspended.map(({ call, parentMessageId }) => resumeSubagent(call, parentMessageId, opening)),
+          ],
+          { concurrency: "unbounded" },
+        );
+        const settled = yield* settle(
+          0,
+          [...decided.map(({ call }) => call), ...suspended.map(({ call }) => call)],
+          outcomes,
+        );
+        yield* emit({
+          _tag: "StepFinished",
+          step: 0,
+          entries: [...settled.childEntries, ...settled.toolEntries],
+          replayed: outcomes.every((outcome) => outcome.replayed),
         });
-        const entries: Array<Messages.Entry> = [];
-        for (const [i, { call }] of decided.entries()) {
-          const { value, replayed } = steps[i]!;
-          // A decision always yields a result.
-          if (value._tag === "Result") {
-            entries.push(toolEntry(call, value));
-            yield* emit(toolResultEvent(0, call, value, replayed));
-          }
+        // A resumed subagent waits again. A decision always yields a result.
+        if (settled.approvals.length > 0) {
+          return yield* emit({
+            _tag: "Finished",
+            outcome: { _tag: "Interrupted", approvals: settled.approvals, pendingToolCalls: [] },
+          });
         }
-        yield* emit({ _tag: "StepFinished", step: 0, entries, replayed: steps.every((s) => s.replayed) });
         // The prompt may continue past the calls (e.g. a new user message), so place the results right after them.
-        prompt = orderToolResults(Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message))));
+        prompt = orderToolResults(
+          Prompt.concat(prompt, Prompt.fromMessages(settled.toolEntries.map((entry) => entry.message))),
+        );
       }
 
       for (let step = 1; ; step++) {
@@ -513,29 +896,18 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         const executed = toolCalls.filter((call) => !pendingIds.has(call.id));
         const tools = yield* Effect.forEach(
           executed,
-          (call) => (complete ? executeTool(call, modelPrompt, undefined) : interruptTool(call, finishReason)),
+          (call): Effect.Effect<ToolOutcome, never, RunServices<Tools, R>> => {
+            if (!complete) {
+              return Effect.map(interruptTool(call, finishReason), withoutEntries);
+            }
+            const child = subagents.get(call.name);
+            return child === undefined
+              ? Effect.map(executeTool(call, modelPrompt, undefined), withoutEntries)
+              : callSubagent(call, child, messageId, modelPrompt, Prompt.empty);
+          },
           { concurrency: "unbounded" },
         );
-
-        const approvals: Array<Approval> = [];
-        const toolEntries: Array<Messages.Entry> = [];
-        for (const [i, call] of executed.entries()) {
-          const { value, replayed } = tools[i]!;
-          if (value._tag === "ApprovalRequested") {
-            approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
-            yield* emit({
-              _tag: "ApprovalRequested",
-              step,
-              approvalId: value.approvalId,
-              toolCallId: call.id,
-              toolName: call.name,
-              replayed,
-            });
-          } else {
-            toolEntries.push(toolEntry(call, value));
-            yield* emit(toolResultEvent(step, call, value, replayed));
-          }
-        }
+        const { approvals, childEntries, toolEntries, suspended } = yield* settle(step, executed, tools);
 
         const assistantMessage = assistant.content.find((message) => message.role === "assistant");
         const entries: Array<Messages.Entry> = [];
@@ -544,18 +916,26 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             id: messageId,
             message: Prompt.makeMessage("assistant", {
               content: [
-                ...assistantMessage.content.map((part) =>
-                  part.type === "tool-call" && pendingIds.has(part.id) ? markFrontend(part) : part,
-                ),
-                ...approvals.map((a) =>
-                  Prompt.toolApprovalRequestPart({ approvalId: a.approvalId, toolCallId: a.toolCallId }),
-                ),
+                ...assistantMessage.content.map((part) => {
+                  if (part.type !== "tool-call") {
+                    return part;
+                  }
+                  if (pendingIds.has(part.id)) {
+                    return markFrontend(part);
+                  }
+                  return suspended.has(part.id) ? markSuspendedSubagent(part, messageId) : part;
+                }),
+                // A subagent's requests are on its own entries.
+                ...approvals
+                  .filter((a) => a.subagentRunId === undefined)
+                  .map((a) => Prompt.toolApprovalRequestPart({ approvalId: a.approvalId, toolCallId: a.toolCallId })),
               ],
               options: assistantMessage.options,
             }),
           });
         }
-        entries.push(...toolEntries);
+        const own = [...entries, ...toolEntries];
+        entries.push(...childEntries, ...toolEntries);
         yield* emit({
           _tag: "StepFinished",
           step,
@@ -573,7 +953,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         if (step + 1 > agent.maxSteps) {
           return yield* new StepLimitExceeded({ maxSteps: agent.maxSteps });
         }
-        prompt = Prompt.concat(prompt, Prompt.fromMessages(entries.map((entry) => entry.message)));
+        prompt = Prompt.concat(prompt, Prompt.fromMessages(own.map((entry) => entry.message)));
       }
     }).pipe(
       Effect.catchCause((cause) => {
@@ -620,6 +1000,8 @@ const annotateModelSpan = (
     // A span left without some attributes is better than a failed run.
   }
 };
+
+const isJson = Schema.is(Schema.Json);
 
 const toolResultEvent = (
   step: number,
@@ -789,6 +1171,123 @@ export const isFrontendCall = (part: Prompt.ToolCallPart): boolean => {
   return Predicate.hasProperty(mark, "frontend") && mark.frontend === true;
 };
 
+// -----------------------------------------------------------------------------
+// Subagent calls
+// -----------------------------------------------------------------------------
+
+/**
+ * The id of the subagent run a tool call spawns (AG-UI `subagentRunId`), and
+ * the owner of that run's thread entries. Derived from the call, so a replayed
+ * or resumed run gives the child the same id. Treat it as opaque.
+ */
+export const subagentIdFor = (toolCallId: string): string => `subagent:${toolCallId}`;
+
+/**
+ * The call, marked as a subagent call whose child is suspended, for the next
+ * run to resume. `messageId` is the id of the assistant message holding the
+ * call, which the resumed child reports as its `parentMessageId`.
+ */
+export const markSuspendedSubagent = (part: Prompt.ToolCallPart, messageId: string): Prompt.ToolCallPart =>
+  Prompt.makePart("tool-call", {
+    id: part.id,
+    name: part.name,
+    params: part.params,
+    providerExecuted: part.providerExecuted,
+    options: { ...part.options, [MARK]: { subagent: { messageId } } },
+  });
+
+/**
+ * The id of the message holding a suspended subagent call, or `undefined` if
+ * the call is not one.
+ */
+const suspendedParent = (part: Prompt.ToolCallPart): string | undefined => {
+  const mark = part.options[MARK];
+  return Predicate.hasProperty(mark, "subagent") &&
+    Predicate.hasProperty(mark.subagent, "messageId") &&
+    Predicate.isString(mark.subagent.messageId)
+    ? mark.subagent.messageId
+    : undefined;
+};
+
+/**
+ * Whether a stored tool call spawned a subagent that is suspended. Such a call
+ * has no result until a later run resumes the child.
+ */
+export const isSuspendedSubagentCall = (part: Prompt.ToolCallPart): boolean => suspendedParent(part) !== undefined;
+
+/** The suspended subagent calls in the prompt that have no result yet, with the id of the message holding each. */
+const suspendedCalls = (
+  prompt: Prompt.Prompt,
+): Array<{ readonly call: ToolCall; readonly parentMessageId: string }> => {
+  const answered = new Set<string>();
+  for (const message of prompt.content) {
+    if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type === "tool-result") {
+          answered.add(part.id);
+        }
+      }
+    }
+  }
+  return prompt.content.flatMap((message) =>
+    message.role === "assistant"
+      ? message.content.flatMap((part) => {
+          const parentMessageId = part.type === "tool-call" ? suspendedParent(part) : undefined;
+          return part.type === "tool-call" && parentMessageId !== undefined && !answered.has(part.id)
+            ? [{ call: { id: part.id, name: part.name, params: part.params }, parentMessageId }]
+            : [];
+        })
+      : [],
+  );
+};
+
+/** The prompt before the assistant message holding the call: what the model had when it made it. */
+const promptBefore = (prompt: Prompt.Prompt, toolCallId: string): Prompt.Prompt => {
+  const index = prompt.content.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      message.content.some((part) => part.type === "tool-call" && part.id === toolCallId),
+  );
+  return index === -1 ? prompt : Prompt.fromMessages(prompt.content.slice(0, index));
+};
+
+/**
+ * What a child under the `conversation` mode is shown of its parent's prompt: the user's messages and the
+ * assistant's text. System messages are the parent's own, and tool calls and results are left out because
+ * they name tools the child may not have, which a provider can reject.
+ */
+const conversationOf = (prompt: Prompt.Prompt): Prompt.Prompt =>
+  Prompt.fromMessages(
+    prompt.content.flatMap((message): Array<Prompt.Message> => {
+      switch (message.role) {
+        case "user": {
+          return [message];
+        }
+        case "assistant": {
+          const content = message.content.filter((part) => part.type === "text");
+          return content.length === 0 ? [] : [Prompt.makeMessage("assistant", { content, options: message.options })];
+        }
+        default: {
+          return [];
+        }
+      }
+    }),
+  );
+
+/** The text of the last assistant entry in `entries`, or "" if there is none. */
+const lastText = (entries: ReadonlyArray<Messages.Entry>): string => {
+  const last = entries.findLast((entry) => entry.message.role === "assistant");
+  return last?.message.role === "assistant"
+    ? last.message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+    : "";
+};
+
+/** The checkpoint service with every step name prefixed, so a child's steps never meet its parent's. */
+const prefixed = (checkpoint: Checkpoint.Checkpoint["Service"], prefix: string): Checkpoint.Checkpoint["Service"] =>
+  Checkpoint.Checkpoint.of({
+    memo: (options, effect) => checkpoint.memo({ ...options, name: `${prefix}${options.name}` }, effect),
+  });
+
 const unmark = (part: Prompt.AssistantMessagePart): Prompt.AssistantMessagePart => {
   if (part.type !== "tool-call" || !(MARK in part.options)) {
     return part;
@@ -805,7 +1304,7 @@ const unmark = (part: Prompt.AssistantMessagePart): Prompt.AssistantMessagePart 
 
 /**
  * The prompt as the model receives it: approval requests and responses, which
- * providers reject, and the marks on frontend calls are removed, and messages
+ * providers reject, and the marks on frontend and subagent calls are removed, and messages
  * left empty are dropped. By the time the model is called every approval in
  * the prompt has been resolved.
  */

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
+import * as Agent from "../src/Agent.ts";
 import * as Conversions from "../src/internal/conversions.ts";
 import * as Messages from "../src/Messages.ts";
 
@@ -146,4 +147,59 @@ describe("Messages.project", () => {
       { role: "user", parts: [{ type: "text", text: "Hello?" }] },
     ]);
   });
+
+  describe("with subagents", () => {
+    const child = Agent.subagentIdFor("c1");
+    const owned = (entry: Messages.Entry): Messages.Entry => ({ ...entry, subagentRunId: child });
+    const thread: ReadonlyArray<Messages.Entry> = [
+      user("u1", "Research Paris"),
+      assistantCall("m1", "c1"),
+      owned(user("b1", "Find the weather in Paris")),
+      owned(assistantCall("m2", "c2")),
+      owned(toolResult("t2", "c2", { temp: 21 })),
+      toolResult("t1", "c1", "21 degrees"),
+    ];
+
+    it("builds the agent's prompt from its own entries only", () => {
+      expect(simplify(Messages.project(thread))).toEqual([
+        { role: "user", parts: [{ type: "text", text: "Research Paris" }] },
+        { role: "assistant", parts: [{ type: "tool-call", id: "c1" }] },
+        { role: "tool", parts: [{ type: "tool-result", id: "c1", result: "21 degrees", isFailure: false }] },
+      ]);
+    });
+
+    it("builds a subagent's prompt from the entries it owns", () => {
+      expect(simplify(Messages.project(thread, child))).toEqual([
+        { role: "user", parts: [{ type: "text", text: "Find the weather in Paris" }] },
+        { role: "assistant", parts: [{ type: "tool-call", id: "c2" }] },
+        { role: "tool", parts: [{ type: "tool-result", id: "c2", result: { temp: 21 }, isFailure: false }] },
+      ]);
+    });
+
+    it("leaves a suspended subagent call to the run", () => {
+      const call = assistantCall("m1", "c1");
+      const suspended: Messages.Entry = {
+        id: call.id,
+        message: Prompt.makeMessage("assistant", {
+          content: (call.message as Prompt.AssistantMessage).content.map((part) =>
+            part.type === "tool-call" ? Agent.markSuspendedSubagent(part, "m1") : part,
+          ),
+        }),
+      };
+      const prompt = Messages.project([user("u1", "Research Paris"), suspended]);
+      expect(simplify(prompt).map((m) => m.role)).toEqual(["user", "assistant"]);
+      // The model never sees the mark.
+      const [, assistant] = Agent.forModel(prompt).content;
+      expect(assistant?.role === "assistant" && assistant.content[0]?.options).toEqual({});
+    });
+  });
+
+  it.effect("round-trips the owning subagent", () =>
+    Effect.gen(function* () {
+      const entry: Messages.Entry = { ...user("m1", "Hi"), subagentRunId: Agent.subagentIdFor("c1") };
+      const encoded = yield* Schema.encodeEffect(Messages.Entry)(entry);
+      const decoded = yield* Schema.decodeUnknownEffect(Messages.Entry)(JSON.parse(JSON.stringify(encoded)));
+      expect(decoded).toEqual(entry);
+    }),
+  );
 });

@@ -1,10 +1,10 @@
 # thread-history-read Specification
 
 ## Purpose
-Turns a stored thread into the AG-UI messages its event streams showed, plus its open approval interrupts and the run that raised them, so a client that has lost its state (a reload, a new device) can restore it and continue the thread.
+Turns a stored thread into the AG-UI messages its event streams showed, plus what the stored thread knows and an event can't carry (a failed result's error), plus its open approval interrupts and the run that raised them, so a client that has lost its state (a reload, a new device) can restore it and continue the thread.
 ## Requirements
 ### Requirement: Reading a thread as AG-UI messages
-The package SHALL provide a read of a thread's loaded entries that returns AG-UI messages in commit order, with each tool message moved to directly after the assistant message holding its tool call. A user entry SHALL become a `user` message with the entry's id and text. An assistant entry SHALL become an `assistant` message with the entry's id, the concatenation of its text as `content`, and every tool call it holds as `toolCalls` (each with the call's id, tool name and JSON-encoded arguments). Each reasoning block with text in an assistant entry SHALL become a `reasoning` message with the `messageId` and the full text its events carried, placed before that entry's `assistant` message, in the order the blocks were produced. A tool entry holding a tool result SHALL become a `tool` message with the entry's id, the call's id as `toolCallId`, and the result as `content`, encoded exactly as the run's `TOOL_CALL_RESULT` event encoded it. System entries, approval-response entries, reasoning blocks with no text, and assistant entries with no text, tool calls or reasoning text SHALL NOT appear. An assistant entry holding only reasoning SHALL yield its `reasoning` messages and no `assistant` message. Provider metadata on a reasoning block SHALL NOT appear. The returned type SHALL be the AG-UI message type, with no narrowing to any consumer's message shape. The read SHALL NOT require a run, an agent or a claim on the thread.
+The package SHALL provide a read of a thread's loaded entries that returns AG-UI messages in commit order, with each tool message moved to directly after the assistant message holding its tool call. A user entry SHALL become a `user` message with the entry's id and text. An assistant entry SHALL become an `assistant` message with the entry's id, the concatenation of its text as `content`, and every tool call it holds as `toolCalls` (each with the call's id, tool name and JSON-encoded arguments). Each reasoning block with text in an assistant entry SHALL become a `reasoning` message with the `messageId` and the full text its events carried, placed before that entry's `assistant` message, in the order the blocks were produced. A tool entry holding a tool result SHALL become a `tool` message with the entry's id, the call's id as `toolCallId`, and the result as `content`, encoded exactly as the run's `TOOL_CALL_RESULT` event encoded it; a failed result SHALL also carry its error as `error` (the result itself when it is a string, otherwise its JSON encoding). This is the one place the read shows more than the events did: `TOOL_CALL_RESULT` has no field for a failure, while AG-UI's tool message has `error` for it, so a client that reads the thread back learns which results failed and sends them back as failures. System entries, approval-response entries, reasoning blocks with no text, and assistant entries with no text, tool calls or reasoning text SHALL NOT appear. An assistant entry holding only reasoning SHALL yield its `reasoning` messages and no `assistant` message. Provider metadata on a reasoning block SHALL NOT appear. Every message from an entry owned by a subagent SHALL carry that subagent's id as `subagentRunId`. The messages of a subagent SHALL come after the assistant message holding the call that spawned it and before that call's tool message. The returned type SHALL be the AG-UI message type, with no narrowing to any consumer's message shape. The read SHALL NOT require a run, an agent or a claim on the thread.
 
 #### Scenario: Thread with a tool call
 - **WHEN** a thread holds a user message, an assistant message with text and one tool call, the tool's result, and a final assistant reply
@@ -46,8 +46,16 @@ The package SHALL provide a read of a thread's loaded entries that returns AG-UI
 - **WHEN** a stored reasoning block has a provider signature in its options
 - **THEN** the `reasoning` message returned for it has no `encryptedValue` and no provider metadata
 
+#### Scenario: Failed result
+- **WHEN** a thread holds a tool call whose result is the failure "Out of range", and the thread is then read
+- **THEN** the call's tool message has `content` `"Out of range"` encoded as JSON and `error` "Out of range", and a run started with the read's messages accepts them
+
+#### Scenario: Thread with a subagent
+- **WHEN** a run's parent calls `researcher`, whose child calls a tool and replies, and the thread is then read
+- **THEN** the read returns the parent's assistant message with the call, the child's assistant, tool and assistant messages each carrying the child's `subagentRunId` and the ids their events used, then the call's tool message
+
 ### Requirement: Open interrupts are returned with their run
-The read SHALL also return every approval request in the thread that has no response yet, each as the same AG-UI interrupt (`id`, `reason`, `toolCallId`, `message`, `responseSchema`) that the run's `RUN_FINISHED` interrupt outcome carried, together with the id of the run that committed the requests. When no request is open, the read SHALL return no interrupts. When the store did not record the committing run, the interrupts SHALL be returned without a run id.
+The read SHALL also return every approval request in the thread that has no response yet, each as the same AG-UI interrupt (`id`, `reason`, `toolCallId`, `message`, `responseSchema`, and `subagentRunId` for a subagent's request) that the run's `RUN_FINISHED` interrupt outcome carried, together with the id of the run that committed the requests. When no request is open, the read SHALL return no interrupts. When the store did not record the committing run, the interrupts SHALL be returned without a run id.
 
 #### Scenario: Run interrupted for approval
 - **WHEN** run "r1" ends with `RUN_FINISHED` with an interrupt outcome for a `send-email` call, and the thread is then read
@@ -60,6 +68,10 @@ The read SHALL also return every approval request in the thread that has no resp
 #### Scenario: Answered approval
 - **WHEN** the approval request in a thread has a response
 - **THEN** the read returns no interrupts
+
+#### Scenario: Suspended child
+- **WHEN** run "r1" ends interrupted because a child of the agent waits for a `send-email` approval, and the thread is then read
+- **THEN** the read returns that interrupt carrying the child's `subagentRunId`, with run id "r1", and answering it in a run started with the read's messages resumes the child
 
 ### Requirement: A read history is accepted as the client's history
 A client that sends back the read's messages, with or without new user messages appended, and with or without their `reasoning` messages, SHALL be matched against the store without `HistoryMismatch` or `HistoryDiverged`, as long as the thread has not changed since the read. `reasoning` messages a client sends SHALL NOT be committed.

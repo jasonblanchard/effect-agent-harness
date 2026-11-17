@@ -10,7 +10,7 @@ This is an experimental library that answers the question: what would it look li
 
 - **Agent** - the behavior (tools and system prompt) of the agent itself. Defined outside its runner so that it can be evaluated in isolation without runtime concerns like state, durability, etc.
   - **Plugin (todo)** - a wrapper for adding behavior to an agent (agent)(args) => agent
-  - Subagents (todo) - a thin wrapper around tools that make them behave like subagents per the AG-UI spec
+  - Subagents - agents an agent delegates to, offered to its model as tools and streamed per the AG-UI subagents spec
 - **Runner** - the container that orchestrates the agent loop. This is where the Agent is decorated with runtime concerns like state, durability, etc. Choose between in-process, detached, effect workflow, or bring your own.
 - **History** - how messages state is prepared for a run. Choose between client authoritative history or server authoritative history.
 - **Thread** - abstract thread storage and lifecycle. Use the built ins or bring your own.
@@ -59,6 +59,7 @@ The same agent runs in a unit test with none of these (in-memory or passthrough 
 - [Authentication and run context](#authentication-and-run-context)
 - [Tool approvals](#tool-approvals)
 - [Frontend tools](#frontend-tools)
+- [Subagents](#subagents)
 - [Durable runs](#durable-runs)
 - [Reconnecting to a run](#reconnecting-to-a-run)
 - [Tracing](#tracing)
@@ -138,7 +139,9 @@ const agent = Agent.define({
   toolkit: Tools, // an effect/ai Toolkit
   system: "…", // optional system prompt: text, or an effect (below)
   maxSteps: 10, // optional, a positive integer; default 10
-  name: "assistant", // optional, identifies the agent in traces only
+  name: "assistant", // optional, identifies the agent in traces (and names it as a subagent)
+  description: "…", // optional, in traces, and the tool description when it is a subagent
+  subagents: { agents: [researcher] }, // optional, see Subagents
 });
 ```
 
@@ -351,6 +354,7 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 - **the latest entries the client has seen**, with their ids. The client's new messages are those after the last one whose id `load` returns. If none of its ids are returned, the run fails with `HistoryMismatch`.
 - **every assistant entry with an unanswered approval request.** `resume` answers are matched against these, and an answer to a request that isn't loaded is ignored.
 - **every assistant entry with a pending frontend call**, with its tool-call parts' `options` intact (they mark the call as the client's). The client's results are matched against these, and a result for a call that isn't loaded is ignored.
+- **every entry of a suspended subagent** (tagged with its `subagentRunId`), and the parent's assistant entry holding the spawning call, with its `options` intact (they mark the call as suspended). The child is resumed from these.
 - **nothing new after what the client has seen.** Write a summary as a `system` entry, or put it before the latest entries the client has seen. A user, assistant or tool entry the client never saw, placed after them, makes its next run fail with `HistoryDiverged`.
 
 In practice: summarise older history into a system entry, and keep the tail from the last user message on.
@@ -536,6 +540,40 @@ The agent marks each frontend call on its stored assistant entry (in the tool-ca
 
 **Advertised tools are untrusted input.** Their descriptions and schemas reach the model exactly as the client sent them, like a client system message. Only accept them from clients you'd let instruct the model.
 
+## Subagents
+
+An agent can delegate to other agents. Each subagent is an ordinary agent definition with a `name`, offered to the parent's model as a tool of that name:
+
+```ts
+const researcher = Agent.define({
+  name: "researcher", // the tool name the parent's model calls, and the name in traces and events
+  description: "Looks things up on the web", // the tool's description
+  toolkit: SearchTools,
+  system: "You research one question and answer it briefly.",
+  input: Schema.Struct({ question: Schema.String }), // optional; default { prompt: string }
+  context: "brief", // optional; or "conversation" (below)
+  result: ({ text }) => text, // optional; what the parent receives (JSON, or the call fails), default the last reply's text
+});
+
+const assistant = Agent.define({
+  toolkit: Tools,
+  system: "Delegate research to the researcher.",
+  subagents: { agents: [researcher] },
+});
+```
+
+`define` throws a `RangeError` if a subagent has no name, a name that isn't 1 to 64 letters, digits, `_` or `-` (what providers accept for a tool), or the name of a tool or another subagent. An agent's own name is never sent to its own model, so a top-level agent's name can be anything. What the subagents require (their tool handlers, their system prompts' services) is part of what the parent requires.
+
+**A call runs the child inside the parent's run**: same thread, run id, services and checkpoint store, with the child's own system prompt, tools and step limit. Its prompt starts with its brief: the call's `prompt`, or its input as JSON when it declares an `input` schema. With `context: "conversation"`, the brief follows the user's messages and the assistant's text from the prompt the parent's model had when it made the call. The parent's tool calls and results are left out, because they name tools the child may not have; put anything the child needs from them in the brief. The child's checkpoints are named after the call (`sub:<toolCallId>/model:1`), so a resumed run replays its completed steps and never repeats its tools. Several calls in one step run concurrently. Children are not offered the client's frontend tools.
+
+**The parent gets the child's last reply** as the call's result (or `result`'s value). A child that fails, including by exceeding its step limit, gives the parent a failed result, and the parent's run continues.
+
+**Clients see the child's work attributed to it.** Every child event carries the child's `subagentRunId` (derived from the call; treat it as opaque), between `SUBAGENT_STARTED` (with `name`, `parentToolCallId`, `parentMessageId`, and `parentSubagentRunId` for a child of a child) and `SUBAGENT_ERROR` or `SUBAGENT_FINISHED` (with the `result`), all before the call's `TOOL_CALL_RESULT`. Clients that don't know AG-UI's subagent events (older than AG-UI 1.0) reject them.
+
+**History.** The child's messages are stored on the thread, tagged with the child's `subagentRunId`, between the spawning call and its result. They never reach the parent's model, and `History.restore` returns them tagged, in that place. Under the server history a client may keep or drop them: they are not required for reconciliation. Under the client history, the client sends them back tagged and the run keeps them out of the parent's prompt.
+
+**Approvals in a child suspend the parent.** A child tool that needs approval ends the child with `SUBAGENT_FINISHED` outcome `suspended` (naming the interrupts it owns), and the parent's run with the usual `interrupt` outcome, each interrupt carrying the child's `subagentRunId`. Answer it with a `resume` entry as for any approval. The next run resumes the child before the parent's model is called, under the same `subagentRunId`: the child runs the decided call, continues, and its reply becomes the call's result. Children of children suspend and resume the same way. Under the client history this needs the child's messages: a client that dropped them gets a failed result for the call instead.
+
 ## Durable runs
 
 ### Checkpoints
@@ -656,11 +694,12 @@ Runs trace themselves whenever the application provides an Effect `Tracer`, foll
 
 Each runner attempt produces:
 
-| Span                                          | Attributes                                                                                                                                                                                                            |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `invoke_agent {name}` (the root)              | `gen_ai.operation.name`, `gen_ai.agent.name` (when the agent has a `name`), `gen_ai.conversation.id` (the thread id), `effect_agent_harness.run.id`; `error.type` and error status when the run ends with `RUN_ERROR` |
-| `LanguageModel.streamText`, per model call    | what the provider writes (model, usage, finish reasons), plus `gen_ai.conversation.id`                                                                                                                                |
-| `execute_tool {tool}`, per executed tool call | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`, `gen_ai.conversation.id`; `error.type` when the result is a failure                                                                                    |
+| Span                                          | Attributes                                                                                                                                                                                                                                       |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `invoke_agent {name}` (the root)              | `gen_ai.operation.name`, `gen_ai.agent.name` and `gen_ai.agent.description` (when the agent has them), `gen_ai.conversation.id` (the thread id), `effect_agent_harness.run.id`; `error.type` and error status when the run ends with `RUN_ERROR` |
+| `LanguageModel.streamText`, per model call    | what the provider writes (model, usage, finish reasons), plus `gen_ai.conversation.id`                                                                                                                                                           |
+| `execute_tool {tool}`, per executed tool call | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`, `gen_ai.conversation.id`; `error.type` when the result is a failure                                                                                                               |
+| `invoke_agent {subagent}`, per subagent call  | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.agent.description`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`; the child's model and tool spans nest under it; `error.type` when the child fails                                     |
 
 The root span starts a new trace, linked to the span the runner was called in (for example the HTTP request's), so a backend sees the run as its own trace. Only work an attempt actually does is traced: a step replayed from a checkpoint, a call awaiting approval, a denied call and a frontend call get no span, so tokens and cost are never counted twice. A resumed attempt is a separate trace with the same `gen_ai.conversation.id`.
 
@@ -812,15 +851,15 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effect-agent-harness"` as namespaces.
 
-| Module       | Main exports                                                                                                                                                                                                     |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `approvalIdFor`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                   |
-| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                 |
-| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections        |
-| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                               |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                          |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                            |
-| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompt                                                      |
-| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                               |
+| Module       | Main exports                                                                                                                                                                                                                                                                                                     |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `StepLimitExceeded`, `ModelStreamError` |
+| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                                                                                                   |
+| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                 |
+| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                        |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                               |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                          |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                            |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                 |
+| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                |
+| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                                                                                               |
