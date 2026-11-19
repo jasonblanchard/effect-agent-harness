@@ -5,6 +5,8 @@ import type * as Messages from "./Messages.ts";
 export type RunOutcome =
   | { readonly _tag: "Success" }
   | { readonly _tag: "Interrupted" }
+  /** The run was cancelled on purpose (a stop, a disconnect, a runner's `cancel`), after committing its partial step. */
+  | { readonly _tag: "Cancelled" }
   | { readonly _tag: "Failed"; readonly code: string | undefined };
 
 export class ThreadError extends Schema.TaggedError<ThreadError, { readonly brand: unique symbol }>()("ThreadError", {
@@ -91,12 +93,14 @@ export class Thread extends Context.Service<
     /**
      * Called once per run that claimed the thread, after its last commit and
      * before its claim is released, whether the run succeeded, was interrupted
-     * for approval or failed (including before the model was called). Not
-     * called for a run that never claimed the thread (`ThreadBusy`,
-     * `RunInputMismatch`), nor for a run that was itself interrupted, such as
-     * a cancelled request: it has not ended. A hook for compaction or
-     * bookkeeping. If it fails, a successful or interrupted run ends with
-     * `RUN_ERROR` instead; a failed run keeps its own error.
+     * for approval, was cancelled (a request whose consumer stopped, or a
+     * runner's `cancel`) or failed (including before the model was called).
+     * Not called for a run that never claimed the thread (`ThreadBusy`,
+     * `RunInputMismatch`), nor for a detached or workflow attempt that stopped
+     * without a terminal event (a crash): it has not ended. A hook for
+     * compaction or bookkeeping. If it fails, a successful, interrupted or
+     * cancelled run ends with `RUN_ERROR` instead; a failed run keeps its own
+     * error.
      */
     readonly runEnded: (threadId: string, runId: string, outcome: RunOutcome) => Effect.Effect<void, ThreadError>;
   }

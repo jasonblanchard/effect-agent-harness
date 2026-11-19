@@ -30,8 +30,12 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
   // the server's event log is keyed by thread. Don't set `history`:
   // paging makes the client send only new messages, which the server rejects.
   // `tools` are frontend tools: the browser runs them and answers in the next run.
-  const { messages, sendMessage, isLoading, error, interrupts, resumeInterruptsUnsafe } = useChat({
-    connection: fetchServerSentEvents(`/api/chat?threadId=${encodeURIComponent(threadId)}`),
+  // With `cancelUrl`, `stop()` also posts the run's ids there, which cancels the
+  // detached run on the server; aborting the stream alone wouldn't reach it.
+  const { messages, sendMessage, stop, isLoading, error, interrupts, resumeInterruptsUnsafe } = useChat({
+    connection: fetchServerSentEvents(`/api/chat?threadId=${encodeURIComponent(threadId)}`, {
+      cancelUrl: "/api/chat/cancel",
+    }),
     threadId,
     persistence: true,
     tools: [getBrowserTime],
@@ -113,10 +117,14 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
           aria-label="Message"
           autoFocus
         />
-        {/* A run outlives its request and can't be cancelled, and the thread is busy until it ends. */}
-        <button type="submit" disabled={isLoading}>
-          Send
-        </button>
+        {/* The thread is busy until the run ends, so a streaming run offers Stop instead of Send. */}
+        {isLoading ? (
+          <button type="button" className="secondary" onClick={stop}>
+            Stop
+          </button>
+        ) : (
+          <button type="submit">Send</button>
+        )}
       </form>
     </main>
   );

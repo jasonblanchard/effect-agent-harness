@@ -139,3 +139,10 @@ The events a run emits, the prompts the model receives and the checkpoints a run
 
 - **WHEN** the same input runs against a scripted model once with no tracer and once with a recording tracer and content capture enabled
 - **THEN** both runs emit the same AG-UI events and the model receives the same prompts
+
+### Requirement: A cancelled run is not an error
+When a run ends with the cancelled outcome, its root span SHALL end without error status and SHALL NOT carry `error.type`. A tool span whose handler was interrupted by the cancellation SHALL end as interrupted, as it does when a request is cancelled.
+
+#### Scenario: Cancelled while the model streams
+- **WHEN** a run is cancelled while the model streams
+- **THEN** the root span ends without error status and has no `error.type`

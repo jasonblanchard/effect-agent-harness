@@ -5,7 +5,7 @@
 Runs a language-model agent with server-side tools for one AG-UI run. It turns the run input into an AG-UI event stream that a strict AG-UI client accepts, and it works the same way whichever model provider is configured.
 ## Requirements
 ### Requirement: Run lifecycle
-The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success or interruption, or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input. `RUN_STARTED` SHALL declare the AG-UI `protocolVersion`, and `RUN_FINISHED` SHALL carry the success outcome or the interrupt outcome. `RUN_ERROR` SHALL carry a `code` naming the kind of failure when one is known.
+The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end every run with exactly one terminal event: `RUN_FINISHED` on success, interruption or cancellation, or `RUN_ERROR` on failure. It SHALL NOT emit any event after the terminal event. `RUN_STARTED` and `RUN_FINISHED` SHALL carry the `threadId` and `runId` from the run input. `RUN_STARTED` SHALL declare the AG-UI `protocolVersion`, and `RUN_FINISHED` SHALL carry the success outcome, the interrupt outcome or the cancelled outcome. A cancelled `RUN_FINISHED` SHALL carry no `result`, and every message, reasoning span, tool call, step and subagent the run opened SHALL be closed before it. `RUN_ERROR` SHALL carry a `code` naming the kind of failure when one is known.
 
 #### Scenario: Successful run
 - **WHEN** a run is started with `threadId` "t1" and `runId` "r1" and the model replies with text only
@@ -20,6 +20,10 @@ The agent SHALL emit `RUN_STARTED` as the first event of every run and SHALL end
 #### Scenario: Failure before the model is called
 - **WHEN** a run uses the server history and loading the thread fails
 - **THEN** the run emits `RUN_STARTED` followed by `RUN_ERROR` whose `code` is `ThreadError`
+
+#### Scenario: Cancelled run
+- **WHEN** a run is cancelled while the model streams text and a reasoning block is open
+- **THEN** the stream closes the reasoning block and the text message, emits `STEP_FINISHED`, and ends with `RUN_FINISHED` with outcome type `cancelled` and no `result`, and the sequence passes the AG-UI client's checks
 
 ### Requirement: Well-formed spans
 Every `TEXT_MESSAGE_CONTENT` SHALL fall between a `TEXT_MESSAGE_START` and a `TEXT_MESSAGE_END` with the same `messageId`. Every `TOOL_CALL_ARGS` SHALL fall between a `TOOL_CALL_START` and a `TOOL_CALL_END` with the same `toolCallId`. Every `REASONING_MESSAGE_CONTENT` SHALL fall between a `REASONING_MESSAGE_START` and a `REASONING_MESSAGE_END` with the same `messageId`, inside a `REASONING_START` and `REASONING_END` with that `messageId`. No text message, reasoning message, reasoning span or tool call SHALL be left open when the terminal event is emitted, including when the model stream ends abruptly or the run fails.
@@ -255,14 +259,19 @@ Under the server history, after each model step completes, the agent SHALL commi
 - **THEN** the store holds step 1's entries and nothing from step 2
 
 ### Requirement: Run-ended notification
-Under the server history, the agent SHALL notify the thread store once when a run that claimed its thread ends, after its last commit, with the outcome kind: success, interrupted or failed.
+Under the server history, the agent SHALL notify the thread store once when a run that claimed its thread ends, after its last commit, with the outcome kind: success, interrupted, cancelled or failed.
 - Failures anywhere in the run after the claim SHALL be notified, including failures before the model is called and a failing commit.
 - A run that fails before claiming the thread (`RunInputMismatch`, `ThreadBusy`, a failing claim) SHALL NOT be notified.
-- If the notification itself fails, a run that succeeded or was interrupted SHALL end with `RUN_ERROR` whose `code` is `ThreadError`, and a run that already failed SHALL keep its own error code.
+- A cancelled run SHALL commit its cancelled step's entries before it is notified.
+- If the notification itself fails, a run that succeeded, was interrupted or was cancelled SHALL end with `RUN_ERROR` whose `code` is `ThreadError`, and a run that already failed SHALL keep its own error code.
 
 #### Scenario: Interrupted run
 - **WHEN** a run ends with an approval interrupt
 - **THEN** the store is notified with the interrupted outcome after the step's entries were committed
+
+#### Scenario: Cancelled run
+- **WHEN** a run is cancelled after the model streamed "Hel" in step 1
+- **THEN** an assistant entry "Hel" under step 1's message id is committed, then the store is notified with the cancelled outcome
 
 #### Scenario: Commit fails mid-run
 - **WHEN** committing step 1's entries fails
@@ -405,8 +414,8 @@ Everything the runner stores for a run SHALL be scoped by the input's thread id 
 ### Requirement: One active run per thread
 Under the server history, every runner SHALL claim the input's thread after checking the input against its run id and before loading the thread. It SHALL release the claim after the run-ended notification and before emitting the terminal event, so a client's next run after `RUN_FINISHED` or `RUN_ERROR` finds the thread free.
 - A run whose claim fails SHALL end with `RUN_ERROR` carrying the claim's error code (`ThreadBusy` when another run is active), without loading or committing anything.
-- A request-scoped run that is cancelled before its terminal event SHALL release its claim.
-- A detached or workflow run that is interrupted SHALL keep its claim, so the thread stays busy until the run is resumed and ends.
+- A cancelled run, on any runner, SHALL release its claim after its run-ended notification. The next run on the thread SHALL be an ordinary new run.
+- A detached or workflow run that is interrupted without being cancelled SHALL keep its claim, so the thread stays busy until the run is resumed and ends.
 
 #### Scenario: Second run while one is streaming
 - **WHEN** run "r1" on thread "t1" is streaming and run "r2" is started on "t1"
@@ -419,6 +428,10 @@ Under the server history, every runner SHALL claim the input's thread after chec
 #### Scenario: Cancelled request
 - **WHEN** a request-scoped run is cancelled because its consumer stopped
 - **THEN** its claim is released
+
+#### Scenario: Cancelled detached run
+- **WHEN** a detached run on "t1" is cancelled and its log has ended with the cancelled `RUN_FINISHED`
+- **THEN** another run can claim "t1"
 
 #### Scenario: Crashed detached run
 - **WHEN** a detached run's scope is closed mid-step and another run is started on its thread
@@ -521,3 +534,10 @@ The agent SHALL have no option of its own that enables or disables reasoning. Wh
 #### Scenario: Model without reasoning
 - **WHEN** a run's model produces only text and tool calls
 - **THEN** the run's events contain no `REASONING_*` event
+
+### Requirement: The client's copy of a cancelled turn is known
+Under the server history, the assistant entry committed for a cancelled step SHALL carry the message id that step's AG-UI events used. A client that resends the partial message it was shown SHALL therefore have it matched as known, and not rejected as divergent.
+
+#### Scenario: Next run after a stop
+- **WHEN** run "r1" was cancelled after streaming "Hel", and the client sends its history including that partial assistant message, followed by a new user message
+- **THEN** the partial message is matched as known, only the new user message is committed, and the model receives "Hel" as the earlier assistant turn

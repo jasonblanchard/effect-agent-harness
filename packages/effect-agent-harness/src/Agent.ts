@@ -1,4 +1,17 @@
-import { Cause, Context, Effect, Option, Predicate, Queue, Result, Schema, Stream } from "effect";
+import {
+  Cause,
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Predicate,
+  Queue,
+  Result,
+  Schema,
+  Stream,
+} from "effect";
 import { IdGenerator, LanguageModel, Prompt, Telemetry as AiTelemetry, Tool } from "effect/ai";
 import type { Response, Toolkit } from "effect/ai";
 import type { JsonSchema } from "effect";
@@ -187,6 +200,16 @@ export interface RunInput extends RunInfo {
    * failed result.
    */
   readonly subagentPrompts?: Readonly<Record<string, Prompt.Prompt>> | undefined;
+  /**
+   * Completes when the run should be cancelled. The run then stops its model
+   * stream or tool handlers (interrupting them, which respects
+   * `Effect.uninterruptible` regions), commits what the step produced and ends
+   * with the `Cancelled` outcome. It is checked before every step, so a run
+   * whose signal has already completed replays what an earlier attempt
+   * completed and then ends without calling the model. Not part of
+   * {@link RunInfo}: tool handlers see cancellation only as interruption.
+   */
+  readonly cancelled?: Effect.Effect<void> | undefined;
 }
 
 /** A tool the client advertised and runs itself. */
@@ -276,7 +299,7 @@ export interface PendingToolCall {
   readonly toolName: string;
 }
 
-/** Both outcomes list the frontend calls the run left pending, in call order. */
+/** `Success` and `Interrupted` list the frontend calls the run left pending, in call order. */
 export type Outcome =
   | { readonly _tag: "Success"; readonly pendingToolCalls: ReadonlyArray<PendingToolCall> }
   /** The run stopped because these tool calls wait for the user's approval. */
@@ -284,7 +307,12 @@ export type Outcome =
       readonly _tag: "Interrupted";
       readonly approvals: ReadonlyArray<Approval>;
       readonly pendingToolCalls: ReadonlyArray<PendingToolCall>;
-    };
+    }
+  /**
+   * The run's cancel signal fired. Every complete call of the last step has a
+   * result, real or a failed "cancelled" one, so nothing is left pending.
+   */
+  | { readonly _tag: "Cancelled" };
 
 export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded, { readonly brand: unique symbol }>()(
   "StepLimitExceeded",
@@ -361,8 +389,50 @@ type ToolStep = typeof ToolStep.Type;
 /** A tool call's step, with the entries of the subagent it ran, if any. */
 type ToolOutcome = Checkpoint.Memoized<ToolStep> & { readonly entries: ReadonlyArray<Messages.Entry> };
 
+/**
+ * A call the run's cancellation stopped before it had an outcome, with the
+ * entries of the subagent it ran, if any. Never memoised: the run is ending.
+ */
+interface CancelledCall {
+  readonly cancelled: true;
+  readonly entries: ReadonlyArray<Messages.Entry>;
+}
+
+/** How a call of a step ended. */
+type CallOutcome = ToolOutcome | CancelledCall;
+
+const cancelledCall: CancelledCall = { cancelled: true, entries: [] };
+
+const isCancelledCall = (outcome: CallOutcome): outcome is CancelledCall => "cancelled" in outcome;
+
+/** The outcomes, if no call was cancelled. */
+const allSettled = (outcomes: ReadonlyArray<CallOutcome>): ReadonlyArray<ToolOutcome> | undefined => {
+  const settled = outcomes.filter((outcome): outcome is ToolOutcome => !isCancelledCall(outcome));
+  return settled.length === outcomes.length ? settled : undefined;
+};
+
 /** Result sent to the model for a suspended subagent call whose child can't be resumed from the history. */
 const INCOMPLETE_SUBAGENT_RESULT = "The subagent did not complete and could not be resumed";
+
+/** The failed result of a complete call that a cancelled run stopped before it had a result. */
+export const CANCELLED_TOOL_CALL_RESULT = "Tool call was cancelled before it completed";
+
+/**
+ * The id of the failed result a cancelled run gives a call. Derived, not minted, because it is built
+ * outside any checkpoint, and a restarted run must commit the same entry again.
+ */
+const cancelledResultId = (toolCallId: string): string => `cancelled:${toolCallId}`;
+
+/** What a model step has streamed so far, kept outside its checkpoint so a cancelled step can commit it. */
+interface StepProgress {
+  messageId: string | undefined;
+  readonly parts: Array<Response.AnyPart>;
+}
+
+/** Wraps a checkpoint's body; see `guard` in {@link run}. */
+type Gate = <X, EX, RX>(work: Effect.Effect<X, EX, RX>) => Effect.Effect<X, EX, RX>;
+
+const ungated: Gate = (work) => work;
 
 /**
  * Internal: carries a failed tool result out of its `execute_tool` span, so the span ends with an error
@@ -419,9 +489,54 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
 ): Stream.Stream<Event, never, Requirements<Tools, R>> =>
   Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
     const emit = (event: Event) => Queue.offer(queue, event);
-    const { prompt: _, frontendTools = [], subagentPrompts, ...info } = input;
+    const { prompt: _, frontendTools = [], subagentPrompts, cancelled, ...info } = input;
     return Effect.gen(function* () {
       const checkpoint = yield* Checkpoint.Checkpoint;
+      // Completed once the signal fires. Started at once, so a signal that has already fired is seen
+      // before the first step.
+      const cancel = yield* Deferred.make<void>();
+      if (cancelled !== undefined) {
+        yield* Effect.forkChild(Effect.andThen(cancelled, Deferred.succeed(cancel, undefined)), {
+          startImmediately: true,
+        });
+      }
+
+      // Runs a checkpointed step, racing it against the signal from outside the checkpoint: a workflow
+      // activity whose own body ends interrupted is retried, but one interrupted from outside stores
+      // nothing. `make` wraps the checkpoint's body in the gate it's given. A body that would start after
+      // the signal fired blocks instead, and is interrupted, so a stored step still replays and an unstored
+      // one never runs. `None` means the step was cancelled; a step that completed while being interrupted
+      // (an uninterruptible one) keeps its value.
+      const guard = <B, E, R2>(
+        make: (gate: Gate) => Effect.Effect<B, E, R2>,
+      ): Effect.Effect<Option.Option<B>, E, R2> =>
+        cancelled === undefined
+          ? Effect.asSome(make(ungated))
+          : Effect.gen(function* () {
+              const started = yield* Deferred.make<void>();
+              const gate: Gate = (work) =>
+                Deferred.succeed(started, undefined).pipe(
+                  Effect.andThen(Deferred.isDone(cancel)),
+                  Effect.flatMap((done) => (done ? Effect.never : work)),
+                );
+              const fiber = yield* Effect.forkChild(make(gate), { startImmediately: true });
+              // `Fiber.await`, not `join`: the step's own interruption (a crash, a workflow suspending) must
+              // reach the race as an exit rather than leave it waiting on the signal.
+              const ended = yield* Effect.raceFirst(
+                Effect.asSome(Fiber.await(fiber)),
+                Effect.as(Effect.andThen(Deferred.await(started), Deferred.await(cancel)), Option.none()),
+              );
+              const exit = Option.isSome(ended)
+                ? ended.value
+                : yield* Effect.andThen(Fiber.interrupt(fiber), Fiber.await(fiber));
+              if (Exit.isSuccess(exit)) {
+                return Option.some(exit.value);
+              }
+              // Interrupted by the signal, or by something else, which the run passes on.
+              return Cause.hasInterruptsOnly(exit.cause) && (yield* Deferred.isDone(cancel))
+                ? Option.none<B>()
+                : yield* Effect.failCause(exit.cause);
+            });
       const toolkit = yield* agent.toolkit;
       // `define` checked that every subagent has a name.
       const subagents = new Map((agent.subagents?.agents ?? []).map((child) => [child.name ?? "", child]));
@@ -479,10 +594,10 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         annotateModelSpan(options, runAttributes, capture);
       };
       // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
-      const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>) =>
+      const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>, gate = ungated) =>
         checkpoint.memo(
           { threadId: input.threadId, runId: input.runId, name, success: ToolStep, error: Schema.Never },
-          Effect.orDie(body),
+          gate(Effect.orDie(body)),
         );
 
       const result = (encodedResult: unknown, isFailure: boolean) =>
@@ -494,7 +609,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }));
 
       // Runs the handler, unless the call needs approval and no decision was made yet.
-      const executeTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined) =>
+      const executeTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined, gate?: Gate) =>
         memoTool(
           `tool:${call.id}`,
           Effect.gen(function* () {
@@ -508,6 +623,14 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             }
             return yield* handleTool(call);
           }),
+          gate,
+        );
+
+      // The call's outcome, or `cancelledCall` if the run's cancellation stopped it first.
+      const guardedTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined) =>
+        Effect.map(
+          guard((gate) => executeTool(call, prompt, decision, gate)),
+          Option.match({ onNone: (): CallOutcome => cancelledCall, onSome: withoutEntries }),
         );
 
       // Only an executed handler is traced: a replayed, denied, interrupted or pending call has no span.
@@ -550,15 +673,21 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
 
       // The model stopped for a reason that does not complete the response.
       const interruptTool = (call: ToolCall, finishReason: string) =>
-        memoTool(
-          `tool:${call.id}`,
-          result(
-            {
-              type: "execution-interrupted",
-              reason: `Tool call execution was interrupted because the response finished with reason "${finishReason}"`,
-            },
-            true,
+        Effect.map(
+          guard((gate) =>
+            memoTool(
+              `tool:${call.id}`,
+              result(
+                {
+                  type: "execution-interrupted",
+                  reason: `Tool call execution was interrupted because the response finished with reason "${finishReason}"`,
+                },
+                true,
+              ),
+              gate,
+            ),
           ),
+          Option.match({ onNone: (): CallOutcome => cancelledCall, onSome: withoutEntries }),
         );
 
       const toolEntry = (call: ToolCall, step: Extract<ToolStep, { _tag: "Result" }>): Messages.Entry => ({
@@ -598,6 +727,10 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       ): Effect.Effect<ToolStep> => {
         if (terminal._tag === "Failed") {
           return result(errorMessage(terminal.error), true);
+        }
+        if (terminal.outcome._tag === "Cancelled") {
+          // `callSubagent` handles a cancelled child before memoising anything.
+          return result(CANCELLED_TOOL_CALL_RESULT, true);
         }
         if (terminal.outcome._tag === "Interrupted") {
           const subagentRunId = subagentIdFor(call.id);
@@ -663,6 +796,8 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             ...info,
             prompt: childPrompt,
             subagentPrompts,
+            // Cancelled with its parent.
+            cancelled: cancelled === undefined ? undefined : Deferred.await(cancel),
           }) as Stream.Stream<Event, never, RunServices<Tools, R>>;
           // The child's model and tool spans are children of one agent span for the call, as a run's are of its
           // root. A failed child fails the span's effect, so the span ends with an error status; it's caught just
@@ -716,6 +851,11 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           }
 
           const ended = terminal;
+          const entries = own.map((entry) => (entry.subagentRunId === undefined ? { ...entry, subagentRunId } : entry));
+          // Not memoised: the parent is ending too, and a stored outcome would turn a later replay into a fake result.
+          if (ended._tag === "Finished" && ended.outcome._tag === "Cancelled") {
+            return { cancelled: true, entries } satisfies CancelledCall;
+          }
           const step = yield* memoTool(
             `tool:${call.id}`,
             Effect.suspend(() =>
@@ -728,7 +868,6 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
               ),
             ),
           );
-          const entries = own.map((entry) => (entry.subagentRunId === undefined ? { ...entry, subagentRunId } : entry));
 
           return { ...step, entries } satisfies ToolOutcome;
         });
@@ -781,7 +920,8 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           return { approvals, childEntries, toolEntries, suspended };
         });
 
-      const modelStep = (step: number, prompt: Prompt.Prompt) =>
+      // A step's parts go to `progress` as they stream, so a cancelled step can commit them.
+      const modelStep = (step: number, prompt: Prompt.Prompt, progress: StepProgress, gate: Gate) =>
         checkpoint.memo(
           {
             threadId: input.threadId,
@@ -790,38 +930,38 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             success: ModelStep,
             error: Schema.Never,
           },
-          Effect.gen(function* () {
-            const messageId = yield* ids.generateId();
-            yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
-            const parts: Array<Response.AnyPart> = [];
-            yield* LanguageModel.streamText({
-              prompt: withSystem(forModel(prompt)),
-              toolkit: modelToolkit,
-              disableToolCallResolution: true,
-            }).pipe(
-              Stream.provideService(AiTelemetry.CurrentSpanTransformer, modelSpanTransformer),
-              Stream.runForEach((streamed) => {
-                // The toolkit's own part type is narrower; this only widens tool names and parameters.
-                const part = streamed as Response.AnyPart;
-                if (part.type === "error") {
-                  return Effect.fail(new ModelStreamError({ error: part.error }));
-                }
-                parts.push(part);
-                return emit({ _tag: "ModelPart", step, messageId, part, replayed: false });
-              }),
-            );
-            const finish = parts.find((part) => part.type === "finish");
-            return {
-              messageId,
-              assistant: Prompt.fromResponseParts(parts),
-              toolCalls: parts.flatMap((part) =>
-                part.type === "tool-call" && part.providerExecuted !== true
-                  ? [{ id: part.id, name: part.name, params: part.params }]
-                  : [],
-              ),
-              finishReason: finish?.type === "finish" ? finish.reason : "unknown",
-            } satisfies ModelStep;
-          }).pipe(Effect.orDie),
+          gate(
+            Effect.gen(function* () {
+              const messageId = yield* ids.generateId();
+              progress.messageId = messageId;
+              progress.parts.length = 0;
+              yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
+              const parts = progress.parts;
+              yield* LanguageModel.streamText({
+                prompt: withSystem(forModel(prompt)),
+                toolkit: modelToolkit,
+                disableToolCallResolution: true,
+              }).pipe(
+                Stream.provideService(AiTelemetry.CurrentSpanTransformer, modelSpanTransformer),
+                Stream.runForEach((streamed) => {
+                  // The toolkit's own part type is narrower; this only widens tool names and parameters.
+                  const part = streamed as Response.AnyPart;
+                  if (part.type === "error") {
+                    return Effect.fail(new ModelStreamError({ error: part.error }));
+                  }
+                  parts.push(part);
+                  return emit({ _tag: "ModelPart", step, messageId, part, replayed: false });
+                }),
+              );
+              const finish = parts.find((part) => part.type === "finish");
+              return {
+                messageId,
+                assistant: Prompt.fromResponseParts(parts),
+                toolCalls: callsIn(parts),
+                finishReason: finish?.type === "finish" ? finish.reason : "unknown",
+              } satisfies ModelStep;
+            }).pipe(Effect.orDie),
+          ),
         );
 
       // Resolved before step 0, so a system prompt that fails runs no tool.
@@ -843,6 +983,49 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           ? prompt
           : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
 
+      const finishCancelled = emit({ _tag: "Finished", outcome: { _tag: "Cancelled" } });
+
+      // Ends a step the signal stopped: the assistant entry under the step's message id (`undefined` for step
+      // 0, which has none) with the calls whose input was complete, each call's real result if it has one and
+      // a failed "cancelled" result otherwise, then the cancelled outcome. A call that waits for approval or a
+      // suspended child gets the "cancelled" result too: the run reports no approvals.
+      const cancelStep = (
+        step: number,
+        messageId: string | undefined,
+        assistant: Prompt.Prompt,
+        calls: ReadonlyArray<ToolCall>,
+        outcomes: ReadonlyMap<string, CallOutcome>,
+      ) =>
+        Effect.gen(function* () {
+          const entries: Array<Messages.Entry> = [];
+          const assistantMessage = withoutUnansweredProviderCalls(
+            assistant.content.find((message) => message.role === "assistant"),
+          );
+          if (messageId !== undefined && assistantMessage !== undefined) {
+            entries.push({ id: messageId, message: assistantMessage });
+          }
+          const toolEntries: Array<Messages.Entry> = [];
+          for (const call of calls) {
+            const outcome = outcomes.get(call.id);
+            entries.push(...(outcome?.entries ?? []));
+            const kept = outcome !== undefined && !isCancelledCall(outcome) ? outcome : undefined;
+            const value: Extract<ToolStep, { _tag: "Result" }> =
+              kept?.value._tag === "Result"
+                ? kept.value
+                : {
+                    _tag: "Result",
+                    messageId: cancelledResultId(call.id),
+                    encodedResult: CANCELLED_TOOL_CALL_RESULT,
+                    isFailure: true,
+                  };
+            toolEntries.push(toolEntry(call, value));
+            yield* emit(toolResultEvent(step, call, value, kept?.value._tag === "Result" && kept.replayed));
+          }
+          entries.push(...toolEntries);
+          yield* emit({ _tag: "StepFinished", step, entries, replayed: false });
+          return yield* finishCancelled;
+        });
+
       // Step 0: approval answers carried by the prompt, and suspended subagents, are resolved before the model
       // is called.
       let prompt = input.prompt;
@@ -850,18 +1033,19 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       const suspended = suspendedCalls(prompt);
       if (decided.length > 0 || suspended.length > 0) {
         const opening = prompt;
-        const outcomes = yield* Effect.all(
+        const calls = [...decided.map(({ call }) => call), ...suspended.map(({ call }) => call)];
+        const ended = yield* Effect.all(
           [
-            ...decided.map(({ call, decision }) => Effect.map(executeTool(call, opening, decision), withoutEntries)),
+            ...decided.map(({ call, decision }) => guardedTool(call, opening, decision)),
             ...suspended.map(({ call, parentMessageId }) => resumeSubagent(call, parentMessageId, opening)),
           ],
           { concurrency: "unbounded" },
         );
-        const settled = yield* settle(
-          0,
-          [...decided.map(({ call }) => call), ...suspended.map(({ call }) => call)],
-          outcomes,
-        );
+        const outcomes = allSettled(ended);
+        if (outcomes === undefined) {
+          return yield* cancelStep(0, undefined, Prompt.empty, calls, byCall(calls, ended));
+        }
+        const settled = yield* settle(0, calls, outcomes);
         yield* emit({
           _tag: "StepFinished",
           step: 0,
@@ -882,7 +1066,21 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       }
 
       for (let step = 1; ; step++) {
-        const model = yield* modelStep(step, prompt);
+        const progress: StepProgress = { messageId: undefined, parts: [] };
+        const memoised = yield* guard((gate) => modelStep(step, prompt, progress, gate));
+        if (Option.isNone(memoised)) {
+          // A step that never started produced nothing: the signal had fired before it.
+          return yield* progress.messageId === undefined
+            ? finishCancelled
+            : cancelStep(
+                step,
+                progress.messageId,
+                Prompt.fromResponseParts(progress.parts),
+                callsIn(progress.parts),
+                new Map(),
+              );
+        }
+        const model = memoised.value;
         const { messageId, assistant, toolCalls, finishReason } = model.value;
         if (model.replayed) {
           yield* emit({ _tag: "StepStarted", step, messageId, replayed: true });
@@ -894,19 +1092,24 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         const pending = complete ? toolCalls.filter((call) => frontend.has(call.name)) : [];
         const pendingIds = new Set(pending.map((call) => call.id));
         const executed = toolCalls.filter((call) => !pendingIds.has(call.id));
-        const tools = yield* Effect.forEach(
+        const ended = yield* Effect.forEach(
           executed,
-          (call): Effect.Effect<ToolOutcome, never, RunServices<Tools, R>> => {
+          (call): Effect.Effect<CallOutcome, never, RunServices<Tools, R>> => {
             if (!complete) {
-              return Effect.map(interruptTool(call, finishReason), withoutEntries);
+              return interruptTool(call, finishReason);
             }
             const child = subagents.get(call.name);
             return child === undefined
-              ? Effect.map(executeTool(call, modelPrompt, undefined), withoutEntries)
+              ? guardedTool(call, modelPrompt, undefined)
               : callSubagent(call, child, messageId, modelPrompt, Prompt.empty);
           },
           { concurrency: "unbounded" },
         );
+        const tools = allSettled(ended);
+        if (tools === undefined) {
+          // Every complete call, frontend calls included, gets a result: the cancelled outcome leaves none pending.
+          return yield* cancelStep(step, messageId, assistant, toolCalls, byCall(executed, ended));
+        }
         const { approvals, childEntries, toolEntries, suspended } = yield* settle(step, executed, tools);
 
         const assistantMessage = assistant.content.find((message) => message.role === "assistant");
@@ -1002,6 +1205,41 @@ const annotateModelSpan = (
 };
 
 const isJson = Schema.is(Schema.Json);
+
+/** The calls in a step's parts for the loop to execute: complete ones (`tool-call` arrived), not provider-executed. */
+const callsIn = (parts: ReadonlyArray<Response.AnyPart>): Array<ToolCall> =>
+  parts.flatMap((part) =>
+    part.type === "tool-call" && part.providerExecuted !== true
+      ? [{ id: part.id, name: part.name, params: part.params }]
+      : [],
+  );
+
+/**
+ * A cancelled step's assistant message without the provider-executed calls whose result never arrived: the
+ * loop doesn't answer those, so a stored one would stay unanswered and be sent back to the provider on every
+ * later run. `undefined` if nothing is left. Exported for tests only.
+ *
+ * @internal
+ */
+export const withoutUnansweredProviderCalls = (
+  message: Prompt.Message | undefined,
+): Prompt.AssistantMessage | undefined => {
+  if (message?.role !== "assistant") {
+    return undefined;
+  }
+  const answered = new Set(message.content.flatMap((part) => (part.type === "tool-result" ? [part.id] : [])));
+  const content = message.content.filter(
+    (part) => part.type !== "tool-call" || part.providerExecuted !== true || answered.has(part.id),
+  );
+  if (content.length === message.content.length) {
+    return message;
+  }
+  return content.length === 0 ? undefined : Prompt.makeMessage("assistant", { content, options: message.options });
+};
+
+/** Each call's outcome, by call id. */
+const byCall = (calls: ReadonlyArray<ToolCall>, outcomes: ReadonlyArray<CallOutcome>): Map<string, CallOutcome> =>
+  new Map(calls.flatMap((call, i) => (outcomes[i] === undefined ? [] : [[call.id, outcomes[i]] as const])));
 
 const toolResultEvent = (
   step: number,

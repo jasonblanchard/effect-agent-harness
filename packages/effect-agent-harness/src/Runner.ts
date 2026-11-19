@@ -1,8 +1,24 @@
-import { Cause, Clock, Context, Effect, Exit, Layer, Option, Schema, Scope, Stream, Tracer } from "effect";
+import {
+  Cause,
+  Clock,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Schedule,
+  Schema,
+  Scope,
+  Stream,
+  Tracer,
+} from "effect";
 import { Prompt } from "effect/ai";
 import type { Tool } from "effect/ai";
-import { Workflow } from "effect/workflow";
-import type { WorkflowEngine } from "effect/workflow";
+import { DurableDeferred, Workflow, WorkflowEngine } from "effect/workflow";
 import * as Agent from "./Agent.ts";
 import * as AgUi from "./AgUi.ts";
 import * as Checkpoint from "./Checkpoint.ts";
@@ -86,6 +102,21 @@ export interface Options<ROut = never, E = never, RIn = never> {
   readonly layer?: Layer.Layer<ROut, E, RIn>;
 }
 
+/** How long a cancelled request-scoped run is given to end by default. */
+const DEFAULT_CANCEL_TIMEOUT: Duration.Input = "30 seconds";
+
+/** Options of {@link makeAttached}. */
+export interface AttachedOptions<ROut = never, E = never, RIn = never> extends Options<ROut, E, RIn> {
+  /**
+   * How long a run whose consumer stopped early is given to end as cancelled
+   * (default 30 seconds): to finish an uninterruptible handler region, commit
+   * its partial step, report and release. A run still going then is
+   * interrupted, its claim is released without a run-ended notification, and
+   * its partial step may not be committed.
+   */
+  readonly cancelTimeout?: Duration.Input | undefined;
+}
+
 /**
  * Options of the runners that capture their services when they're built
  * ({@link makeDetached}, {@link makeWorkflow}), which therefore name the services
@@ -143,6 +174,15 @@ export class RunInputMismatch extends Schema.TaggedError<RunInputMismatch, { rea
 }
 
 const InputJson = Schema.toCodecJson(AgUi.RunAgentInput);
+
+/** What names a run to cancel: a cancel route has only the ids, not the input. */
+export interface RunIds {
+  readonly threadId: string;
+  readonly runId: string;
+}
+
+/** A run's key. JSON, so no choice of ids can make two keys collide. */
+const runKey = (run: RunIds): string => JSON.stringify([run.threadId, run.runId]);
 
 /** Ends the stream with a `Failed` event instead of failing it. Interruption passes through. */
 const failInBand = <R>(stream: Stream.Stream<Agent.Event, unknown, R>): Stream.Stream<Agent.Event, never, R> =>
@@ -203,7 +243,7 @@ const currentHistory: Effect.Effect<internal.Service> = Effect.map(
  * `UnansweredToolCall`), end the stream with `RUN_ERROR`, so it never fails.
  * An interrupted run (e.g. a cancelled request) is not handed to the history
  * as ended: under the server history it keeps its claim, and running it again
- * finishes it. The request-scoped runner abandons a cancelled run itself.
+ * finishes it. A cancelled run (`how.cancelled`) ends like any other.
  */
 const agUiRun =
   <Tools extends Record<string, Tool.Any>, R, Dependencies extends ReadonlyArray<AnyService>, ROut, E, RIn>(
@@ -212,8 +252,12 @@ const agUiRun =
   ) =>
   (
     input: AgUi.RunAgentInput,
-    // The log of an earlier attempt this one completes.
-    resumed?: ReadonlyArray<AgUi.Event>,
+    how?: {
+      /** The log of an earlier attempt this one completes. */
+      readonly resumed?: ReadonlyArray<AgUi.Event> | undefined;
+      /** The run's cancel signal (`Agent.RunInput.cancelled`). */
+      readonly cancelled?: Effect.Effect<void> | undefined;
+    },
   ): Stream.Stream<
     AgUi.Event,
     never,
@@ -247,6 +291,7 @@ const agUiRun =
             prompt: prompt.value,
             frontendTools: input.tools,
             subagentPrompts: subagentPrompts.value,
+            cancelled: how?.cancelled,
           }).pipe(Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)));
         }),
       ).pipe(
@@ -283,7 +328,9 @@ const agUiRun =
         return opened(attempt, checkpoint).pipe(Stream.provideContext(services));
       }),
     ).pipe(failInBand);
-    return traced(agent, input, (onFailed) => AgUi.fold(input, { resumed })(Stream.tap(events, onFailed)));
+    return traced(agent, input, (onFailed) =>
+      AgUi.fold(input, { resumed: how?.resumed })(Stream.tap(events, onFailed)),
+    );
   };
 
 /**
@@ -364,30 +411,47 @@ const traced = <R>(
  */
 export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
   agent: Agent.Agent<Tools, R>,
-  options?: Options<ROut, E, RIn>,
+  options?: AttachedOptions<ROut, E, RIn>,
 ) => {
+  const cancelTimeout = options?.cancelTimeout ?? DEFAULT_CANCEL_TIMEOUT;
   const runWith = agUiRun<Tools, R, readonly [], ROut, E, RIn>(agent, options);
   return (
     input: AgUi.RunAgentInput,
   ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
-    Stream.suspend(() => {
-      // A run that ended has been handed to its history. Nothing resumes a cancelled
-      // request-scoped run, so a stream that stops before the end abandons it (the
-      // server history releases its thread).
-      let ended = false;
-      return runWith(input).pipe(
-        Stream.tap((event) =>
-          Effect.sync(() => {
-            ended ||= AgUi.isTerminal(event);
-          }),
-        ),
-        Stream.ensuring(
-          Effect.suspend(() =>
-            ended ? Effect.void : Effect.flatMap(currentHistory, (history) => history.abandonAttempt(input)),
-          ),
-        ),
-      );
-    });
+    Stream.unwrap(
+      Effect.gen(function* () {
+        // The run is forked and read through a queue, so a consumer that stops early cancels it instead of
+        // interrupting it: the run then ends as cancelled (committing its partial step, and reporting and
+        // releasing under the server history) before the stream finishes closing. Its remaining events are
+        // discarded. Unbounded, so a run with no reader never blocks. Detached rather than in the stream's
+        // scope, whose own finalizer would wait for the fiber however long it took: the finalizer below
+        // owns its lifetime.
+        const cancel = yield* Deferred.make<void>();
+        const queue = yield* Queue.unbounded<AgUi.Event, Cause.Done>();
+        // A run that doesn't end in time (a hung store, a long uninterruptible handler) is interrupted
+        // without waiting for it, and the history releases what it holds without reporting an end, so a
+        // disconnect can't hold the request, or a shutdown, for longer than `cancelTimeout`. An
+        // uninterruptible region still running then finishes on its own; the run commits nothing after it.
+        // `acquireRelease`, so the fork and its finalizer can't be separated by an interruption.
+        yield* Effect.acquireRelease(
+          runWith(input, { cancelled: Deferred.await(cancel) }).pipe(Stream.runIntoQueue(queue), Effect.forkDetach),
+          (fiber) =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(cancel, undefined);
+              const ended = yield* Effect.timeoutOption(Fiber.await(fiber), cancelTimeout);
+              if (Option.isNone(ended)) {
+                yield* Effect.logWarning(
+                  "effect-agent-harness: a cancelled run did not end in time and was interrupted",
+                  input.runId,
+                );
+                yield* Effect.forkDetach(Fiber.interrupt(fiber));
+                yield* Effect.flatMap(currentHistory, (history) => history.abandonAttempt(input));
+              }
+            }),
+        );
+        return Stream.fromQueue(queue);
+      }),
+    );
 };
 
 /**
@@ -404,6 +468,8 @@ const detached =
   ) =>
   (
     input: AgUi.RunAgentInput,
+    // The run's cancel signal.
+    cancelled: Effect.Effect<void>,
   ): Effect.Effect<
     void,
     EventLog.EventLogError,
@@ -422,7 +488,10 @@ const detached =
         return;
       }
       yield* Effect.forEach(AgUi.closeOpen(history), append, { discard: true });
-      const events = history.length === 0 ? runWith(input) : Stream.drop(runWith(input, history), 1);
+      const events =
+        history.length === 0
+          ? runWith(input, { cancelled })
+          : Stream.drop(runWith(input, { resumed: history, cancelled }), 1);
       yield* Stream.runForEach(events, append);
     });
   };
@@ -459,7 +528,10 @@ export const makeDetached = <
   agent: Agent.Agent<Tools, R>,
   options?: DetachedOptions<Dependencies, ROut, E, RIn>,
 ): Effect.Effect<
-  { readonly start: (input: AgUi.RunAgentInput) => Effect.Effect<void, never, DependencyServices<Dependencies>> },
+  {
+    readonly start: (input: AgUi.RunAgentInput) => Effect.Effect<void, never, DependencyServices<Dependencies>>;
+    readonly cancel: (run: RunIds) => Effect.Effect<void>;
+  },
   never,
   Requirements<Tools, R, Dependencies, ROut, RIn> | EventLog.EventLog | Scope.Scope
 > =>
@@ -468,16 +540,41 @@ export const makeDetached = <
     const scope = yield* Scope.Scope;
     const log = yield* EventLog.EventLog;
     const body = detached(agent, options);
+    // The cancel signal of each run this runner started that has not ended: one in progress, or one whose
+    // attempt was interrupted (a crash), which the next `start` reuses. Only `start` adds entries, so the ids
+    // a caller passes to `cancel` can never grow it.
+    const signals = new Map<string, Deferred.Deferred<void>>();
     return {
       start: (input) =>
         Effect.gen(function* () {
-          const last = (yield* Effect.orDie(log.read(input.threadId, input.runId))).at(-1);
+          const key = runKey(input);
+          // Registered before anything is read, so a cancel that arrives while `start` reads the log still
+          // reaches the run. A cancel made while an earlier attempt was down has fired it already.
+          const earlier = signals.get(key);
+          const own = earlier ?? Deferred.makeUnsafe<void>();
+          signals.set(key, own);
+          const forget = Effect.sync(() => {
+            if (signals.get(key) === own) {
+              signals.delete(key);
+            }
+          });
+          // A `start` that fails before forking drops only the entry it created: an earlier crashed
+          // attempt's entry may hold a cancel for the next start.
+          const last = yield* Effect.orDie(log.read(input.threadId, input.runId)).pipe(
+            Effect.map((stored) => stored.at(-1)),
+            Effect.onError(() => (earlier === undefined ? forget : Effect.void)),
+          );
           if (last !== undefined && AgUi.isTerminal(last.event)) {
-            return;
+            return yield* forget;
           }
           // Read now, so the forked run has the dependencies its caller provided.
           const perRun = yield* Effect.context<DependencyServices<Dependencies>>();
-          yield* body(input).pipe(
+          yield* body(input, Deferred.await(own)).pipe(
+            // An attempt that was interrupted keeps its signal, so a restart sees a cancel made in between.
+            // One that ended otherwise (its terminal event, or a failure) drops it.
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? Effect.void : forget,
+            ),
             Effect.tapCause((cause) =>
               Cause.hasInterruptsOnly(cause)
                 ? Effect.void
@@ -486,6 +583,12 @@ export const makeDetached = <
             Effect.provideContext(Context.merge(context, perRun)),
             Effect.forkIn(scope),
           );
+        }),
+      // Does nothing for a run this runner has not started, or that has ended.
+      cancel: (run) =>
+        Effect.suspend(() => {
+          const signal = signals.get(runKey(run));
+          return signal === undefined ? Effect.void : Effect.asVoid(Deferred.succeed(signal, undefined));
         }),
     };
   });
@@ -503,7 +606,16 @@ export interface WorkflowOptions<
    * under it are in flight.
    */
   readonly name: string;
+  /**
+   * How often a running execution checks the engine for a cancel made through
+   * another runner value, such as on another host (default 1 second). A cancel
+   * made through the runner value executing the run reaches it at once.
+   */
+  readonly cancelPollInterval?: Duration.Input | undefined;
 }
+
+/** How often a running workflow execution checks the engine for a cancel by default. */
+const DEFAULT_CANCEL_POLL_INTERVAL: Duration.Input = "1 second";
 
 /**
  * The fields of what {@link makeWorkflow} persists per run: the AG-UI input and,
@@ -567,15 +679,24 @@ export const makeWorkflow = <
           input: AgUi.RunAgentInput,
           context: Schema.Struct(Object.fromEntries(dependencies.map((tag) => [tag.key, tag.schema]))),
         };
+  // Built only from the ids, so `cancel` can derive the execution id without the dependencies.
+  const idempotencyKey = (payload: unknown) => runKey((payload as PayloadParts).input);
   const run = Workflow.make(options.name, {
     // Built from `dependencies` exactly as the type describes; TypeScript can't follow the mapping.
     payload: fields as unknown as WorkflowPayloadFields<Dependencies>,
-    // JSON, so no choice of ids can make two keys collide.
-    idempotencyKey: (payload) => {
-      const { input } = payload as PayloadParts;
-      return JSON.stringify([input.threadId, input.runId]);
-    },
+    idempotencyKey,
   });
+  // Never registered or executed: only its execution ids are used. Same name and idempotency key as `run`, so
+  // the same ids, but a payload that needs no dependency values (`run.executionId` validates them all).
+  const ids = Workflow.make(options.name, { payload: { input: AgUi.RunAgentInput }, idempotencyKey });
+  // Completed by `cancel`; held by the engine, so it reaches the run on any host, before it starts or while it
+  // is down. The run never awaits it durably: completing a deferred a run awaits makes the engine interrupt and
+  // replay the run, and an interrupted step is lost as a crash's is, instead of ending cancelled with its partial
+  // turn.
+  const cancelRequest = DurableDeferred.make(`${options.name}/cancel`);
+  const pollInterval = options.cancelPollInterval ?? DEFAULT_CANCEL_POLL_INTERVAL;
+  // The signals of the runs this runner value is executing, so its own `cancel` reaches them without a poll.
+  const executing = new Map<string, Deferred.Deferred<void>>();
   // What a payload holds for `input`, with the dependencies' values when there are any.
   const payloadOf = (input: AgUi.RunAgentInput, perRun: Context.Context<DependencyServices<Dependencies>>) => {
     const parts: PayloadParts =
@@ -601,12 +722,40 @@ export const makeWorkflow = <
     for (const tag of dependencies) {
       perRun = Context.add(perRun, tag, context?.[tag.key]);
     }
-    return body(input).pipe(
-      Effect.orDie,
-      // One service per dependency was added above, which TypeScript can't follow through the loop.
-      Effect.provideContext(perRun as Context.Context<DependencyServices<Dependencies>>),
-      Effect.provide(Checkpoint.layerWorkflow),
-    );
+    const execute = (cancelled: Effect.Effect<void>) =>
+      body(input, cancelled).pipe(
+        Effect.orDie,
+        // One service per dependency was added above, which TypeScript can't follow through the loop.
+        Effect.provideContext(perRun as Context.Context<DependencyServices<Dependencies>>),
+        Effect.provide(Checkpoint.layerWorkflow),
+      );
+    return Effect.gen(function* () {
+      const engine = yield* WorkflowEngine.WorkflowEngine;
+      // Read without waiting: a cancel made before this attempt (before start, or while the run was down).
+      if (Option.isSome(yield* engine.deferredResult(cancelRequest))) {
+        return yield* execute(Effect.void);
+      }
+      const key = runKey(input);
+      const signal = yield* Deferred.make<void>();
+      executing.set(key, signal);
+      // A cancel made through another runner value: the engine has it, and only a read finds it.
+      const polled = engine
+        .deferredResult(cancelRequest)
+        .pipe(
+          Effect.repeat({ schedule: Schedule.spaced(pollInterval), until: Option.isSome }),
+          Effect.andThen(Deferred.succeed(signal, undefined)),
+          Effect.andThen(Effect.never),
+        );
+      return yield* Effect.race(execute(Deferred.await(signal)), polled).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (executing.get(key) === signal) {
+              executing.delete(key);
+            }
+          }),
+        ),
+      );
+    });
   });
   return {
     workflow: run,
@@ -621,6 +770,22 @@ export const makeWorkflow = <
     executionId: (input: AgUi.RunAgentInput): Effect.Effect<string, never, DependencyServices<Dependencies>> =>
       Effect.flatMap(Effect.context<DependencyServices<Dependencies>>(), (perRun) =>
         run.executionId(payloadOf(input, perRun)),
+      ),
+    cancel: ({ threadId, runId }: RunIds): Effect.Effect<void, never, WorkflowEngine.WorkflowEngine> =>
+      Effect.flatMap(ids.executionId({ input: { threadId, runId, messages: [] } }), (executionId) =>
+        DurableDeferred.succeed(cancelRequest, {
+          token: DurableDeferred.tokenFromExecutionId(cancelRequest, { workflow: run, executionId }),
+          value: undefined,
+        }).pipe(
+          // Recorded first, so an attempt that starts or replays from here on sees it; then the run this runner
+          // value is executing, if any, at once.
+          Effect.andThen(
+            Effect.suspend(() => {
+              const signal = executing.get(runKey({ threadId, runId }));
+              return signal === undefined ? Effect.void : Effect.asVoid(Deferred.succeed(signal, undefined));
+            }),
+          ),
+        ),
       ),
   };
 };

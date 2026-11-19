@@ -438,6 +438,12 @@ export const fold =
               // AG-UI's interrupt outcome carries no pending calls: the client finds them in the stream.
               return [...unclosed, runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
             }
+            if (event.outcome._tag === "Cancelled") {
+              // AG-UI requires everything closed first. The run ended its step already, so this closes only what
+              // a step left open, as before `RUN_ERROR`. A cancelled `RUN_FINISHED` carries no `result`.
+              const closers = [...levels.keys()].flatMap(closeLevel);
+              return [...closers, ...unclosed, runFinished(input, { type: "cancelled" })];
+            }
             const pendingToolCallIds = event.outcome.pendingToolCalls.map((call) => call.toolCallId);
             return [
               ...unclosed,
@@ -489,6 +495,21 @@ export const fold =
           }
           const opening = start();
           const closers = closeLevel(id);
+          if (event._tag === "Finished" && event.outcome._tag === "Cancelled") {
+            // AG-UI has no cancelled subagent outcome.
+            open.delete(id);
+            closed.add(id);
+            return [
+              ...opening,
+              ...closers,
+              {
+                type: "SUBAGENT_ERROR",
+                subagentRunId: id,
+                message: "The subagent was cancelled with its parent run",
+                code: "Cancelled",
+              },
+            ];
+          }
           if (event._tag === "Failed") {
             open.delete(id);
             closed.add(id);

@@ -42,8 +42,9 @@ export interface Service {
    */
   readonly beginAttempt: (input: AgUi.RunAgentInput, options: AttemptOptions) => Effect.Effect<Attempt, AttemptError>;
   /**
-   * Called by the request-scoped runner when its stream stops before a
-   * terminal event, whether or not `beginAttempt` returned.
+   * Releases whatever the run holds, without reporting an end. Only for the
+   * request-scoped runner's slow path: a cancelled run that did not end within
+   * its time limit and was interrupted. Never fails.
    */
   readonly abandonAttempt: (input: AgUi.RunAgentInput) => Effect.Effect<void>;
 }
@@ -122,8 +123,8 @@ export const client: Service = {
 
 /**
  * Calls `runEnded` and then releases the thread, even if `runEnded` failed. If
- * either fails, a successful or interrupted run ends as failed instead; a run
- * that already failed keeps its own error.
+ * either fails, a successful, interrupted or cancelled run ends as failed
+ * instead; a run that already failed keeps its own error.
  */
 const endRun = (thread: Thread.Thread["Service"], threadId: string, runId: string, event: Terminal) =>
   thread
@@ -149,9 +150,10 @@ const endRun = (thread: Thread.Thread["Service"], threadId: string, runId: strin
  * active run), loads it, takes the client's delta, its `resume` answers and its
  * results for pending frontend calls, and commits them. Each step is
  * committed, and the run's end is reported to the store before the thread is
- * released, so the client's next run finds it free. A run that never claimed
- * the thread, or was itself interrupted, is not reported: an interrupted
- * detached run keeps its claim, and running it again finishes it.
+ * released, so the client's next run finds it free. A cancelled run ends like
+ * any other, with its partial step committed. A run that never claimed the
+ * thread, or was itself interrupted, is not reported: an interrupted detached
+ * or workflow run keeps its claim, and running it again finishes it.
  */
 export const server = (thread: Thread.Thread["Service"]): Service => ({
   [TypeId]: TypeId,
@@ -198,7 +200,7 @@ export const server = (thread: Thread.Thread["Service"]): Service => ({
       .release(input.threadId, input.runId)
       .pipe(
         Effect.catchCause((cause) =>
-          Effect.logError("effect-agent-harness: releasing a cancelled run's thread failed", cause),
+          Effect.logError("effect-agent-harness: releasing an abandoned run's thread failed", cause),
         ),
       ),
 });

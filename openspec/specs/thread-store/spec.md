@@ -41,7 +41,7 @@ Committing entries SHALL append, in the given order, each entry whose id is not 
 - **THEN** loading returns A once, with run id "r1"
 
 ### Requirement: The store is told when a run ends
-After a run that claimed its thread finishes, is interrupted for approval, or fails, the store SHALL be notified once per terminal outcome with the thread id, run id and outcome kind, before the run's claim is released, so a caller can hook compaction or bookkeeping there. Only runs using the server history claim a thread. A run that never claimed the thread SHALL NOT be notified.
+After a run that claimed its thread finishes, is interrupted for approval, is cancelled, or fails, the store SHALL be notified once per terminal outcome with the thread id, run id and outcome kind, before the run's claim is released, so a caller can hook compaction or bookkeeping there. Only runs using the server history claim a thread. A run that never claimed the thread SHALL NOT be notified. A detached or workflow run that stops without a terminal outcome (a crash) SHALL NOT be notified until an attempt ends it.
 
 #### Scenario: Notification after success
 - **WHEN** a run on thread "t1" finishes successfully
@@ -53,7 +53,11 @@ After a run that claimed its thread finishes, is interrupted for approval, or fa
 
 #### Scenario: Cancelled run
 - **WHEN** a request-scoped run is cancelled because its consumer stopped
-- **THEN** the store receives no run-ended notification for that run
+- **THEN** the store receives one run-ended notification for that run with the cancelled outcome
+
+#### Scenario: Crashed detached run
+- **WHEN** a detached run's scope is closed mid-step
+- **THEN** the store receives no run-ended notification until the run is started again and ends
 
 #### Scenario: Run rejected before claiming
 - **WHEN** a run fails with `ThreadBusy` or `RunInputMismatch`

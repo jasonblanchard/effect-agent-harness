@@ -105,6 +105,26 @@ const AgentRoutes = HttpRouter.use((router) =>
       }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
     );
 
+    // POST /threads/:threadId/runs/:runId/cancel stops a detached run: it ends
+    // with `RUN_FINISHED` outcome `cancelled`, and what it streamed so far is
+    // kept. It returns at once; follow the events route to see the end.
+    // Cancelling a run that has ended does nothing. Authenticated like
+    // POST /runs, and a real server would check the thread here too.
+    yield* router.add(
+      "POST",
+      "/threads/:threadId/runs/:runId/cancel",
+      Effect.gen(function* () {
+        yield* authenticate;
+        const run = yield* HttpRouter.schemaPathParams(
+          Schema.Struct({ threadId: Schema.String, runId: Schema.String }),
+        );
+
+        yield* detached.cancel(run);
+
+        return HttpServerResponse.empty({ status: 202 });
+      }).pipe(Effect.catchTag("Unauthorized", unauthorized), Effect.catch(invalidInput)),
+    );
+
     yield* router.add(
       "GET",
       "/threads/:threadId/runs/:runId/events",

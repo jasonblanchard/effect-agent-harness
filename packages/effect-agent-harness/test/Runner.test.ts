@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
 import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
+import type { Response } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
@@ -329,17 +330,32 @@ describe("Runner.makeAttached commits", () => {
     }),
   );
 
-  it.effect("does not report a run cancelled by its consumer", () =>
+  it.effect("records a run cancelled by its consumer: the partial turn, then runEnded, then release", () =>
     Effect.gen(function* () {
       const spy = spyThread();
-      const model = scriptedModel([...weatherTurn]);
-      yield* Runner.makeAttached(weatherAgent)(input("r1", [userMessage("u1", "Weather in Paris?")])).pipe(
-        Stream.takeUntil((event) => event.type === "TOOL_CALL_RESULT"),
-        Stream.runDrain,
+      // The model streams "Hel" and is still generating when the consumer stops.
+      const model = scriptedModel([
+        Stream.concat(
+          Stream.make<ReadonlyArray<Response.StreamPartEncoded>>(
+            { type: "text-start", id: "0" },
+            { type: "text-delta", id: "0", delta: "Hel" },
+          ),
+          Stream.never,
+        ),
+      ]);
+      const events = yield* Runner.makeAttached(weatherAgent)(input("r1", [userMessage("u1", "Hi")])).pipe(
+        Stream.takeUntil((event) => event.type === "TEXT_MESSAGE_CONTENT"),
+        Stream.runCollect,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, spy.layer]),
       );
-      // Not reported, since it has not ended, but the request-scoped runner frees the thread.
-      expect(spy.log).toEqual(["claim r1", "commit r1: u1", "release r1"]);
+      const [started] = Array.from(events).filter((event) => event.type === "TEXT_MESSAGE_START");
+      expect(spy.log).toEqual([
+        "claim r1",
+        "commit r1: u1",
+        `commit r1: ${started?.type === "TEXT_MESSAGE_START" ? started.messageId : "?"}`,
+        "runEnded r1: Cancelled",
+        "release r1",
+      ]);
     }),
   );
 

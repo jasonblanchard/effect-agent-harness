@@ -81,6 +81,9 @@ const ChatQuery = Schema.Struct({
 
 const ResumeHeaders = Schema.Struct({ "last-event-id": Schema.optional(Schema.String) });
 
+/** What TanStack AI's `stop()` posts to `cancelUrl`. */
+const CancelBody = Schema.Struct({ threadId: Schema.String, runId: Schema.String });
+
 /** How long a run's event stream stays open with nothing new. Longer than the slowest model or tool step. */
 const IDLE_TIMEOUT = "2 minutes";
 
@@ -150,8 +153,8 @@ const toUIMessagesWithSubagents = (
 const ChatRoutes = HttpRouter.use((router) =>
   Effect.gen(function* () {
     // A detached run outlives its request and writes to the event log, so a
-    // reloaded page or a second tab can follow it. Nothing cancels one once
-    // it has started, which is why the page has no Stop button.
+    // reloaded page or a second tab can follow it. A disconnect doesn't stop
+    // it; only `detached.cancel` does (the cancel route below).
     const detached = yield* Runner.makeDetached(assistant);
     const log = yield* EventLog.EventLog;
 
@@ -217,6 +220,26 @@ const ChatRoutes = HttpRouter.use((router) =>
         }
 
         return yield* follow(input.threadId, input.runId, lastEventId);
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.succeed(HttpServerResponse.text(`Invalid request: ${error.message}`, { status: 400 })),
+        ),
+      ),
+    );
+
+    // POST /api/chat/cancel: the page's Stop button. TanStack AI's `stop()`
+    // aborts its own stream and posts the run's ids here (`cancelUrl`). The run
+    // ends as cancelled: its log ends with `RUN_FINISHED` outcome `cancelled`,
+    // and the partial reply is committed to the thread, which is then free for
+    // the next message. Cancelling a run that has ended does nothing. A real
+    // route would authorise the thread here, as for the other routes.
+    yield* router.add(
+      "POST",
+      "/api/chat/cancel",
+      Effect.gen(function* () {
+        const run = yield* HttpServerRequest.schemaBodyJson(CancelBody);
+        yield* detached.cancel(run);
+        return HttpServerResponse.empty({ status: 204 });
       }).pipe(
         Effect.catch((error) =>
           Effect.succeed(HttpServerResponse.text(`Invalid request: ${error.message}`, { status: 400 })),

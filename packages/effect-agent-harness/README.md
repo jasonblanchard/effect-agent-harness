@@ -210,11 +210,13 @@ AG-UI events are emitted throughout.
 
 Pick a runner by what should happen when the client goes away:
 
-| Runner                | A client disconnect…              | Requires                                                     |
-| --------------------- | --------------------------------- | ------------------------------------------------------------ |
-| `Runner.makeAttached` | cancels the run (model and tools) | `Checkpoint`, model, tools, and what the per-run layer needs |
-| `Runner.makeDetached` | does nothing; the run continues   | the above + `EventLog`, `Scope`                              |
-| `Runner.makeWorkflow` | does nothing; an engine owns it   | the above (minus `Checkpoint`) + `WorkflowEngine`            |
+| Runner                | A client disconnect…              | Cancelled by                                   | Requires                                                     |
+| --------------------- | --------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
+| `Runner.makeAttached` | cancels the run (model and tools) | the consumer stopping                          | `Checkpoint`, model, tools, and what the per-run layer needs |
+| `Runner.makeDetached` | does nothing; the run continues   | `cancel({ threadId, runId })`, in this process | the above + `EventLog`, `Scope`                              |
+| `Runner.makeWorkflow` | does nothing; an engine owns it   | `cancel({ threadId, runId })`, on any host     | the above (minus `Checkpoint`) + `WorkflowEngine`            |
+
+**Cancelling a run.** A cancelled run stops its model stream or tool handlers and ends in-band: it closes everything it opened and emits `RUN_FINISHED` with outcome `cancelled` (no `result`). What the step produced is kept: the partial assistant text under the message id the client saw, each complete tool call with its real result if its handler finished and a failed "cancelled" result otherwise. Under the server history that is committed, the store is told (`runEnded` with `Cancelled`) and the thread released, so the client's next message is an ordinary run. A running subagent is cancelled with its parent and closes with `SUBAGENT_ERROR` code `Cancelled`. A cancel made while a run was down is honoured at its next step without calling the model. `cancel` returns at once and is idempotent; cancelling a run that has ended does nothing. `makeDetached`'s cancel reaches only runs started through the same runner in this process (it is lost if the process dies), and does nothing, keeping nothing, for a run it hasn't started. `makeWorkflow`'s is held by the engine, so it also reaches a run that hasn't started yet, and one running on another host, within `cancelPollInterval` (1 second by default; a cancel through the runner executing the run is immediate). A disconnected `makeAttached` run is given `cancelTimeout` (30 seconds by default) to end; after that it is interrupted and its thread released. A route for it, such as TanStack AI's `cancelUrl`, takes the ids and calls `cancel`. To keep a side effect from being torn, a handler wraps it in `Effect.uninterruptible`: the run waits for it before ending (for a `makeAttached` run, up to `cancelTimeout`). Without the runners, pass `Agent.run` a `cancelled` effect that completes when the run should stop.
 
 None of them requires a thread store: a run's history is optional, and `History.layerServer` brings its own `Thread`.
 
@@ -343,11 +345,11 @@ The model prompt is the agent's system prompt followed by whatever `Thread.load`
 
 **One run at a time.** A thread has at most one active run, because each run reconciles the client against what it loaded and commits on top of it. The run claims the thread (`Thread.claim`) before loading it, and a run started while another is active ends at once with `RUN_ERROR` code `ThreadBusy`, without touching the thread. The claim is released after the run's last commit and before its `RUN_FINISHED` / `RUN_ERROR` is sent, so a client can start the next run as soon as it sees the last one end. `HttpAgent` already runs one run at a time per agent, so `ThreadBusy` usually means a second tab or a run that is still going in the background.
 
-- A request-scoped run (`makeAttached`) that is cancelled releases the thread.
+- A cancelled run releases the thread, on every runner, after committing its partial step and reporting `runEnded`.
 - A detached or workflow run that crashes keeps it: the thread stays busy until the run is resumed and ends. A durable store should expire a claim after longer than any run takes, so a crashed run that is never resumed doesn't hold its thread for ever.
 - The same run claims again when it resumes, so starting the same run twice at once is not prevented.
 
-**Compaction is up to you.** To summarise a long thread, return a summary entry from `load` in place of the history it covers. `runEnded` is called once per run that claimed the thread, after the last commit and while the run still holds the thread, however the run ended (success, approval interrupt or failure, even one before the model is called), which makes it a natural place to trigger compaction. A run rejected before claiming the thread (a failed per-run layer, `RunInputMismatch`, `ThreadBusy`) is not reported. Nor is a run that was cancelled, such as a request-scoped run whose client disconnected: it hasn't ended, and running it again finishes it.
+**Compaction is up to you.** To summarise a long thread, return a summary entry from `load` in place of the history it covers. `runEnded` is called once per run that claimed the thread, after the last commit and while the run still holds the thread, however the run ended (success, approval interrupt, cancellation or failure, even one before the model is called), which makes it a natural place to trigger compaction. A run rejected before claiming the thread (a failed per-run layer, `RunInputMismatch`, `ThreadBusy`) is not reported. Nor is a detached or workflow run that crashed: it hasn't ended, and running it again finishes it.
 
 `load` is also what each run reconciles the client against, so a compacted thread must keep:
 
