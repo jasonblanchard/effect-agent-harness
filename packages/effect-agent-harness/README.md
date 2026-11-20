@@ -48,7 +48,7 @@ The agent's _behaviour_ is kept separate from _durability_. You define the agent
 
 The same agent runs in a unit test with none of these (in-memory or passthrough layers) and in production with all of them.
 
-> Status: `0.0.1`, built on Effect v4 (`effect@4.0.5`). `effect/ai` and `effect/workflow` are unstable upstream, and so is this API.
+> Status: `0.0.1`, built on Effect v4 (`effect@4.1.4`). `effect/ai` and `effect/workflow` are unstable upstream, and so is this API.
 
 ## Contents
 
@@ -74,9 +74,10 @@ A weather agent served as an AG-UI endpoint, backed by Anthropic:
 ```ts
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, Effect, Layer, Schema } from "effect";
-import { Tool, Toolkit } from "effect/ai";
-import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Agent, AgUi, Checkpoint, Runner, Sse } from "effect-agent-harness";
+import { AgUiServer, Tool, Toolkit } from "effect/ai";
+import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
+import { HttpApi, HttpApiBuilder, HttpApiGroup } from "effect/http-api";
+import { Agent, Checkpoint, Runner } from "effect-agent-harness";
 
 // 1. Tools
 const GetWeather = Tool.make("get-weather", {
@@ -103,21 +104,29 @@ const ModelLayer = AnthropicLanguageModel.layer({ model: "claude-haiku-5-5" }).p
   Layer.provide(FetchHttpClient.layer),
 );
 
-// 4. An AG-UI route. An attached runner: a client disconnect cancels the run.
+// 4. An AG-UI endpoint, from effect/ai. An attached runner: a client disconnect cancels the run.
+class Api extends HttpApi.make("agent").add(HttpApiGroup.make("agent").add(AgUiServer.endpoint("run", "/agent"))) {}
+
 const runAgent = Runner.makeAttached(weather);
 
-const AgentRoute = HttpRouter.add(
-  "POST",
-  "/agent",
-  HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-    // `Sse.response` closes over the handler's context: the body is read after the handler has returned.
-    Effect.flatMap((input) => Sse.response(Sse.encode(runAgent(input)))),
-    Effect.orElseSucceed(() => HttpServerResponse.text("Invalid RunAgentInput", { status: 400 })),
+const AgentHandlers = HttpApiBuilder.group(Api, "agent", (handlers) =>
+  // `AgUiServer.handler` provides the handler's context to the stream: the body is read after it has returned.
+  Effect.succeed(
+    handlers.handle(
+      "run",
+      AgUiServer.handler((input) => runAgent(input)),
+    ),
   ),
-  // The handler's services come from the app layer's output: merge them in rather than hide them.
-).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, Checkpoint.layerNone)));
+);
 
-export const { handler } = HttpRouter.toWebHandler(AgentRoute);
+const Routes = HttpApiBuilder.layer(Api).pipe(
+  Layer.provide(AgentHandlers),
+  // The run's services come from the app layer's output: merge them in rather than hide them.
+  Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, Checkpoint.layerNone)),
+  Layer.provide(HttpServer.layerServices),
+);
+
+export const { handler } = HttpRouter.toWebHandler(Routes);
 ```
 
 On the client:
@@ -220,7 +229,7 @@ Pick a runner by what should happen when the client goes away:
 
 None of them requires a thread store: a run's history is optional, and `History.layerServer` brings its own `Thread`.
 
-`Runner.makeAttached` returns a plain function: nothing is captured, and each stream requires the agent's services. A route calls it inside its handler and returns `Sse.response(Sse.encode(stream))`. Because the body is read after the handler has returned, `Sse.response` closes over the handler's context, so whatever the stream still needs becomes a requirement of the handler. It also sets `text/event-stream` and `cache-control: no-cache`; `headers` and `status` are merged over them. With `effect/http`, keep those services in the app layer's output (`Layer.provideMerge`): the web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument. For the same reason, a per-request service the route forgets to provide, such as the principal, is not reported at the route but where the web handler is built or called. On another transport, close over the context yourself (`Stream.provideContext(yield* Effect.context())`) and use `Sse.encode` and `Sse.contentType`.
+`Runner.makeAttached` returns a plain function: nothing is captured, and each stream requires the agent's services. The library has no HTTP code of its own: serve the stream with `effect/ai`'s `AgUiServer.endpoint` and `AgUiServer.handler((input) => runAgent(input))`. The endpoint decodes the body as AG-UI's `RunAgentInput` (a body that doesn't decode is a 400 before any stream opens), sends each event as an SSE `data:` frame with `cache-control: no-cache` and a keepalive comment every 15 seconds, and the handler provides its context to the stream, since the body is read after the handler has returned. Whatever the stream still needs becomes a requirement of the handler: keep those services in the app layer's output (`Layer.provideMerge`). The web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument. For the same reason, a per-request service the route forgets to provide, such as the principal, is not reported at the route but where the web handler is built or called. On another transport, close over the context yourself (`Stream.provideContext(yield* Effect.context())`) and encode the events as you need.
 
 Guarantees for every runner:
 
@@ -431,24 +440,40 @@ const CurrentUserLayer = Layer.effect(CurrentUser)(
   }),
 );
 
+// An HttpApi middleware verifies the bearer token (signature, expiry, audience) and provides
+// the principal as AuthContext; a request without a valid one is a 401 before its handler runs.
+class Authentication extends HttpApiMiddleware.Service<Authentication, { provides: AuthContext; requires: never }>()(
+  "app/Authentication",
+  { security: { bearer: HttpApiSecurity.bearer }, error: Unauthorized },
+) {}
+
+class Api extends HttpApi.make("agent").add(
+  HttpApiGroup.make("agent").add(AgUiServer.endpoint("run", "/agent")).middleware(Authentication),
+) {}
+
 const runAgent = Runner.makeAttached(agent, { layer: CurrentUserLayer });
 
-const AgentRoute = HttpRouter.add(
-  "POST",
-  "/agent",
-  Effect.gen(function* () {
-    const principal = yield* authenticate; // verify the bearer token: signature, expiry, audience
-    const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-    yield* threadOwners.authorize(input.threadId, principal); // see below
-    // It closes over the handler's context, which holds UserDirectory and the rest.
-    return yield* Sse.response(Sse.encode(runAgent(input).pipe(Stream.provideService(AuthContext, principal))));
-  }).pipe(/* Unauthorized → 401, Forbidden → 403, decode errors → 400 */),
+const AgentHandlers = HttpApiBuilder.group(Api, "agent", (handlers) =>
+  Effect.succeed(
+    handlers.handle(
+      "run",
+      // The handler's context holds AuthContext from the middleware, and UserDirectory and the rest.
+      AgUiServer.handler((input) =>
+        Stream.unwrap(
+          Effect.as(
+            threadOwners.authorize(input.threadId), // see below
+            runAgent(input),
+          ),
+        ),
+      ),
+    ),
+  ),
 );
 ```
 
 How it fits together:
 
-- **The principal is a requirement of each run.** `Runner.makeAttached` captures nothing: `AuthContext` is on the stream like every other service, so a run whose `AuthContext` isn't provided fails to typecheck. If auth middleware already provided it to the route, the handler's context holds it, and closing over that context (as `sse` does) provides it. A detached or workflow runner captures its services when it's built, so it names the per-run ones instead, `dependencies: [AuthContext]`, and leaves them on `start`. An agent without per-run services adds no requirement.
+- **The principal is a requirement of each run.** `Runner.makeAttached` captures nothing: `AuthContext` is on the stream like every other service, so a run whose `AuthContext` isn't provided fails to typecheck. Auth middleware provides it to the handler's context, and `AgUiServer.handler` provides that context to the stream. Without middleware, provide it on the stream yourself (`Stream.provideService(AuthContext, principal)`). A detached or workflow runner captures its services when it's built, so it names the per-run ones instead, `dependencies: [AuthContext]`, and leaves them on `start`. An agent without per-run services adds no requirement.
 - **The layer is ordinary Effect.** It reads `AuthContext` like any service, and services that depend on each other compose as layers do (a tenant from the user, say). What it needs besides, such as `UserDirectory`, stays on the stream too, provided the same way as the stores. What it provides is not required from outside.
 - **It's built for every run attempt, before the thread is claimed.** A run that fails to build it ends with `RUN_ERROR` (code: the error's tag), claims nothing and isn't reported to the store. Its finalizers run when the attempt ends. It's not memoised: a resumed run builds it again, so steps not yet run see the new services. A computed system prompt is memoised (as `system`), though, so it keeps the first attempt's text.
 - **You can provide the layer yourself with `makeAttached`.** Leave `layer` out and provide it on each run's stream: `runAgent(input).pipe(Stream.provide(CurrentUserLayer), Stream.provideService(AuthContext, principal))`. It's still built per run, but a failure to build it fails the stream (a broken response) instead of ending the run with `RUN_ERROR`. Detached and workflow runs need `layer`: a detached run's services must outlive the call to `start`, and a workflow rebuilds them from its persisted dependencies on every replay.
@@ -594,7 +619,7 @@ Every model call and every tool call in a run goes through `Checkpoint.memo`, un
 
 A step that _failed_ is stored too, so re-running a failed run fails again the same way; retry with a new `runId`. Only work that was interrupted (a crash, a deploy, a cancelled fiber) is executed again.
 
-Checkpoints are keyed by thread id and run id, so the same `runId` on another thread is a different run. A run id names one input: the input is memoised (as `input`), and running the same `runId` on the same thread with a different input fails with `RunInputMismatch` before anything is committed or replayed. The caller's `context` is not part of the input, so a different context isn't detected: pass the one the run was first started with.
+Checkpoints are keyed by thread id and run id, so the same `runId` on another thread is a different run. A run id names one input: the input is memoised (as `input`), and running the same `runId` on the same thread with a different input fails with `RunInputMismatch` before anything is committed or replayed. The input is the whole of what AG-UI's schema decodes, including fields the run ignores, such as `state` and `context`: a retry that changes them is a different input. The caller's `context` is not part of the input, so a different context isn't detected: pass the one the run was first started with.
 
 The projected thread is memoised as well (as `prompt`), and so is a computed system prompt (as `system`). A resumed run therefore sees the same history and the same system prompt as the attempt that crashed, even if the thread was compacted or the system prompt's services changed in between.
 
@@ -603,23 +628,17 @@ The projected thread is memoised as well (as `prompt`), and so is a computed sys
 `Runner.makeDetached` decouples a run from the request that started it. `start` forks the run into the scope you give it and returns at once. The run's events go to the `EventLog`.
 
 ```ts
-const Routes = HttpRouter.use((router) =>
-  Effect.gen(function* () {
-    // HttpRouter.use provides the layer's Scope; runs live as long as the router.
-    // `principal` comes from authenticating the request, as in Authentication and run context.
+// An endpoint in the group of Authentication and run context, answering 202 at once.
+//   HttpApiEndpoint.post("start", "/runs", { payload: AgUiSchema.RunAgentInput, success: HttpApiSchema.Empty(202) })
+
+const AgentHandlers = HttpApiBuilder.group(
+  Api,
+  "agent",
+  Effect.fn(function* (handlers) {
+    // The group's layer provides the Scope; runs live as long as the server.
     const runner = yield* Runner.makeDetached(agent, { dependencies: [AuthContext], layer: CurrentUserLayer });
-    yield* router.add(
-      "POST",
-      "/runs",
-      HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput).pipe(
-        Effect.flatMap((input) =>
-          Effect.as(
-            runner.start(input).pipe(Effect.provideService(AuthContext, principal)),
-            HttpServerResponse.empty({ status: 202 }),
-          ),
-        ),
-      ),
-    );
+    // The middleware provides AuthContext to the handler, and `start` reads it from there.
+    return handlers.handle("start", ({ payload }) => runner.start(payload));
   }),
 );
 ```
@@ -661,31 +680,37 @@ yield * start(input).pipe(Effect.provideService(AuthContext, principal));
 
 ## Reconnecting to a run
 
-The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` checks `after` and then returns a stream of the stored events after it, then live events, which completes after the terminal event (at once if `after` is already at or past it). A cursor the run's log never issued, such as a malformed `Last-Event-ID`, fails `subscribe` with `InvalidCursor` before any response starts, so the route can answer 400 instead of streaming nothing. `Sse.encodeStored` turns cursors into SSE `id`s, so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
+The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` checks `after` and then returns a stream of the stored events after it, then live events, which completes after the terminal event (at once if `after` is already at or past it). A cursor the run's log never issued, such as a malformed `Last-Event-ID`, fails `subscribe` with `InvalidCursor` before any response starts, so the route can answer 400 instead of streaming nothing. Serve each stored event as an SSE frame whose `id` is its cursor (with `HttpApiSchema.StreamSse({ events })`), so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
 
 ```ts
-yield *
-  router.add(
-    "GET",
-    "/threads/:threadId/runs/:runId/events",
-    Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
-      const { threadId, runId } = yield* HttpRouter.schemaPathParams(
-        Schema.Struct({ threadId: Schema.String, runId: Schema.String }),
-      );
-      const principal = yield* authenticate;
-      yield* threadOwners.authorize(threadId, principal); // as for POST /agent
-      const headers = yield* HttpServerRequest.schemaHeaders(
-        Schema.Struct({ "last-event-id": Schema.optional(Schema.String) }),
-      );
-      const events = yield* log.subscribe(threadId, runId, headers["last-event-id"]);
-      return yield* Sse.response(Sse.encodeStored(events));
-    }).pipe(
-      Effect.catchTag("InvalidCursor", (error) =>
-        Effect.succeed(HttpServerResponse.text(error.message, { status: 400 })),
-      ),
-    ),
-  );
+// An event from the log as an SSE frame: its cursor is the frame's `id`.
+const StoredEvent = Schema.Struct({
+  id: Schema.String,
+  event: Schema.String,
+  data: Schema.fromJsonString(Schema.toCodecJson(AgUiSchema.Event)),
+});
+
+// In the group of Authentication and run context:
+//   HttpApiEndpoint.get("events", "/threads/:threadId/runs/:runId/events", {
+//     params: { threadId: Schema.String, runId: Schema.String },
+//     headers: { "last-event-id": Schema.optional(Schema.String) },
+//     success: HttpApiSchema.StreamSse({ events: StoredEvent }),
+//     error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+//   })
+
+handlers.handle("events", ({ params, headers }) =>
+  Effect.gen(function* () {
+    yield* threadOwners.authorize(params.threadId); // as for POST /agent
+    const log = yield* EventLog.EventLog;
+    const events = yield* log
+      .subscribe(params.threadId, params.runId, headers["last-event-id"])
+      .pipe(Effect.catchTag("EventLogError", Effect.die));
+    return events.pipe(
+      Stream.map(({ cursor, event }) => ({ id: cursor, event: "message", data: event })),
+      Stream.orDie,
+    );
+  }),
+);
 ```
 
 `EventLog.layerMemory` keeps logs in process memory.
@@ -851,12 +876,12 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 ## Module reference
 
-Everything is exported from `"effect-agent-harness"` as namespaces.
+Everything is exported from `"effect-agent-harness"` as namespaces. The AG-UI protocol comes from `effect/ai`: `AgUiSchema` (events, messages, and the `RunAgentInput` every runner takes) and `AgUiServer` (the HTTP endpoint).
 
 | Module       | Main exports                                                                                                                                                                                                                                                                                                     |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `RunAgentInput`, `ResumeEntry`, `FrontendTool`, `ApprovalResponse`, `decodeRunAgentInput`, `Event`, `isTerminal`, `fold`, `closeOpen`, `approvalInterrupt`, event constructors                                                                                                                                   |
+| `AgUi`       | `ApprovalResponse`, `approvalInterrupt`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors                                                                                                                                                                                                          |
 | `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                 |
 | `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                        |
 | `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                               |
@@ -864,4 +889,3 @@ Everything is exported from `"effect-agent-harness"` as namespaces.
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                            |
 | `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                 |
 | `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                |
-| `Sse`        | `encode`, `encodeEvent`, `encodeStored`, `contentType`, `response`                                                                                                                                                                                                                                               |

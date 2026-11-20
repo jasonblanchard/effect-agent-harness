@@ -1,61 +1,14 @@
-import { PROTOCOL_VERSION } from "./AgUiSchema.ts";
-import type {
-  Interrupt,
-  ReasoningEndEvent,
-  ReasoningMessageContentEvent,
-  ReasoningMessageEndEvent,
-  ReasoningMessageStartEvent,
-  ReasoningStartEvent,
-  RunErrorEvent,
-  RunFinishedEvent,
-  RunFinishedOutcome,
-  RunStartedEvent,
-  StepFinishedEvent,
-  StepStartedEvent,
-  SubagentErrorEvent,
-  SubagentFinishedEvent,
-  SubagentStartedEvent,
-  TextMessageContentEvent,
-  TextMessageEndEvent,
-  TextMessageStartEvent,
-  ToolCallArgsEvent,
-  ToolCallEndEvent,
-  ToolCallResultEvent,
-  ToolCallStartEvent,
-} from "./AgUiSchema.ts";
-import { Schema, Stream } from "effect";
+import { Array as Arr, Schema, Stream } from "effect";
+import { AgUiSchema } from "effect/ai";
 import type { Response, Tool } from "effect/ai";
 import * as Agent from "./Agent.ts";
 
 // -----------------------------------------------------------------------------
-// Input
+// Approvals
 //
-// Only the subset of `RunAgentInput` the agent reads is decoded. Unknown fields
-// are stripped and unknown message roles pass through as plain strings so the
-// converter can ignore them.
+// The run input itself is `effect/ai`'s `AgUiSchema.RunAgentInput`. What this
+// library adds is the contract for answering a tool approval interrupt.
 // -----------------------------------------------------------------------------
-
-export const ToolCall = Schema.Struct({
-  id: Schema.String,
-  function: Schema.Struct({
-    name: Schema.String,
-    arguments: Schema.String,
-  }),
-});
-export type ToolCall = typeof ToolCall.Type;
-
-export const Message = Schema.Struct({
-  id: Schema.String,
-  role: Schema.String,
-  content: Schema.optional(Schema.Unknown),
-  toolCalls: Schema.optional(Schema.Array(ToolCall)),
-  toolCallId: Schema.optional(Schema.String),
-  /** Set on a `tool` message whose tool call failed. */
-  error: Schema.optional(Schema.String),
-  /** The subagent that produced the message; absent for the agent's own. */
-  subagentRunId: Schema.optional(Schema.String),
-});
-export type Message = typeof Message.Type;
 
 /**
  * The payload of a `resolved` answer to a tool approval. Every approval
@@ -84,7 +37,7 @@ export const approvalInterrupt = (approval: {
   readonly toolCallId: string;
   readonly toolName: string;
   readonly subagentRunId?: string | undefined;
-}): Interrupt => ({
+}): AgUiSchema.Interrupt => ({
   id: approval.approvalId,
   reason: "tool-approval",
   toolCallId: approval.toolCallId,
@@ -93,84 +46,49 @@ export const approvalInterrupt = (approval: {
   ...(approval.subagentRunId === undefined ? {} : { subagentRunId: approval.subagentRunId }),
 });
 
-/**
- * An answer to an interrupt of the previous run. For a tool approval, the call
- * is approved only when `status` is `"resolved"` and `payload` is an
- * {@link ApprovalResponse} with `approved: true`; anything else denies it.
- */
-export const ResumeEntry = Schema.Struct({
-  interruptId: Schema.String,
-  status: Schema.Literals(["resolved", "cancelled"]),
-  payload: Schema.optional(Schema.Unknown),
-});
-export type ResumeEntry = typeof ResumeEntry.Type;
-
-/**
- * A frontend tool the client advertises: the model may call it, and the
- * client runs it and answers in the next run's `messages`. Set by the client,
- * so untrusted: its description and schema reach the model as sent.
- */
-export const FrontendTool = Schema.Struct({
-  name: Schema.String,
-  description: Schema.optional(Schema.String),
-  /** A JSON Schema for the call's arguments, passed through unchecked. */
-  parameters: Schema.Unknown,
-});
-export type FrontendTool = typeof FrontendTool.Type;
-
-export const RunAgentInput = Schema.Struct({
-  threadId: Schema.String,
-  runId: Schema.String,
-  messages: Schema.Array(Message),
-  resume: Schema.optional(Schema.Array(ResumeEntry)),
-  tools: Schema.optional(Schema.Array(FrontendTool)),
-  /** Passed through unchecked as the run's `props`. Set by the client, so untrusted. */
-  forwardedProps: Schema.optional(Schema.Unknown),
-});
-export type RunAgentInput = typeof RunAgentInput.Type;
-
-export const decodeRunAgentInput = Schema.decodeUnknownEffect(RunAgentInput);
-
 // -----------------------------------------------------------------------------
 // Events
 // -----------------------------------------------------------------------------
 
 export type Event =
-  | RunStartedEvent
-  | RunFinishedEvent
-  | RunErrorEvent
-  | StepStartedEvent
-  | StepFinishedEvent
-  | TextMessageStartEvent
-  | TextMessageContentEvent
-  | TextMessageEndEvent
-  | ReasoningStartEvent
-  | ReasoningMessageStartEvent
-  | ReasoningMessageContentEvent
-  | ReasoningMessageEndEvent
-  | ReasoningEndEvent
-  | ToolCallStartEvent
-  | ToolCallArgsEvent
-  | ToolCallEndEvent
-  | ToolCallResultEvent
-  | SubagentStartedEvent
-  | SubagentFinishedEvent
-  | SubagentErrorEvent;
+  | AgUiSchema.RunStartedEvent
+  | AgUiSchema.RunFinishedEvent
+  | AgUiSchema.RunErrorEvent
+  | AgUiSchema.StepStartedEvent
+  | AgUiSchema.StepFinishedEvent
+  | AgUiSchema.TextMessageStartEvent
+  | AgUiSchema.TextMessageContentEvent
+  | AgUiSchema.TextMessageEndEvent
+  | AgUiSchema.ReasoningStartEvent
+  | AgUiSchema.ReasoningMessageStartEvent
+  | AgUiSchema.ReasoningMessageContentEvent
+  | AgUiSchema.ReasoningMessageEndEvent
+  | AgUiSchema.ReasoningEndEvent
+  | AgUiSchema.ToolCallStartEvent
+  | AgUiSchema.ToolCallArgsEvent
+  | AgUiSchema.ToolCallEndEvent
+  | AgUiSchema.ToolCallResultEvent
+  | AgUiSchema.SubagentStartedEvent
+  | AgUiSchema.SubagentFinishedEvent
+  | AgUiSchema.SubagentErrorEvent;
 
 /** Whether the event ends a run (`RUN_FINISHED` or `RUN_ERROR`). */
 export const isTerminal = (event: Event): boolean => event.type === "RUN_FINISHED" || event.type === "RUN_ERROR";
 
-export const runStarted = (input: { readonly threadId: string; readonly runId: string }): RunStartedEvent => ({
+export const runStarted = (input: {
+  readonly threadId: string;
+  readonly runId: string;
+}): AgUiSchema.RunStartedEvent => ({
   type: "RUN_STARTED",
   threadId: input.threadId,
   runId: input.runId,
-  protocolVersion: PROTOCOL_VERSION,
+  protocolVersion: AgUiSchema.protocolVersion,
 });
 
 export const runFinished = (
   input: { readonly threadId: string; readonly runId: string },
-  outcome: RunFinishedOutcome = { type: "success" },
-): RunFinishedEvent => ({
+  outcome: AgUiSchema.RunFinishedOutcome = { type: "success" },
+): AgUiSchema.RunFinishedEvent => ({
   type: "RUN_FINISHED",
   threadId: input.threadId,
   runId: input.runId,
@@ -180,62 +98,62 @@ export const runFinished = (
 /** `RUN_FINISHED` with the `interrupt` outcome: the run waits for the client to answer `interrupts`. */
 export const runInterrupted = (
   input: { readonly threadId: string; readonly runId: string },
-  interrupts: ReadonlyArray<Interrupt>,
-): RunFinishedEvent => runFinished(input, { type: "interrupt", interrupts: [...interrupts] });
+  interrupts: Arr.NonEmptyReadonlyArray<AgUiSchema.Interrupt>,
+): AgUiSchema.RunFinishedEvent => runFinished(input, { type: "interrupt", interrupts: [...interrupts] });
 
-export const runError = (message: string, code?: string): RunErrorEvent =>
+export const runError = (message: string, code?: string): AgUiSchema.RunErrorEvent =>
   code === undefined ? { type: "RUN_ERROR", message } : { type: "RUN_ERROR", message, code };
 
-export const stepStarted = (stepName: string): StepStartedEvent => ({
+export const stepStarted = (stepName: string): AgUiSchema.StepStartedEvent => ({
   type: "STEP_STARTED",
   stepName,
 });
 
-export const stepFinished = (stepName: string): StepFinishedEvent => ({
+export const stepFinished = (stepName: string): AgUiSchema.StepFinishedEvent => ({
   type: "STEP_FINISHED",
   stepName,
 });
 
-export const textMessageStart = (messageId: string): TextMessageStartEvent => ({
+export const textMessageStart = (messageId: string): AgUiSchema.TextMessageStartEvent => ({
   type: "TEXT_MESSAGE_START",
   messageId,
   role: "assistant",
 });
 
-export const textMessageContent = (messageId: string, delta: string): TextMessageContentEvent => ({
+export const textMessageContent = (messageId: string, delta: string): AgUiSchema.TextMessageContentEvent => ({
   type: "TEXT_MESSAGE_CONTENT",
   messageId,
   delta,
 });
 
-export const textMessageEnd = (messageId: string): TextMessageEndEvent => ({
+export const textMessageEnd = (messageId: string): AgUiSchema.TextMessageEndEvent => ({
   type: "TEXT_MESSAGE_END",
   messageId,
 });
 
-export const reasoningStart = (messageId: string): ReasoningStartEvent => ({
+export const reasoningStart = (messageId: string): AgUiSchema.ReasoningStartEvent => ({
   type: "REASONING_START",
   messageId,
 });
 
-export const reasoningMessageStart = (messageId: string): ReasoningMessageStartEvent => ({
+export const reasoningMessageStart = (messageId: string): AgUiSchema.ReasoningMessageStartEvent => ({
   type: "REASONING_MESSAGE_START",
   messageId,
   role: "reasoning",
 });
 
-export const reasoningMessageContent = (messageId: string, delta: string): ReasoningMessageContentEvent => ({
+export const reasoningMessageContent = (messageId: string, delta: string): AgUiSchema.ReasoningMessageContentEvent => ({
   type: "REASONING_MESSAGE_CONTENT",
   messageId,
   delta,
 });
 
-export const reasoningMessageEnd = (messageId: string): ReasoningMessageEndEvent => ({
+export const reasoningMessageEnd = (messageId: string): AgUiSchema.ReasoningMessageEndEvent => ({
   type: "REASONING_MESSAGE_END",
   messageId,
 });
 
-export const reasoningEnd = (messageId: string): ReasoningEndEvent => ({
+export const reasoningEnd = (messageId: string): AgUiSchema.ReasoningEndEvent => ({
   type: "REASONING_END",
   messageId,
 });
@@ -244,25 +162,29 @@ export const toolCallStart = (
   toolCallId: string,
   toolCallName: string,
   parentMessageId: string,
-): ToolCallStartEvent => ({
+): AgUiSchema.ToolCallStartEvent => ({
   type: "TOOL_CALL_START",
   toolCallId,
   toolCallName,
   parentMessageId,
 });
 
-export const toolCallArgs = (toolCallId: string, delta: string): ToolCallArgsEvent => ({
+export const toolCallArgs = (toolCallId: string, delta: string): AgUiSchema.ToolCallArgsEvent => ({
   type: "TOOL_CALL_ARGS",
   toolCallId,
   delta,
 });
 
-export const toolCallEnd = (toolCallId: string): ToolCallEndEvent => ({
+export const toolCallEnd = (toolCallId: string): AgUiSchema.ToolCallEndEvent => ({
   type: "TOOL_CALL_END",
   toolCallId,
 });
 
-export const toolCallResult = (messageId: string, toolCallId: string, content: string): ToolCallResultEvent => ({
+export const toolCallResult = (
+  messageId: string,
+  toolCallId: string,
+  content: string,
+): AgUiSchema.ToolCallResultEvent => ({
   type: "TOOL_CALL_RESULT",
   messageId,
   toolCallId,
@@ -434,9 +356,12 @@ export const fold =
             // Every subagent closes before the run does; one still open never got its parent's result.
             const unclosed = [...open].map((id) => subagentFinished(id, undefined));
             open.clear();
-            if (event.outcome._tag === "Interrupted") {
+            const interrupts =
+              event.outcome._tag === "Interrupted" ? event.outcome.approvals.map(approvalInterrupt) : [];
+            // An interrupted run always waits on an approval, and AG-UI's interrupt outcome needs at least one.
+            if (Arr.isReadonlyArrayNonEmpty(interrupts)) {
               // AG-UI's interrupt outcome carries no pending calls: the client finds them in the stream.
-              return [...unclosed, runInterrupted(input, event.outcome.approvals.map(approvalInterrupt))];
+              return [...unclosed, runInterrupted(input, interrupts)];
             }
             if (event.outcome._tag === "Cancelled") {
               // AG-UI requires everything closed first. The run ended its step already, so this closes only what
@@ -566,7 +491,7 @@ const stepName = (step: number) => `step-${step}`;
 const attribute = (event: Event, subagentRunId: string | undefined): Event =>
   subagentRunId === undefined ? event : ({ ...event, subagentRunId } as Event);
 
-const subagentFinished = (subagentRunId: string, result: unknown): SubagentFinishedEvent => ({
+const subagentFinished = (subagentRunId: string, result: unknown): AgUiSchema.SubagentFinishedEvent => ({
   type: "SUBAGENT_FINISHED",
   subagentRunId,
   // AG-UI's `result` is any JSON value except null.

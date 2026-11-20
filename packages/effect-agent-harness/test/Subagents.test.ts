@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Exit, Layer, Schema, Scope, Stream } from "effect";
 import { expectTypeOf } from "vitest";
 import { Prompt } from "effect/ai";
-import type { LanguageModel, Response } from "effect/ai";
+import type { AgUiSchema, LanguageModel, Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -479,7 +479,7 @@ describe("suspended subagents", () => {
   const say = (words: string): Step => [...text("0", words), finish("stop")];
 
   const emailerId = Agent.subagentIdFor("c1");
-  const approve = (...toolCallIds: ReadonlyArray<string>): AgUi.RunAgentInput["resume"] =>
+  const approve = (...toolCallIds: ReadonlyArray<string>): AgUiSchema.RunAgentInput["resume"] =>
     toolCallIds.map((id) => ({
       interruptId: Agent.approvalIdFor(id),
       status: "resolved" as const,
@@ -493,14 +493,14 @@ describe("suspended subagents", () => {
   const twoRuns = (options: {
     readonly agent: Agent.Any;
     readonly steps: ReadonlyArray<Step>;
-    readonly resume?: AgUi.RunAgentInput["resume"];
-    readonly messages?: (restored: ReadonlyArray<AgUi.Message>) => ReadonlyArray<AgUi.Message>;
+    readonly resume?: AgUiSchema.RunAgentInput["resume"];
+    readonly messages?: (restored: ReadonlyArray<AgUiSchema.Message>) => ReadonlyArray<AgUiSchema.Message>;
     readonly history?: "server" | "client";
   }) =>
     Effect.gen(function* () {
       const model = scriptedModel(options.steps);
       const handlers = countingApprovalLayer();
-      const run = (input: AgUi.RunAgentInput) =>
+      const run = (input: AgUiSchema.RunAgentInput) =>
         Effect.gen(function* () {
           const events = Array.from(yield* Stream.runCollect(Runner.makeAttached(options.agent as typeof boss)(input)));
           yield* Effect.promise(() => verify(events));
@@ -508,13 +508,17 @@ describe("suspended subagents", () => {
         });
       return yield* Effect.gen(function* () {
         const first = yield* run({
+          tools: [],
+          context: [],
           threadId: "t1",
           runId: "r1",
           messages: [{ id: "u1", role: "user", content: "Email Ada" }],
         });
         const restored = yield* History.restore("t1");
-        const clientMessages = (options.messages ?? ((m) => m))(restored.messages as ReadonlyArray<AgUi.Message>);
+        const clientMessages = (options.messages ?? ((m) => m))(restored.messages as ReadonlyArray<AgUiSchema.Message>);
         const second = yield* run({
+          tools: [],
+          context: [],
           threadId: "t1",
           runId: "r2",
           messages: clientMessages,
@@ -716,7 +720,7 @@ describe("suspended subagents", () => {
    * results, tagged and carrying the card in `metadata.tanstack.subagent`, and an empty placeholder message
    * (`subagent:` + the child's id) for a child with no messages of its own.
    */
-  const asTanStack = (restored: ReadonlyArray<AgUi.Message>): ReadonlyArray<AgUi.Message> => {
+  const asTanStack = (restored: ReadonlyArray<AgUiSchema.Message>): ReadonlyArray<AgUiSchema.Message> => {
     const card = { tanstack: { subagent: { name: "emailer", status: "suspended" } } };
     const own = restored.filter((message) => message.subagentRunId === undefined);
     const children = restored.flatMap((message) =>
@@ -822,7 +826,13 @@ describe("History.restore with subagents", () => {
       const model = scriptedModel(delegation);
       const { events, restored, rejoined } = yield* Effect.gen(function* () {
         const [events] = yield* runAgUi(parent, [
-          { threadId: "t1", runId: "r1", messages: [{ id: "u1", role: "user", content: "How warm is Paris?" }] },
+          {
+            tools: [],
+            context: [],
+            threadId: "t1",
+            runId: "r1",
+            messages: [{ id: "u1", role: "user", content: "How warm is Paris?" }],
+          },
         ]);
         const thread = yield* Thread.Thread;
         return {
@@ -861,7 +871,13 @@ describe("AG-UI events of subagents", () => {
     Effect.gen(function* () {
       const model = scriptedModel(steps);
       const [events] = yield* runAgUi(agent as typeof parent, [
-        { threadId: "t1", runId: "r1", messages: [{ id: "u1", role: "user", content: "How warm is Paris?" }] },
+        {
+          tools: [],
+          context: [],
+          threadId: "t1",
+          runId: "r1",
+          messages: [{ id: "u1", role: "user", content: "How warm is Paris?" }],
+        },
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
       return events!;
     });
@@ -1008,6 +1024,8 @@ describe("AG-UI events of subagents", () => {
             Effect.provideService(Scope.Scope, scope),
           );
           yield* runner.start({
+            tools: [],
+            context: [],
             threadId: "t1",
             runId: "r1",
             messages: [{ id: "u1", role: "user", content: "How warm is Paris?" }],
@@ -1106,6 +1124,8 @@ describe("AG-UI events of subagents", () => {
               Effect.provideService(Scope.Scope, scope),
             );
             yield* runner.start({
+              tools: [],
+              context: [],
               threadId: "t1",
               runId: "r1",
               messages: [{ id: "u1", role: "user", content: "Rome and Paris?" }],
@@ -1156,6 +1176,8 @@ describe("AG-UI events of subagents", () => {
             Effect.provideService(Scope.Scope, scope),
           );
           yield* runner.start({
+            tools: [],
+            context: [],
             threadId: "t1",
             runId: "r1",
             messages: [{ id: "u1", role: "user", content: "Paris and Rome?" }],

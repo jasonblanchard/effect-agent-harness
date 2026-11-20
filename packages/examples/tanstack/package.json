@@ -12,7 +12,7 @@
     "format:check": "oxfmt -c ../../../.oxfmtrc.json --check"
   },
   "dependencies": {
-    "@effect/ai-anthropic": "4.0.5",
+    "@effect/ai-anthropic": "4.1.4",
     "@tanstack/ai": "^1.7.0",
     "@tanstack/ai-react": "^1.1.0",
     "@tanstack/react-router": "^1.170.46",

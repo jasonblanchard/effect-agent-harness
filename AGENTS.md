@@ -2,7 +2,7 @@
 
 Effect-based AG-UI agent library. pnpm monorepo:
 
-- `packages/effect-agent-harness` — the library (`Agent`, `AgUi`, `AgUiSchema`, `Messages`, `History`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Sse` modules). Its only runtime dependency is `effect` (a peer dependency); `AgUiSchema` is generated from the AG-UI JSON Schema. See its `AGENTS.md`.
+- `packages/effect-agent-harness` — the library (`Agent`, `AgUi`, `Messages`, `History`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Telemetry` modules). Its only runtime dependency is `effect` (a peer dependency). The AG-UI protocol schemas and the HTTP endpoint come from `effect/ai` (`AgUiSchema`, `AgUiServer`); the library has no protocol schema or HTTP code of its own. See its `AGENTS.md`.
 - `packages/examples/ag-ui` — a runnable example wiring the library to Anthropic. See its `AGENTS.md`.
 - `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effect-agent-harness backend. See its `AGENTS.md`.
 - `openspec/` — spec-driven change proposals (see "Planning changes" below).
@@ -30,12 +30,13 @@ To target one package, filter by name: `pnpm --filter effect-agent-harness test`
 - **Versions are pinned on purpose.** `typescript` (catalog, `7.0.2`), `@effect/tsgo`, `oxlint` and `oxlint-tsgolint` must be versions that `@effect/tsgo` supports. The `prepare` script runs `effect-tsgo patch`, and the patch refuses unsupported versions. Before bumping any of them, check the "Supported Package Versions" table in the `@effect/tsgo` README.
 - **The Effect language service plugin has `diagnostics: false`** in every tsconfig, so Effect diagnostics come only from Oxlint. Lint output is where to look for them, not `tsc`.
 - **`effecttsgo/unstable-api-usage` is off** (`.oxlintrc.json`). `effect/ai` and `effect/http` are unstable by design and this project is built on them.
+- **`effecttsgo/experimental-api-usage` is off** too. The AG-UI protocol schemas and HTTP binding come from `effect/ai`'s `AgUiSchema` and `AgUiServer`, which Effect marks `@stability experimental`. The exact `effect` pin is what protects the repo from changes there.
 - **Package scripts pass the root config explicitly** (`oxlint -c ../../.oxlintrc.json`, `oxfmt -c ../../.oxfmtrc.json`), because neither tool looks in parent directories for its config. A new package must do the same, using the right relative depth.
 - **Formatting:** oxfmt, 120 columns, double quotes, semicolons. Don't hand-format. Run `pnpm format`.
 
 ## Effect conventions
 
-- Effect v4 (`effect@4.0.5`). The authoritative docs are the installed package's own guide, `node_modules/.pnpm/effect@4.0.5/node_modules/effect/CLAUDE.md`, plus its `ai-docs/`. Prefer them over memory and over web docs written for Effect v3.
+- Effect v4 (`effect@4.1.4`). The authoritative docs are the installed package's own guide, `node_modules/.pnpm/effect@4.1.4/node_modules/effect/CLAUDE.md`, plus its `ai-docs/`. Prefer them over memory and over web docs written for Effect v3.
 - Errors are `Schema.TaggedError` classes with a brand type argument: `Schema.TaggedError<Self, { readonly brand: unique symbol }>()(...)`.
 - Use `Schema.Finite` for numbers, not `Schema.Number`, unless `NaN`/`Infinity` really are valid.
 - Prefer the most direct combinator. The linter suggests these, for example `Effect.orElseSucceed` over `Effect.catch(() => Effect.succeed(...))`.

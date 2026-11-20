@@ -16,7 +16,7 @@ import {
   Stream,
   Tracer,
 } from "effect";
-import { Prompt } from "effect/ai";
+import { AgUiSchema, Prompt } from "effect/ai";
 import type { Tool } from "effect/ai";
 import { DurableDeferred, Workflow, WorkflowEngine } from "effect/workflow";
 import * as Agent from "./Agent.ts";
@@ -173,7 +173,17 @@ export class RunInputMismatch extends Schema.TaggedError<RunInputMismatch, { rea
   }
 }
 
-const InputJson = Schema.toCodecJson(AgUi.RunAgentInput);
+const InputJson = Schema.toCodecJson(AgUiSchema.RunAgentInput);
+
+/**
+ * A tool the client advertised, as the agent offers it. AG-UI leaves `parameters` optional, and the agent passes
+ * the schema to the model as given, so a tool without one takes no arguments.
+ */
+const frontendTool = (tool: AgUiSchema.Tool): Agent.FrontendTool => ({
+  name: tool.name,
+  description: tool.description,
+  parameters: tool.parameters ?? { type: "object", properties: {} },
+});
 
 /** What names a run to cancel: a cancel route has only the ids, not the input. */
 export interface RunIds {
@@ -251,7 +261,7 @@ const agUiRun =
     options?: Options<ROut, E, RIn>,
   ) =>
   (
-    input: AgUi.RunAgentInput,
+    input: AgUiSchema.RunAgentInput,
     how?: {
       /** The log of an earlier attempt this one completes. */
       readonly resumed?: ReadonlyArray<AgUi.Event> | undefined;
@@ -289,7 +299,7 @@ const agUiRun =
             threadId,
             props: input.forwardedProps,
             prompt: prompt.value,
-            frontendTools: input.tools,
+            frontendTools: input.tools.map(frontendTool),
             subagentPrompts: subagentPrompts.value,
             cancelled: how?.cancelled,
           }).pipe(Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)));
@@ -342,7 +352,7 @@ const agUiRun =
  */
 const traced = <R>(
   agent: Agent.Agent<any, any>,
-  input: AgUi.RunAgentInput,
+  input: AgUiSchema.RunAgentInput,
   run: (onFailed: (event: Agent.Event) => Effect.Effect<void>) => Stream.Stream<AgUi.Event, never, R>,
 ): Stream.Stream<AgUi.Event, never, R> =>
   Stream.unwrap(
@@ -400,14 +410,14 @@ const traced = <R>(
  * run's history is read from the stream's context too: provide
  * `History.layerServer` (with its `Thread`) to the stream, or around the
  * handler, for the server history, or nothing for the client history. That
- * can differ per request. At a transport
- * edge, call it inside the request handler, provide the per-request services
- * (`Stream.provideService(AuthContext, principal)`) and close over the
- * handler's context (`Stream.provideContext(yield* Effect.context())`) before
- * handing the stream to the response, so it needs nothing more once the
- * handler has returned. The rest is then a requirement of the handler: with
- * `effect/http`, keep those services in the app layer's output
- * (`Layer.provideMerge`), which the web handler provides to every request.
+ * can differ per request. Over HTTP, serve it with `effect/ai`'s
+ * `AgUiServer.endpoint` and `AgUiServer.handler((input) => run(input))`: the
+ * handler provides its context to the stream, including what middleware such
+ * as authentication provides, so the stream needs nothing more once the
+ * handler has returned. The rest is a requirement of the handler: keep those
+ * services in the app layer's output (`Layer.provideMerge`), which the web
+ * handler provides to every request. On another transport, close over the
+ * handler's context yourself (`Stream.provideContext(yield* Effect.context())`).
  */
 export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
   agent: Agent.Agent<Tools, R>,
@@ -416,7 +426,7 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
   const cancelTimeout = options?.cancelTimeout ?? DEFAULT_CANCEL_TIMEOUT;
   const runWith = agUiRun<Tools, R, readonly [], ROut, E, RIn>(agent, options);
   return (
-    input: AgUi.RunAgentInput,
+    input: AgUiSchema.RunAgentInput,
   ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -467,7 +477,7 @@ const detached =
     options?: DetachedOptions<Dependencies, ROut, E, RIn>,
   ) =>
   (
-    input: AgUi.RunAgentInput,
+    input: AgUiSchema.RunAgentInput,
     // The run's cancel signal.
     cancelled: Effect.Effect<void>,
   ): Effect.Effect<
@@ -529,7 +539,7 @@ export const makeDetached = <
   options?: DetachedOptions<Dependencies, ROut, E, RIn>,
 ): Effect.Effect<
   {
-    readonly start: (input: AgUi.RunAgentInput) => Effect.Effect<void, never, DependencyServices<Dependencies>>;
+    readonly start: (input: AgUiSchema.RunAgentInput) => Effect.Effect<void, never, DependencyServices<Dependencies>>;
     readonly cancel: (run: RunIds) => Effect.Effect<void>;
   },
   never,
@@ -623,15 +633,15 @@ const DEFAULT_CANCEL_POLL_INTERVAL: Duration.Input = "1 second";
  * key, encoded with their schemas.
  */
 export type WorkflowPayloadFields<Dependencies extends ReadonlyArray<AnyRunContext>> = Dependencies extends readonly []
-  ? { readonly input: typeof AgUi.RunAgentInput }
+  ? { readonly input: typeof AgUiSchema.RunAgentInput }
   : {
-      readonly input: typeof AgUi.RunAgentInput;
+      readonly input: typeof AgUiSchema.RunAgentInput;
       readonly context: Schema.Struct<{ readonly [C in Dependencies[number] as C["key"]]: C["schema"] }>;
     };
 
 /** A workflow payload, read through the shape every payload has. */
 interface PayloadParts {
-  readonly input: AgUi.RunAgentInput;
+  readonly input: AgUiSchema.RunAgentInput;
   readonly context?: Readonly<Record<string, unknown>>;
 }
 
@@ -674,9 +684,9 @@ export const makeWorkflow = <
   const dependencies: ReadonlyArray<AnyRunContext> = options.dependencies ?? [];
   const fields =
     dependencies.length === 0
-      ? { input: AgUi.RunAgentInput }
+      ? { input: AgUiSchema.RunAgentInput }
       : {
-          input: AgUi.RunAgentInput,
+          input: AgUiSchema.RunAgentInput,
           context: Schema.Struct(Object.fromEntries(dependencies.map((tag) => [tag.key, tag.schema]))),
         };
   // Built only from the ids, so `cancel` can derive the execution id without the dependencies.
@@ -688,7 +698,7 @@ export const makeWorkflow = <
   });
   // Never registered or executed: only its execution ids are used. Same name and idempotency key as `run`, so
   // the same ids, but a payload that needs no dependency values (`run.executionId` validates them all).
-  const ids = Workflow.make(options.name, { payload: { input: AgUi.RunAgentInput }, idempotencyKey });
+  const ids = Workflow.make(options.name, { payload: { input: AgUiSchema.RunAgentInput }, idempotencyKey });
   // Completed by `cancel`; held by the engine, so it reaches the run on any host, before it starts or while it
   // is down. The run never awaits it durably: completing a deferred a run awaits makes the engine interrupt and
   // replay the run, and an interrupted step is lost as a crash's is, instead of ending cancelled with its partial
@@ -698,7 +708,7 @@ export const makeWorkflow = <
   // The signals of the runs this runner value is executing, so its own `cancel` reaches them without a poll.
   const executing = new Map<string, Deferred.Deferred<void>>();
   // What a payload holds for `input`, with the dependencies' values when there are any.
-  const payloadOf = (input: AgUi.RunAgentInput, perRun: Context.Context<DependencyServices<Dependencies>>) => {
+  const payloadOf = (input: AgUiSchema.RunAgentInput, perRun: Context.Context<DependencyServices<Dependencies>>) => {
     const parts: PayloadParts =
       dependencies.length === 0
         ? { input }
@@ -761,31 +771,33 @@ export const makeWorkflow = <
     workflow: run,
     layer,
     start: (
-      input: AgUi.RunAgentInput,
+      input: AgUiSchema.RunAgentInput,
     ): Effect.Effect<void, never, DependencyServices<Dependencies> | WorkflowEngine.WorkflowEngine> =>
       Effect.flatMap(Effect.context<DependencyServices<Dependencies>>(), (perRun) =>
         Effect.asVoid(run.execute(payloadOf(input, perRun), { discard: true })),
       ),
     // The engine derives the id from the encoded payload, so it needs the dependencies too.
-    executionId: (input: AgUi.RunAgentInput): Effect.Effect<string, never, DependencyServices<Dependencies>> =>
+    executionId: (input: AgUiSchema.RunAgentInput): Effect.Effect<string, never, DependencyServices<Dependencies>> =>
       Effect.flatMap(Effect.context<DependencyServices<Dependencies>>(), (perRun) =>
         run.executionId(payloadOf(input, perRun)),
       ),
     cancel: ({ threadId, runId }: RunIds): Effect.Effect<void, never, WorkflowEngine.WorkflowEngine> =>
-      Effect.flatMap(ids.executionId({ input: { threadId, runId, messages: [] } }), (executionId) =>
-        DurableDeferred.succeed(cancelRequest, {
-          token: DurableDeferred.tokenFromExecutionId(cancelRequest, { workflow: run, executionId }),
-          value: undefined,
-        }).pipe(
-          // Recorded first, so an attempt that starts or replays from here on sees it; then the run this runner
-          // value is executing, if any, at once.
-          Effect.andThen(
-            Effect.suspend(() => {
-              const signal = executing.get(runKey({ threadId, runId }));
-              return signal === undefined ? Effect.void : Effect.asVoid(Deferred.succeed(signal, undefined));
-            }),
+      Effect.flatMap(
+        ids.executionId({ input: { threadId, runId, messages: [], tools: [], context: [] } }),
+        (executionId) =>
+          DurableDeferred.succeed(cancelRequest, {
+            token: DurableDeferred.tokenFromExecutionId(cancelRequest, { workflow: run, executionId }),
+            value: undefined,
+          }).pipe(
+            // Recorded first, so an attempt that starts or replays from here on sees it; then the run this runner
+            // value is executing, if any, at once.
+            Effect.andThen(
+              Effect.suspend(() => {
+                const signal = executing.get(runKey({ threadId, runId }));
+                return signal === undefined ? Effect.void : Effect.asVoid(Deferred.succeed(signal, undefined));
+              }),
+            ),
           ),
-        ),
       ),
   };
 };

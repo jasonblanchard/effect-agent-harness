@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Result } from "effect";
 import { Prompt } from "effect/ai";
+import type { AgUiSchema } from "effect/ai";
 import * as Agent from "../../src/Agent.ts";
 import * as AgUi from "../../src/AgUi.ts";
 import * as Conversions from "../../src/internal/conversions.ts";
@@ -93,7 +94,11 @@ const frontendCalls = (id: string, ...callIds: Array<string>): Messages.Entry =>
 });
 
 /** A client tool message answering `toolCallId`, under a TanStack-style id. */
-const answer = (toolCallId: string, content: unknown, error?: string): AgUi.Message => ({
+const answer = (
+  toolCallId: string,
+  content: string | ReadonlyArray<AgUiSchema.ContentPart>,
+  error?: string,
+): AgUiSchema.ToolMessage => ({
   id: `tool-${toolCallId}`,
   role: "tool",
   toolCallId,
@@ -122,8 +127,22 @@ const simplify = (prompt: Prompt.Prompt) =>
           }),
   }));
 
-const clientMessage = (id: string, role: string, content?: string): AgUi.Message =>
-  content === undefined ? { id, role } : { id, role, content };
+/** An image part, which `ingest` drops: only text is kept. */
+const image = { type: "image", source: { type: "url", value: "https://example.com/a.png" } } as const;
+
+type ClientRole = "user" | "assistant" | "system" | "developer" | "reasoning" | "activity";
+
+/** A client message of `role`. An `activity` message carries `content` as a record, as AG-UI defines it. */
+const clientMessage = (id: string, role: ClientRole, content?: string): AgUiSchema.Message => {
+  switch (role) {
+    case "assistant":
+      return content === undefined ? { id, role } : { id, role, content };
+    case "activity":
+      return { id, role, activityType: "status", content: content === undefined ? {} : { text: content } };
+    default:
+      return { id, role, content: content ?? "" };
+  }
+};
 
 describe("delta", () => {
   it("is the whole client list when the store is empty", () => {
@@ -132,7 +151,7 @@ describe("delta", () => {
   });
 
   it("is everything after the last client message the store knows", () => {
-    const client = [
+    const client: ReadonlyArray<AgUiSchema.Message> = [
       clientMessage("u1", "user", "hi"),
       clientMessage("a1", "assistant", "hello"),
       clientMessage("u2", "user", "again"),
@@ -153,15 +172,15 @@ describe("delta", () => {
     toolResult("t1", "c1", 21),
     assistantText("a2", "21°"),
   ];
-  const callMessage: AgUi.Message = {
+  const callMessage: AgUiSchema.Message = {
     id: "m1",
     role: "assistant",
-    toolCalls: [{ id: "c1", function: { name: "get-weather", arguments: "{}" } }],
+    toolCalls: [{ id: "c1", type: "function", function: { name: "get-weather", arguments: "{}" } }],
   };
   const u3 = clientMessage("u3", "user", "Thanks");
 
   it("matches a tool message by its toolCallId", () => {
-    const client = [
+    const client: ReadonlyArray<AgUiSchema.Message> = [
       clientMessage("u1", "user", "Weather?"),
       callMessage,
       { id: "tool-c1", role: "tool", toolCallId: "c1", content: "21" },
@@ -174,7 +193,7 @@ describe("delta", () => {
   });
 
   it("ignores messages the store never committed", () => {
-    const client = [
+    const client: ReadonlyArray<AgUiSchema.Message> = [
       clientMessage("u1", "user", "Weather?"),
       // A step that was cancelled mid-stream, then the turns that followed it.
       clientMessage("x1", "assistant", "Let me"),
@@ -226,7 +245,7 @@ describe("delta", () => {
       user("u2", "Also"),
       toolResult("t1", "c1", 1),
     ];
-    const client = [
+    const client: ReadonlyArray<AgUiSchema.Message> = [
       clientMessage("u1", "user", "Email Ada"),
       callMessage,
       { id: "t1", role: "tool", toolCallId: "c1", content: "1" },
@@ -236,7 +255,7 @@ describe("delta", () => {
     expect(Conversions.delta(stored, client)).toEqual(Result.succeed([u3]));
   });
 
-  const diverged = (stored: ReadonlyArray<Messages.Entry>, client: ReadonlyArray<AgUi.Message>) => {
+  const diverged = (stored: ReadonlyArray<Messages.Entry>, client: ReadonlyArray<AgUiSchema.Message>) => {
     const result = Conversions.delta(stored, client);
     return Result.isFailure(result) && result.failure._tag === "HistoryDiverged";
   };
@@ -247,7 +266,11 @@ describe("delta", () => {
   });
 
   it("fails with HistoryDiverged when the client drops the last reply", () => {
-    const client = [clientMessage("u1", "user", "Weather?"), callMessage, { id: "t1", role: "tool", toolCallId: "c1" }];
+    const client: ReadonlyArray<AgUiSchema.Message> = [
+      clientMessage("u1", "user", "Weather?"),
+      callMessage,
+      { id: "t1", role: "tool", toolCallId: "c1", content: "21" },
+    ];
     expect(diverged(thread, client)).toBe(true);
     // Without the tool result too.
     expect(diverged(thread, client.slice(0, 2))).toBe(true);
@@ -505,9 +528,9 @@ describe("ingest", () => {
       {
         id: "u2",
         role: "user",
-        content: [{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }],
+        content: [{ type: "text", text: "a" }, image, { type: "text", text: "b" }],
       },
-      { id: "u3", role: "user", content: [{ type: "image" }] },
+      { id: "u3", role: "user", content: [image] },
     ]);
     expect(entries.map((e) => e.id)).toEqual(["u1", "u2"]);
     expect(simplify(Prompt.fromMessages(entries.map((e) => e.message)))).toEqual([
@@ -536,7 +559,7 @@ describe("resume", () => {
   const stored = [user("u1", "Email Ada"), assistantCall("m1", "c1", "a1")];
 
   /** The responses for an input that answers every pending request. */
-  const answer = (entries: ReadonlyArray<Messages.Entry>, resume: ReadonlyArray<AgUi.ResumeEntry>) =>
+  const answer = (entries: ReadonlyArray<Messages.Entry>, resume: ReadonlyArray<AgUiSchema.ResumeEntry>) =>
     Result.getOrThrow(Conversions.resume(entries, resume));
 
   const response = (entries: ReadonlyArray<Messages.Entry>) =>
@@ -665,9 +688,13 @@ describe("frontend calls across a run", () => {
     { ...user("u1", "Pick a file"), runId: "r1" },
     { ...frontendCalls("m1", "c1"), runId: "r1" },
   ];
-  const client: Array<AgUi.Message> = [
+  const client: Array<AgUiSchema.Message> = [
     clientMessage("u1", "user", "Pick a file"),
-    { id: "m1", role: "assistant", toolCalls: [{ id: "c1", function: { name: "pick-file", arguments: "{}" } }] },
+    {
+      id: "m1",
+      role: "assistant",
+      toolCalls: [{ id: "c1", type: "function", function: { name: "pick-file", arguments: "{}" } }],
+    },
     answer("c1", '"a.txt"'),
     clientMessage("u2", "user", "Thanks"),
   ];
@@ -746,19 +773,19 @@ describe("malformedAnswers", () => {
 });
 
 describe("fromHistory", () => {
-  const callMessage = (id: string, callId: string, args: string, content?: string): AgUi.Message => ({
+  const callMessage = (id: string, callId: string, args: string, content?: string): AgUiSchema.Message => ({
     id,
     role: "assistant",
     ...(content === undefined ? {} : { content }),
-    toolCalls: [{ id: callId, function: { name: "send-email", arguments: args } }],
+    toolCalls: [{ id: callId, type: "function", function: { name: "send-email", arguments: args } }],
   });
   const emailCall = callMessage("m1", "c1", '{"to":"ada@example.com"}');
   const convert = (
-    messages: ReadonlyArray<AgUi.Message>,
-    resume: ReadonlyArray<AgUi.ResumeEntry> = [],
+    messages: ReadonlyArray<AgUiSchema.Message>,
+    resume: ReadonlyArray<AgUiSchema.ResumeEntry> = [],
     options?: Conversions.IngestOptions,
   ) => Conversions.fromHistory(messages, resume, options);
-  const prompt = (messages: ReadonlyArray<AgUi.Message>, resume: ReadonlyArray<AgUi.ResumeEntry> = []) =>
+  const prompt = (messages: ReadonlyArray<AgUiSchema.Message>, resume: ReadonlyArray<AgUiSchema.ResumeEntry> = []) =>
     simplify(Prompt.fromMessages(convert(messages, resume).entries.map((entry) => entry.message)));
   const approvalId = Agent.approvalIdFor("c1");
   const responseOf = (result: Conversions.FromHistory) =>
@@ -840,12 +867,12 @@ describe("fromHistory", () => {
       emailCall,
       answer("c1", [
         { type: "text", text: "sent" },
-        { type: "binary", mimeType: "image/png", data: "AA==" },
+        { type: "document", source: { type: "data", value: "AA==", mimeType: "application/pdf" } },
       ]),
     ]);
     expect(parts.droppedParts).toEqual(["c1"]);
     expect(parts.entries[1]!.message.content[0]).toMatchObject({ type: "tool-result", result: "sent" });
-    const failed = convert([emailCall, answer("c1", undefined, "No such address")]);
+    const failed = convert([emailCall, answer("c1", "", "No such address")]);
     expect(failed.entries[1]!.message.content[0]).toMatchObject({ result: "No such address", isFailure: true });
   });
 

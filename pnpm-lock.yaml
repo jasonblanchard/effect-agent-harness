@@ -165,8 +165,8 @@ settings:
 catalogs:
   default:
     effect:
-      specifier: 4.0.5
-      version: 4.0.5
+      specifier: 4.1.4
+      version: 4.1.4
     typescript:
       specifier: 7.0.2
       version: 7.0.2
@@ -197,14 +197,14 @@ importers:
         specifier: ^1.0.3
         version: 1.0.3
       '@effect/vitest':
-        specifier: 4.0.5
-        version: 4.0.5(effect@4.0.5)(vitest@5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0)))
+        specifier: 4.1.4
+        version: 4.1.4(effect@4.1.4)(vitest@5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0)))
       '@types/node':
         specifier: ^26.6.5
         version: 26.6.5
       effect:
         specifier: 'catalog:'
-        version: 4.0.5
+        version: 4.1.4
       rxjs:
         specifier: 7.8.1
         version: 7.8.1
@@ -221,11 +221,11 @@ importers:
         specifier: ^1.0.3
         version: 1.0.3
       '@effect/ai-anthropic':
-        specifier: 4.0.5
-        version: 4.0.5(effect@4.0.5)
+        specifier: 4.1.4
+        version: 4.1.4(effect@4.1.4)
       effect:
         specifier: 'catalog:'
-        version: 4.0.5
+        version: 4.1.4
       effect-agent-harness:
         specifier: workspace:*
         version: link:../../effect-agent-harness
@@ -240,8 +240,8 @@ importers:
   packages/examples/tanstack:
     dependencies:
       '@effect/ai-anthropic':
-        specifier: 4.0.5
-        version: 4.0.5(effect@4.0.5)
+        specifier: 4.1.4
+        version: 4.1.4(effect@4.1.4)
       '@tanstack/ai':
         specifier: ^1.7.0
         version: 1.7.0(zod@4.6.7)
@@ -256,7 +256,7 @@ importers:
         version: 1.169.4(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(rolldown@1.2.14)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0))
       effect:
         specifier: 'catalog:'
-        version: 4.0.5
+        version: 4.1.4
       effect-agent-harness:
         specifier: workspace:*
         version: link:../../effect-agent-harness
@@ -386,10 +386,10 @@ packages:
   '@cfworker/json-schema@4.1.1':
     resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}
 
-  '@effect/ai-anthropic@4.0.5':
-    resolution: {integrity: sha512-Vb8pEJrwqeRd3UT0BtOM2IHlLgRp32XunUnWfEd/DpV0jyKgZHSKVVxsDs6AsMyZpRsD1klDtvfCndDiQV4TyQ==}
+  '@effect/ai-anthropic@4.1.4':
+    resolution: {integrity: sha512-VDcsyL3k76HhF7YqH8z0gQ0bUybX4ti5RHv3JadDXZvEgNpvUT3p4YBssvKR2HAGa7NXr9yfmFedRilhQM7tdQ==}
     peerDependencies:
-      effect: ^4.0.5
+      effect: ^4.1.4
 
   '@effect/tsgo-darwin-arm64@0.54.1':
     resolution: {integrity: sha512-eVLYXfsik3FTO24dBoXZN/KVYPYVM36Kc18hXM/3y6ixNdaxVnqzNqFyLlAuNdgse6skBXjeZq1V+XyShcl+7Q==}
@@ -430,10 +430,10 @@ packages:
     resolution: {integrity: sha512-X7oGQODYMzAgeuVvOgQnEqDJqnWzn4CIY4ZJxYo8REHaMhCdlS8DXWoBHm3FhFpyAOF/8qrbqrY9hakx+pNGDg==}
     hasBin: true
 
-  '@effect/vitest@4.0.5':
-    resolution: {integrity: sha512-q64paZ/i4V2NiRhTyqCmT2KiDbFjlxc2EZrZca8GGt+Nf8844946HyJM5bPk/q+YeRkFSxIrlCs+J+LSfky/wA==}
+  '@effect/vitest@4.1.4':
+    resolution: {integrity: sha512-AKpZ6zKihCRhY7hDbiQ2yp/krw+afIkxDRjFMwwzMiyhd0iYk0WaHa9J6GGC7TUF/C7HP2dZyMVq5xC0Qm/2/g==}
     peerDependencies:
-      effect: ^4.0.5
+      effect: ^4.1.4
       vitest: '>=5.0.0 <6.0.0'
 
   '@jridgewell/gen-mapping@0.3.13':
@@ -1269,8 +1269,8 @@ packages:
     resolution: {integrity: sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==}
     engines: {node: '>=0.3.1'}
 
-  effect@4.0.5:
-    resolution: {integrity: sha512-BY4/28NlpOd99yzmV741xbVGmp+1U7tks4oB7F/Png64bTa5tm5eCA6W0RiXsnuLDDoJpjfVSo4Dnq4BZb/89Q==}
+  effect@4.1.4:
+    resolution: {integrity: sha512-Tgrv/9FN+TZYyOn8XSli+fVqAfwDrDAkiX5Uu9vztINb675VTQdhD0gWI5Kzvhlh9QqzjZvw72iugqw5pwoghQ==}
 
   electron-to-chromium@1.5.464:
     resolution: {integrity: sha512-nRa65aFge40viPAKxMKULIY8tcXKwKboJWNn4RoKwyWXJ6SP7BnrDGKUTzc64818jIciH0PK7LSF8QzZes19GA==}
@@ -1887,9 +1887,9 @@ snapshots:
 
   '@cfworker/json-schema@4.1.1': {}
 
-  '@effect/ai-anthropic@4.0.5(effect@4.0.5)':
+  '@effect/ai-anthropic@4.1.4(effect@4.1.4)':
     dependencies:
-      effect: 4.0.5
+      effect: 4.1.4
 
   '@effect/tsgo-darwin-arm64@0.54.1':
     optional: true
@@ -1922,9 +1922,9 @@ snapshots:
       '@effect/tsgo-win32-arm64': 0.54.1
       '@effect/tsgo-win32-x64': 0.54.1
 
-  '@effect/vitest@4.0.5(effect@4.0.5)(vitest@5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0)))':
+  '@effect/vitest@4.1.4(effect@4.1.4)(vitest@5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0)))':
     dependencies:
-      effect: 4.0.5
+      effect: 4.1.4
       vitest: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(jiti@2.7.0))
 
   '@jridgewell/gen-mapping@0.3.13':
@@ -2553,7 +2553,7 @@ snapshots:
 
   diff@9.0.0: {}
 
-  effect@4.0.5: {}
+  effect@4.1.4: {}
 
   electron-to-chromium@1.5.464: {}
 

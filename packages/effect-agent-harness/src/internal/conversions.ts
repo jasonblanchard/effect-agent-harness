@@ -1,4 +1,4 @@
-import type { Interrupt, Message, ReasoningMessage } from "../AgUiSchema.ts";
+import type { AgUiSchema } from "effect/ai";
 import { Option, Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import * as Agent from "../Agent.ts";
@@ -62,9 +62,9 @@ export class HistoryDiverged extends Schema.TaggedError<HistoryDiverged, { reado
  */
 export const delta = (
   stored: ReadonlyArray<Entry>,
-  client: ReadonlyArray<AgUi.Message>,
+  client: ReadonlyArray<AgUiSchema.Message>,
   runId?: string,
-): Result.Result<ReadonlyArray<AgUi.Message>, HistoryMismatch | HistoryDiverged> => {
+): Result.Result<ReadonlyArray<AgUiSchema.Message>, HistoryMismatch | HistoryDiverged> => {
   if (stored.length === 0) {
     return Result.succeed(client);
   }
@@ -80,9 +80,7 @@ export const delta = (
     }
   }
   const positions = client.map(
-    (message) =>
-      byId.get(message.id) ??
-      (message.role === "tool" && message.toolCallId !== undefined ? byCall.get(message.toolCallId) : undefined),
+    (message) => byId.get(message.id) ?? (message.role === "tool" ? byCall.get(message.toolCallId) : undefined),
   );
   const last = positions.findLastIndex((position) => position !== undefined);
   if (last === -1) {
@@ -118,23 +116,21 @@ export interface IngestOptions {
  * so a client cannot fabricate them. The one exception, a tool message
  * answering a frontend call, is taken by {@link answers}.
  */
-export const ingest = (messages: ReadonlyArray<AgUi.Message>, options?: IngestOptions): ReadonlyArray<Entry> =>
+export const ingest = (messages: ReadonlyArray<AgUiSchema.Message>, options?: IngestOptions): ReadonlyArray<Entry> =>
   messages.flatMap((message): Array<Entry> => {
     // A message with only media parts has no text to send, and providers
     // reject empty text blocks.
-    const text = textOf(message.content);
-    if (text.length === 0) {
-      return [];
-    }
     switch (message.role) {
-      case "user":
-        return [
-          { id: message.id, message: Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }) },
-        ];
+      case "user": {
+        const text = textOf(message.content);
+        return text.length === 0
+          ? []
+          : [{ id: message.id, message: Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }) }];
+      }
       case "system":
       case "developer":
-        return options?.clientSystem === "allow"
-          ? [{ id: message.id, message: Prompt.makeMessage("system", { content: text }) }]
+        return options?.clientSystem === "allow" && message.content.length > 0
+          ? [{ id: message.id, message: Prompt.makeMessage("system", { content: message.content }) }]
           : [];
       default:
         return [];
@@ -148,7 +144,7 @@ const decodeApprovalResponse = Schema.decodeUnknownOption(AgUi.ApprovalResponse)
  * {@link AgUi.ApprovalResponse}. {@link resume} denies such an answer, which is
  * safe but easy to miss, so the runner logs a warning naming them.
  */
-export const malformedAnswers = (entries: ReadonlyArray<AgUi.ResumeEntry>): ReadonlyArray<string> =>
+export const malformedAnswers = (entries: ReadonlyArray<AgUiSchema.ResumeEntry>): ReadonlyArray<string> =>
   entries.flatMap((entry) =>
     entry.status === "resolved" && Option.isNone(decodeApprovalResponse(entry.payload)) ? [entry.interruptId] : [],
   );
@@ -178,7 +174,7 @@ export class UnansweredInterrupt extends Schema.TaggedError<UnansweredInterrupt,
  */
 export const resume = (
   stored: ReadonlyArray<Entry>,
-  entries: ReadonlyArray<AgUi.ResumeEntry>,
+  entries: ReadonlyArray<AgUiSchema.ResumeEntry>,
 ): Result.Result<ReadonlyArray<Entry>, UnansweredInterrupt> => {
   const answers = new Map(entries.map((entry) => [entry.interruptId, entry]));
   const pending = pendingApprovals(stored);
@@ -195,7 +191,7 @@ export const resume = (
  * The approval response entry a resume entry gives the request it answers
  * (see {@link resume}), owned by the subagent that owns the request, if any.
  */
-const decision = (answer: AgUi.ResumeEntry, owner: string | undefined): Entry => {
+const decision = (answer: AgUiSchema.ResumeEntry, owner: string | undefined): Entry => {
   const approvalId = answer.interruptId;
   const payload = Option.getOrUndefined(decodeApprovalResponse(answer.payload));
   const approved = answer.status === "resolved" && payload?.approved === true;
@@ -280,12 +276,12 @@ export interface Answers {
  */
 export const answers = (
   stored: ReadonlyArray<Entry>,
-  delta: ReadonlyArray<AgUi.Message>,
+  delta: ReadonlyArray<AgUiSchema.Message>,
 ): Result.Result<Answers, UnansweredToolCall> => {
   const pending = pendingFrontendCalls(stored);
-  const sent = new Map<string, AgUi.Message>();
+  const sent = new Map<string, AgUiSchema.ToolMessage>();
   for (const message of delta) {
-    if (message.role === "tool" && message.toolCallId !== undefined && !sent.has(message.toolCallId)) {
+    if (message.role === "tool" && !sent.has(message.toolCallId)) {
       sent.set(message.toolCallId, message);
     }
   }
@@ -310,7 +306,7 @@ export const answers = (
  * than text were dropped.
  */
 const resultEntry = (
-  message: AgUi.Message,
+  message: AgUiSchema.ToolMessage,
   toolCallId: string,
   toolName: string,
 ): { readonly entry: Entry; readonly dropped: boolean } => {
@@ -335,7 +331,7 @@ const resultEntry = (
 };
 
 /** A tool message's content as a stored result, and whether parts other than text were dropped. */
-const resultOf = (content: unknown): { readonly result: unknown; readonly dropped: boolean } => {
+const resultOf = (content: Content): { readonly result: unknown; readonly dropped: boolean } => {
   if (typeof content === "string") {
     try {
       return { result: JSON.parse(content), dropped: false };
@@ -343,10 +339,7 @@ const resultOf = (content: unknown): { readonly result: unknown; readonly droppe
       return { result: content, dropped: false };
     }
   }
-  if (Array.isArray(content)) {
-    return { result: textOf(content), dropped: content.some((part) => !isTextPart(part)) };
-  }
-  return { result: content ?? "", dropped: false };
+  return { result: textOf(content), dropped: content.some((part) => part.type !== "text") };
 };
 
 interface PendingFrontendCall {
@@ -424,8 +417,8 @@ export interface FromHistory {
  * answer is left to `Messages.project`, which gives it a failed result.
  */
 export const fromHistory = (
-  messages: ReadonlyArray<AgUi.Message>,
-  resume: ReadonlyArray<AgUi.ResumeEntry>,
+  messages: ReadonlyArray<AgUiSchema.Message>,
+  resume: ReadonlyArray<AgUiSchema.ResumeEntry>,
   options?: IngestOptions,
 ): FromHistory => {
   const droppedCalls: Array<string> = [];
@@ -482,11 +475,11 @@ export const fromHistory = (
       }
       case "tool": {
         const toolCallId = message.toolCallId;
-        if (toolCallId !== undefined && dropped.has(toolCallId)) {
+        if (dropped.has(toolCallId)) {
           break;
         }
-        const call = toolCallId === undefined ? undefined : calls.get(toolCallId);
-        if (toolCallId === undefined || call === undefined) {
+        const call = calls.get(toolCallId);
+        if (call === undefined) {
           orphanResults.push(message.id);
           break;
         }
@@ -559,13 +552,15 @@ const parseObject = (text: string): Record<string, unknown> | undefined => {
 /** A thread as a client restores it. See `History.restore`. */
 export interface Restored {
   /** The messages the thread's runs showed, as their events showed them. */
-  readonly messages: ReadonlyArray<Message>;
+  readonly messages: ReadonlyArray<AgUiSchema.Message>;
   /**
    * The approval requests still waiting for an answer, as the `RUN_FINISHED`
    * that raised them carried them, and the run that raised them (`undefined`
    * if the store did not record it). `undefined` when none are open.
    */
-  readonly interrupts: { readonly runId: string | undefined; readonly pending: ReadonlyArray<Interrupt> } | undefined;
+  readonly interrupts:
+    | { readonly runId: string | undefined; readonly pending: ReadonlyArray<AgUiSchema.Interrupt> }
+    | undefined;
   /**
    * The frontend calls still waiting for the client's result, in call order,
    * and the run that left them (`undefined` if the store did not record it).
@@ -593,11 +588,12 @@ export interface Restored {
  * would otherwise have to be matched, and a client can't match it: its rows
  * carry their blocks' ids, not the entry's.
  */
-const shown = (entry: Entry): Message | undefined => {
+const shown = (entry: Entry): AgUiSchema.Message | undefined => {
   const { id, message } = entry;
   switch (message.role) {
     case "user": {
-      return { id, role: "user", content: textOf(message.content) };
+      const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+      return { id, role: "user", content: text };
     }
     case "assistant": {
       const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
@@ -650,7 +646,7 @@ const shown = (entry: Entry): Message | undefined => {
  * them. A block with no text showed nothing, but still counts towards the ids
  * of the blocks after it. Provider options are never read.
  */
-const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
+const reasoningOf = ({ id, message }: Entry): ReadonlyArray<AgUiSchema.ReasoningMessage> =>
   message.role === "assistant"
     ? message.content
         .filter((part) => part.type === "reasoning")
@@ -660,6 +656,16 @@ const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
             : [{ id: AgUi.reasoningMessageId(id, n), role: "reasoning" as const, content: part.text }],
         )
     : [];
+
+/**
+ * Every AG-UI message an entry's events showed: its reasoning, then the
+ * message {@link shown} gives it. The assistant message has one `content`, so
+ * its text can't be split around a block, and the reasoning goes first.
+ */
+const toAgUi = (entry: Entry): ReadonlyArray<AgUiSchema.Message> => {
+  const message = shown(entry);
+  return message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
+};
 
 /**
  * The thread's loaded entries as its runs' events showed them, with its open
@@ -681,9 +687,8 @@ const reasoningOf = ({ id, message }: Entry): ReadonlyArray<ReasoningMessage> =>
  */
 export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Restored => {
   const entries = activeRunId === undefined ? stored : withoutReplayed(stored, activeRunId);
-  const messages = entries.flatMap((entry): ReadonlyArray<Message> => {
-    const message = shown(entry);
-    const all = message === undefined ? reasoningOf(entry) : [...reasoningOf(entry), message];
+  const messages = entries.flatMap((entry): ReadonlyArray<AgUiSchema.Message> => {
+    const all = toAgUi(entry);
     const owner = entry.subagentRunId;
     return owner === undefined ? all : all.map((m) => ({ ...m, subagentRunId: owner }));
   });
@@ -699,10 +704,10 @@ export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Res
       }
     }
   }
-  const results = new Map<string, Array<Message>>();
-  const nested = new Map<string, Array<Message>>();
-  const rest: Array<Message> = [];
-  const push = (map: Map<string, Array<Message>>, key: string, message: Message) =>
+  const results = new Map<string, Array<AgUiSchema.Message>>();
+  const nested = new Map<string, Array<AgUiSchema.Message>>();
+  const rest: Array<AgUiSchema.Message> = [];
+  const push = (map: Map<string, Array<AgUiSchema.Message>>, key: string, message: AgUiSchema.Message) =>
     map.set(key, [...(map.get(key) ?? []), message]);
   for (const message of messages) {
     const resultOf = message.role === "tool" ? caller.get(message.toolCallId) : undefined;
@@ -716,7 +721,7 @@ export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Res
       rest.push(message);
     }
   }
-  const place = (message: Message): Array<Message> => [
+  const place = (message: AgUiSchema.Message): Array<AgUiSchema.Message> => [
     message,
     ...(nested.get(message.id) ?? []).flatMap(place),
     ...(results.get(message.id) ?? []),
@@ -797,18 +802,13 @@ const withoutReplayed = (entries: ReadonlyArray<Entry>, runId: string): Readonly
   });
 };
 
-const TextPart = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String });
-const isTextPart = Schema.is(TextPart);
+/** The content of a user or tool message. */
+type Content = string | ReadonlyArray<AgUiSchema.ContentPart>;
 
-const textOf = (content: unknown): string => {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .filter(isTextPart)
-      .map((part) => part.text)
-      .join("");
-  }
-  return "";
-};
+/** The text of a message's content: a string as is, or its text parts joined; none is "". */
+const textOf = (content: Content | undefined): string =>
+  content === undefined
+    ? ""
+    : typeof content === "string"
+      ? content
+      : content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");

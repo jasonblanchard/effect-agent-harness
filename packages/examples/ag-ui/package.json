@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@ag-ui/client": "^1.0.3",
-    "@effect/ai-anthropic": "4.0.5",
+    "@effect/ai-anthropic": "4.1.4",
     "effect": "catalog:",
     "effect-agent-harness": "workspace:*"
   },

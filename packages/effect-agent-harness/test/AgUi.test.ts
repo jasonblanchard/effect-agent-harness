@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Exit, Stream } from "effect";
-import { AiError, Prompt } from "effect/ai";
+import { Effect, Exit, Schema, Stream } from "effect";
+import { AgUiSchema, AiError, Prompt } from "effect/ai";
 import type { Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
@@ -21,92 +21,93 @@ import {
   wholeReasoning,
 } from "./fixtures.ts";
 
-describe("AgUi.RunAgentInput", () => {
+// The run input is `effect/ai`'s schema. These pin the parts of it the runners rely on.
+describe("AgUiSchema.RunAgentInput", () => {
+  const decode = Schema.decodeUnknownEffect(AgUiSchema.RunAgentInput);
+  const minimal = { threadId: "t1", runId: "r1", messages: [] };
+
   it.effect("decodes a valid input", () =>
     Effect.gen(function* () {
-      const input = yield* AgUi.decodeRunAgentInput({
-        threadId: "t1",
-        runId: "r1",
-        messages: [{ id: "m1", role: "user", content: "hi" }],
-      });
+      const input = yield* decode({ ...minimal, messages: [{ id: "m1", role: "user", content: "hi" }] });
       expect(input.threadId).toBe("t1");
       expect(input.runId).toBe("r1");
       expect(input.messages).toEqual([{ id: "m1", role: "user", content: "hi" }]);
     }),
   );
 
-  it.effect("accepts and ignores extra fields", () =>
+  it.effect("accepts the fields the run ignores", () =>
     Effect.gen(function* () {
-      const input = yield* AgUi.decodeRunAgentInput({
-        threadId: "t1",
-        runId: "r1",
+      const input = yield* decode({
+        ...minimal,
         protocolVersion: "1.0",
-        state: {},
-        tools: [{ name: "x", description: "y", parameters: { type: "object" }, extra: true }],
-        context: [],
-        forwardedProps: { locale: "fr" },
-        messages: [
-          { id: "m1", role: "activity", activityType: "x", content: {} },
-          {
-            id: "m2",
-            role: "assistant",
-            toolCalls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }],
-          },
-        ],
+        parentRunId: "r0",
+        state: { step: 1 },
+        context: [{ description: "Locale", value: "fr" }],
+        messages: [{ id: "m1", role: "user", content: "hi" }],
       });
-      expect(Object.keys(input).sort()).toEqual(["forwardedProps", "messages", "runId", "threadId", "tools"]);
-      expect(input.forwardedProps).toEqual({ locale: "fr" });
-      expect(input.tools).toEqual([{ name: "x", description: "y", parameters: { type: "object" } }]);
-      expect(input.messages.map((m) => m.role)).toEqual(["activity", "assistant"]);
+      expect(input).toMatchObject({ protocolVersion: "1.0", parentRunId: "r0", state: { step: 1 } });
+      expect(input.context).toEqual([{ description: "Locale", value: "fr" }]);
     }),
   );
 
   it.effect("keeps forwarded properties of any shape unchanged", () =>
     Effect.gen(function* () {
       for (const forwardedProps of ["fr", [1, "two"], { user: { prefs: { locale: "fr" } } }]) {
-        const input = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], forwardedProps });
+        const input = yield* decode({ ...minimal, forwardedProps });
         expect(input.forwardedProps).toEqual(forwardedProps);
       }
-      const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
+      const without = yield* decode(minimal);
       expect("forwardedProps" in without).toBe(false);
     }),
   );
 
-  it.effect("fails on a tool without a name", () =>
+  it.effect("fails on a tool without a name or without a description", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(
-        AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], tools: [{ parameters: {} }] }),
-      );
-      expect(Exit.isFailure(exit)).toBe(true);
+      for (const tool of [
+        { description: "Pick", parameters: {} },
+        { name: "pick-file", parameters: {} },
+      ]) {
+        const exit = yield* Effect.exit(decode({ ...minimal, tools: [tool] }));
+        expect(Exit.isFailure(exit)).toBe(true);
+      }
     }),
   );
 
-  it.effect("decodes no tools and an empty tools list", () =>
+  it.effect("decodes no tools and an empty tools list as no frontend tools", () =>
     Effect.gen(function* () {
-      const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
-      expect(without.tools).toBeUndefined();
-      const empty = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [], tools: [] });
-      expect(empty.tools).toEqual([]);
+      expect((yield* decode(minimal)).tools).toEqual([]);
+      expect((yield* decode({ ...minimal, tools: [] })).tools).toEqual([]);
     }),
   );
 
   it.effect("decodes resume entries", () =>
     Effect.gen(function* () {
-      const input = yield* AgUi.decodeRunAgentInput({
-        threadId: "t1",
-        runId: "r1",
-        messages: [],
+      const input = yield* decode({
+        ...minimal,
         resume: [{ interruptId: "a1", status: "resolved", payload: { approved: true } }],
       });
       expect(input.resume).toEqual([{ interruptId: "a1", status: "resolved", payload: { approved: true } }]);
-      const without = yield* AgUi.decodeRunAgentInput({ threadId: "t1", runId: "r1", messages: [] });
-      expect(without.resume).toBeUndefined();
+      expect((yield* decode(minimal)).resume).toBeUndefined();
+    }),
+  );
+
+  it.effect("drops a message whose role the protocol doesn't define", () =>
+    Effect.gen(function* () {
+      const input = yield* decode({
+        ...minimal,
+        messages: [
+          { id: "u1", role: "user", content: "hi" },
+          { id: "x1", role: "narrator", content: "meanwhile" },
+          { id: "u2", role: "user", content: "again" },
+        ],
+      });
+      expect(input.messages.map((message) => message.id)).toEqual(["u1", "u2"]);
     }),
   );
 
   it.effect("fails when runId is missing", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(AgUi.decodeRunAgentInput({ threadId: "t1", messages: [] }));
+      const exit = yield* Effect.exit(decode({ threadId: "t1", messages: [] }));
       expect(Exit.isFailure(exit)).toBe(true);
     }),
   );
@@ -149,7 +150,7 @@ const agent = Agent.define({ toolkit: ApprovalToolkit });
 const prompt = Prompt.make([{ role: "user", content: "What is the weather in Paris?" }]);
 
 /** Runs the core on a scripted model and projects it onto AG-UI; every sequence is verified. */
-const foldRun = (steps: ReadonlyArray<Step>, frontendTools?: ReadonlyArray<AgUi.FrontendTool>) =>
+const foldRun = (steps: ReadonlyArray<Step>, frontendTools?: ReadonlyArray<Agent.FrontendTool>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
     const events = yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt, frontendTools }).pipe(

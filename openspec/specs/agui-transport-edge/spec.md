@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Lets applications expose the AG-UI agent through a transport they own (an HTTP route, a WebSocket, an in-process call). The package supplies the run input decoder, runners whose event streams have no service requirements, and an SSE encoding compatible with `@ag-ui/client`'s `HttpAgent`. It does not own a web server or route.
+Lets applications expose the AG-UI agent through a transport they own (an HTTP route, a WebSocket, an in-process call). The package supplies runners whose event streams have no service requirements. The input schema, the AG-UI endpoint and the SSE encoding come from Effect (`effect/ai`'s `AgUiSchema` and `AgUiServer`, `effect/http-api`'s `StreamSse`), and the package has no HTTP code of its own. It does not own a web server or route.
 ## Requirements
 ### Requirement: No server ownership
 The package SHALL NOT start servers, register routes, or depend on an HTTP server module. The caller SHALL choose the transport, path, status codes, and headers.
@@ -11,16 +11,20 @@ The package SHALL NOT start servers, register routes, or depend on an HTTP serve
 - **WHEN** an application defines its own `POST /agent` route that decodes the input, runs the agent, and encodes the events as SSE
 - **THEN** an `HttpAgent` pointed at that route can run a multi-turn conversation that includes tool calls
 
-### Requirement: Lenient run input decoding
-The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only the fields the agent uses: `threadId`, `runId`, the `messages` fields needed for ingestion, `resume` entries (`interruptId`, `status`, optional `payload`), and `tools` entries (`name`, optional `description`, `parameters`). It SHALL keep an optional `forwardedProps` value of any shape without checking it, and each tool's `parameters` without checking it against JSON Schema. It SHALL accept and ignore any other fields, and it SHALL fail on input whose required fields are missing or malformed, so the caller can reject it before starting a run.
+### Requirement: Run input is the AG-UI input as Effect decodes it
+Every runner SHALL take the AG-UI 1.0 `RunAgentInput` as `effect/ai`'s `AgUiSchema.RunAgentInput` decodes it. The package SHALL NOT provide its own input schema or decoder. Input that schema rejects SHALL be rejected by the caller before a run starts, and nothing SHALL be committed for it. The run SHALL read `threadId`, `runId`, `messages`, `resume`, `tools` (as the frontend tools) and `forwardedProps` (as the run's untrusted `props`). It SHALL ignore every other field, though those fields stay part of the input the runner memoises.
 
 #### Scenario: Extra fields
-- **WHEN** the input includes `tools`, `context`, `state`, `forwardedProps` and `protocolVersion`
-- **THEN** decoding succeeds and returns only the fields the agent reads, including `tools` and `forwardedProps`
+- **WHEN** the input includes `context`, `state`, `parentRunId` and `protocolVersion` alongside the fields the run reads
+- **THEN** decoding succeeds, and the run behaves as it would without them
 
 #### Scenario: Missing runId
 - **WHEN** the input has no `runId`
-- **THEN** decoding fails
+- **THEN** decoding fails, and no run starts
+
+#### Scenario: Tool without a description
+- **WHEN** an entry in `tools` has a `name` and no `description`
+- **THEN** decoding fails, and no run starts
 
 #### Scenario: Resume entries
 - **WHEN** the input includes `resume: [{ interruptId: "a1", status: "resolved", payload: { approved: true } }]`
@@ -28,15 +32,15 @@ The package SHALL provide a decoder for AG-UI `RunAgentInput` that checks only t
 
 #### Scenario: Forwarded properties of any shape
 - **WHEN** the input's `forwardedProps` is a string, an array or a nested object
-- **THEN** decoding succeeds and returns `forwardedProps` unchanged
-
-#### Scenario: Tool without a name
-- **WHEN** an entry in `tools` has no `name`
-- **THEN** decoding fails
+- **THEN** decoding succeeds and the run's `props` is that value, unchanged
 
 #### Scenario: No tools
 - **WHEN** the input has no `tools` field, or an empty one
 - **THEN** decoding succeeds and the run has no frontend tools
+
+#### Scenario: Unknown message role
+- **WHEN** the input holds a message whose `role` the AG-UI version doesn't define, between two user messages
+- **THEN** decoding succeeds without it, and the model receives both user messages
 
 ### Requirement: Runner without service requirements
 The package SHALL provide a request-scoped run as a function from the run's input to an event stream, made without capturing any service.
@@ -94,38 +98,28 @@ For the request-scoped runner, when the consumer of a run's event stream stops r
 - **WHEN** a subscriber to a detached run's event log stops reading while the model is still streaming
 - **THEN** the run continues and its remaining events are appended to the log
 
-### Requirement: SSE encoding
-The package SHALL provide a pure transform from a stream of AG-UI events to Server-Sent Events frames, along with the matching content type (`text/event-stream`). Each event SHALL become one `data:` frame containing the event as JSON, in emission order. When encoding stored events from the event log, each frame SHALL carry the event's cursor in the SSE `id` field, so a client can resume with `Last-Event-ID`. Each frame SHALL be produced as soon as its event is produced, not buffered until the run ends.
+### Requirement: Serving runs through Effect's AG-UI binding
+A request-scoped run's event stream SHALL be servable as the response of `effect/ai`'s AG-UI endpoint (`AgUiServer.endpoint` implemented with `AgUiServer.handler`) without any adapter from this package, and an `HttpAgent` SHALL accept the result. Events read from the event log SHALL be servable as Server-Sent Events with each event's cursor as its SSE `id`, using `effect/http-api`'s SSE stream schema, so a client can resume with `Last-Event-ID`. The package SHALL contain no HTTP code of its own.
 
-For callers whose transport is `effect/http`, the package SHALL also provide an HTTP response built from such frames. It SHALL have content type `text/event-stream` and `cache-control: no-cache`, unless the caller overrides them, and the caller SHALL be able to set the status and add headers. Building the response SHALL require whatever services the frames still need, and SHALL provide them to the body from the context it is built in, so the body needs nothing further once the code that built the response has returned. The response SHALL NOT buffer the frames.
+#### Scenario: HttpAgent runs a conversation through the endpoint
+- **WHEN** an application serves a request-scoped runner through the AG-UI endpoint, and an `HttpAgent` runs a multi-turn conversation that includes tool calls against it
+- **THEN** `HttpAgent` invokes its text, tool call and tool result subscribers, and every run resolves without errors from the client's sequence checks
 
-#### Scenario: Frames parse back into events
-- **WHEN** a text-only run is encoded and the resulting frames are parsed
-- **THEN** each `data:` frame decodes to the corresponding AG-UI event, in order
+#### Scenario: One run lifecycle on the wire
+- **WHEN** a run is served through the AG-UI endpoint
+- **THEN** the client receives exactly one `RUN_STARTED` first and exactly one terminal event last, and the terminal event is the one the run emitted (its outcome, interrupts, `pendingToolCallIds`, or `RUN_ERROR` message and code)
 
-#### Scenario: HttpAgent consumes the encoding
-- **WHEN** a caller's route responds with the encoded frames and content type `text/event-stream`
-- **THEN** `HttpAgent` invokes its text, tool call, and tool result subscribers, and the run resolves without errors from the client's sequence checks
+#### Scenario: Disconnect cancels the run
+- **WHEN** a client of the AG-UI endpoint disconnects while the model is still streaming
+- **THEN** the model stream is interrupted, and under the server history the thread's claim is released
 
-#### Scenario: Stored events carry ids
-- **WHEN** stored events with cursors "0", "1", "2" are encoded
-- **THEN** each frame has an `id:` line equal to its cursor
+#### Scenario: Invalid input is rejected before the stream
+- **WHEN** a request to the AG-UI endpoint carries a body that the AG-UI input schema rejects
+- **THEN** the response has status 400, no event stream opens, and the model is not called
 
-#### Scenario: Response headers
-- **WHEN** a route responds with the package's SSE response and no options
-- **THEN** the response has status 200, content type `text/event-stream` and `cache-control: no-cache`
-
-#### Scenario: Caller's status and headers
-- **WHEN** a route builds the response with an extra header `x-run: r1`
-- **THEN** the response carries `x-run: r1` as well as the SSE content type and `cache-control: no-cache`
-
-#### Scenario: Body carries the handler's services
-- **WHEN** a request handler builds the response from a request-scoped run's frames, and the run's services are available only in the handler's context
-- **THEN** the body, read after the handler has returned, yields the run's complete AG-UI sequence
-
-#### Scenario: Missing service fails to typecheck
-- **WHEN** a handler builds the response from frames that require a service the handler's context does not provide
-- **THEN** the handler requires that service, and building or calling an app that does not provide it fails to typecheck
+#### Scenario: Replay carries cursors as ids
+- **WHEN** a route serves stored events with cursors "0", "1", "2" from the event log as Server-Sent Events
+- **THEN** each event's frame has an `id:` line equal to its cursor, and its `data:` line decodes to the stored event
 
 ### Requirement: Detached runner
 The package SHALL provide a runner that starts a run, given its input, in a scope the caller or a workflow engine owns, returns before the run completes, and appends every AG-UI event of the run to the event log under the thread id and run id. Starting a run SHALL require the runner's declared run contexts, read when the run is started, so a service the caller provides around the start reaches the run. Observing the run SHALL be done by subscribing to the event log.

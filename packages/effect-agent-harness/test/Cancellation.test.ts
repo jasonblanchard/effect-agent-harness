@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { Prompt } from "effect/ai";
-import type { Response } from "effect/ai";
+import type { AgUiSchema, Response } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
 import * as AgUi from "../src/AgUi.ts";
@@ -538,8 +538,14 @@ describe("AgUi.fold cancellation", () => {
 // Runners
 // -----------------------------------------------------------------------------
 
-const userMessage = (id: string, content: string): AgUi.Message => ({ id, role: "user", content });
-const run1: AgUi.RunAgentInput = { threadId: "t1", runId: "r1", messages: [userMessage("u1", "Hi")] };
+const userMessage = (id: string, content: string): AgUiSchema.Message => ({ id, role: "user", content });
+const run1: AgUiSchema.RunAgentInput = {
+  tools: [],
+  context: [],
+  threadId: "t1",
+  runId: "r1",
+  messages: [userMessage("u1", "Hi")],
+};
 
 /** The run's log once it has ended. */
 const logOf = (threadId: string, runId: string) =>
@@ -569,13 +575,15 @@ describe("Runner.makeAttached cancellation", () => {
   it.effect("matches the client's copy of a cancelled turn as known on the next run", () =>
     Effect.gen(function* () {
       const model = scriptedModel([stalled(partialText("0", "Hel")), [...text("0", "Hello!"), finish("stop")]]);
-      const attached = (input: AgUi.RunAgentInput) =>
+      const attached = (input: AgUiSchema.RunAgentInput) =>
         Runner.makeAttached(weatherAgent)(input).pipe(Stream.provide(model.layer));
       const first = Array.from(yield* attached(run1).pipe(Stream.takeUntil(isContent), Stream.runCollect));
       const started = first.find((event) => event.type === "TEXT_MESSAGE_START");
       const messageId = started?.type === "TEXT_MESSAGE_START" ? started.messageId : "";
       const second = Array.from(
         yield* attached({
+          tools: [],
+          context: [],
           threadId: "t1",
           runId: "r2",
           messages: [

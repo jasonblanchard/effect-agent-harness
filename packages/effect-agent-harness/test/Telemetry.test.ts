@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Exit, Layer, Scope, Stream } from "effect";
 import { Prompt, Response } from "effect/ai";
+import type { AgUiSchema } from "effect/ai";
 import type { Tracer } from "effect";
 import * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
@@ -31,8 +32,14 @@ import {
 const assistant = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful.", name: "assistant" });
 const approvalAgent = Agent.define({ toolkit: ApprovalToolkit, name: "assistant" });
 
-const userMessage = (id: string, content: string): AgUi.Message => ({ id, role: "user", content });
-const run1: AgUi.RunAgentInput = { threadId: "t1", runId: "r1", messages: [userMessage("u1", "Weather in Paris?")] };
+const userMessage = (id: string, content: string): AgUiSchema.Message => ({ id, role: "user", content });
+const run1: AgUiSchema.RunAgentInput = {
+  tools: [],
+  context: [],
+  threadId: "t1",
+  runId: "r1",
+  messages: [userMessage("u1", "Weather in Paris?")],
+};
 
 const weatherTurn: ReadonlyArray<Step> = [
   [...toolCall("call-1", "get-weather", { location: "Paris" }), finish("tool-calls")],
@@ -57,7 +64,7 @@ const parsed = (span: Tracer.Span, key: string) => JSON.parse(attr(span, key) as
 /** Runs `inputs` through `Runner.makeAttached` against `steps`, recording every span. */
 const traced = (
   steps: ReadonlyArray<Step>,
-  inputs: ReadonlyArray<AgUi.RunAgentInput>,
+  inputs: ReadonlyArray<AgUiSchema.RunAgentInput>,
   options?: { readonly agent?: typeof assistant; readonly capture?: boolean },
 ) =>
   Effect.gen(function* () {
@@ -77,7 +84,7 @@ const traced = (
 /** {@link traced} for {@link approvalAgent}, with the given handlers. */
 const tracedApproval = (
   steps: ReadonlyArray<Step>,
-  inputs: ReadonlyArray<AgUi.RunAgentInput>,
+  inputs: ReadonlyArray<AgUiSchema.RunAgentInput>,
   handlers: ReturnType<typeof countingApprovalLayer>,
 ) =>
   Effect.gen(function* () {
@@ -261,7 +268,7 @@ describe("run root span", () => {
     Effect.gen(function* () {
       const { tracer, runs } = yield* tracedApproval(
         [[...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }), finish("tool-calls")]],
-        [{ threadId: "t1", runId: "r1", messages: [userMessage("u1", "Email Ada")] }],
+        [{ tools: [], context: [], threadId: "t1", runId: "r1", messages: [userMessage("u1", "Email Ada")] }],
         countingApprovalLayer(),
       );
       expect(runs[0]!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "interrupt" } });
@@ -371,17 +378,23 @@ describe("tool spans", () => {
       ...toolCall("c_email", "send-email", { to: "ada@example.com", body: "Hi" }),
       finish("tool-calls"),
     ];
-    const afterEmailTurn: ReadonlyArray<AgUi.Message> = [
+    const afterEmailTurn: ReadonlyArray<AgUiSchema.Message> = [
       userMessage("u1", "Email Ada"),
       {
         id: "id-1",
         role: "assistant",
         toolCalls: [
-          { id: "c_email", function: { name: "send-email", arguments: '{"to":"ada@example.com","body":"Hi"}' } },
+          {
+            id: "c_email",
+            type: "function",
+            function: { name: "send-email", arguments: '{"to":"ada@example.com","body":"Hi"}' },
+          },
         ],
       },
     ];
-    const resumeRun = (approved: boolean): AgUi.RunAgentInput => ({
+    const resumeRun = (approved: boolean): AgUiSchema.RunAgentInput => ({
+      tools: [],
+      context: [],
       threadId: "t1",
       runId: "r2",
       messages: afterEmailTurn,
@@ -395,7 +408,7 @@ describe("tool spans", () => {
         const handlers = countingApprovalLayer();
         const first = yield* tracedApproval(
           [emailStep],
-          [{ threadId: "t1", runId: "r1", messages: [userMessage("u1", "Email Ada")] }],
+          [{ tools: [], context: [], threadId: "t1", runId: "r1", messages: [userMessage("u1", "Email Ada")] }],
           handlers,
         );
         expect(emailSpans(first.tracer)).toEqual([]);

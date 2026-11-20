@@ -1,11 +1,10 @@
 import { verifyEvents } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { Effect, Layer, Option, Schema, Stream, Tracer } from "effect";
-import { AiError, IdGenerator, LanguageModel, Response, Tool, Toolkit } from "effect/ai";
+import { AgUiSchema, AiError, IdGenerator, LanguageModel, Response, Tool, Toolkit } from "effect/ai";
 import type { Prompt } from "effect/ai";
 import type * as Agent from "../src/Agent.ts";
 import type * as AgUi from "../src/AgUi.ts";
-import * as AgUiSchema from "../src/AgUiSchema.ts";
 import * as Runner from "../src/Runner.ts";
 import { from, lastValueFrom, toArray } from "rxjs";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -207,30 +206,43 @@ export const countingApprovalLayer = () => {
 // -----------------------------------------------------------------------------
 
 /** A frontend tool as a client advertises it in `RunAgentInput.tools`. */
-export const PickFile: AgUi.FrontendTool = {
+export const PickFile = {
   name: "pick-file",
   description: "Ask the user to pick a file",
   parameters: { type: "object", properties: { accept: { type: "string" } } },
-};
+} satisfies AgUiSchema.Tool;
 
-export const GetLocation: AgUi.FrontendTool = {
+export const GetLocation = {
   name: "get-location",
   description: "Read the browser's location",
   parameters: { type: "object", properties: {} },
-};
+} satisfies AgUiSchema.Tool;
 
 /** A client `tool` message answering a frontend call, as TanStack AI sends it (its own id, JSON text content). */
 export const toolAnswer = (
   toolCallId: string,
   content: unknown,
   options?: { readonly id?: string; readonly error?: string },
-): AgUi.Message => ({
+): AgUiSchema.Message => ({
   id: options?.id ?? `tool-${toolCallId}`,
   role: "tool",
   toolCallId,
   content: typeof content === "string" ? content : JSON.stringify(content),
   ...(options?.error === undefined ? {} : { error: options.error }),
 });
+
+// -----------------------------------------------------------------------------
+// Run input
+// -----------------------------------------------------------------------------
+
+/**
+ * A run input as AG-UI's schema decodes it, with `tools` and `context` defaulting to the empty arrays a request
+ * without them decodes to.
+ */
+export const runInput = (
+  input: Omit<AgUiSchema.RunAgentInput, "tools" | "context"> &
+    Partial<Pick<AgUiSchema.RunAgentInput, "tools" | "context">>,
+): AgUiSchema.RunAgentInput => ({ tools: [], context: [], ...input });
 
 // -----------------------------------------------------------------------------
 // Evals
@@ -276,7 +288,7 @@ export const verify = async (events: ReadonlyArray<AgUi.Event>): Promise<Array<B
  */
 export const runAgUi = <Tools extends Record<string, Tool.Any>, R>(
   agent: Agent.Agent<Tools, R>,
-  inputs: ReadonlyArray<AgUi.RunAgentInput>,
+  inputs: ReadonlyArray<AgUiSchema.RunAgentInput>,
   options?: Runner.Options,
 ) =>
   Effect.forEach(inputs, (input) =>

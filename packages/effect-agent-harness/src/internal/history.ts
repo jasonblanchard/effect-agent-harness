@@ -1,6 +1,6 @@
 import { Cause, Effect } from "effect";
 import * as Agent from "../Agent.ts";
-import type * as AgUi from "../AgUi.ts";
+import type { AgUiSchema } from "effect/ai";
 import type * as Messages from "../Messages.ts";
 import type * as Thread from "../Thread.ts";
 import * as Conversions from "./conversions.ts";
@@ -40,13 +40,16 @@ export interface Service {
    * failure after the history took hold of the thread is reported to it
    * before `beginAttempt` fails, as `Attempt.end` would report it.
    */
-  readonly beginAttempt: (input: AgUi.RunAgentInput, options: AttemptOptions) => Effect.Effect<Attempt, AttemptError>;
+  readonly beginAttempt: (
+    input: AgUiSchema.RunAgentInput,
+    options: AttemptOptions,
+  ) => Effect.Effect<Attempt, AttemptError>;
   /**
    * Releases whatever the run holds, without reporting an end. Only for the
    * request-scoped runner's slow path: a cancelled run that did not end within
    * its time limit and was interrupted. Never fails.
    */
-  readonly abandonAttempt: (input: AgUi.RunAgentInput) => Effect.Effect<void>;
+  readonly abandonAttempt: (input: AgUiSchema.RunAgentInput) => Effect.Effect<void>;
 }
 
 /** One attempt of a run, as `beginAttempt` opened it. */
@@ -67,7 +70,7 @@ export const failed = (cause: Cause.Cause<unknown>): Terminal => {
   return { _tag: "Failed", error, code: Agent.errorCode(error) };
 };
 
-const logMalformed = (input: AgUi.RunAgentInput) =>
+const logMalformed = (input: AgUiSchema.RunAgentInput) =>
   Effect.gen(function* () {
     const malformed = Conversions.malformedAnswers(input.resume ?? []);
     if (malformed.length > 0) {

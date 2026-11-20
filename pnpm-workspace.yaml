@@ -2,7 +2,7 @@ packages:
   - packages/**
 catalog:
   typescript: 7.0.2
-  effect: 4.0.5
+  effect: 4.1.4
 minimumReleaseAgeExclude:
   - "@effect/tsgo-darwin-arm64@0.54.1"
   - "@effect/tsgo-darwin-x64@0.54.1"

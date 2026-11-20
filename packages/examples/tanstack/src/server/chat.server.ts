@@ -1,10 +1,11 @@
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
-import { Toolkit } from "effect/ai";
-import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { AgUiSchema, Toolkit } from "effect/ai";
+import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
+import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 import { convertMessagesToModelMessages, modelMessagesToUIMessages } from "@tanstack/ai";
 import type { ModelMessage, SubagentPart, UIMessage } from "@tanstack/ai";
-import { Agent, AgUi, Checkpoint, EventLog, History, Runner, Sse, Thread } from "effect-agent-harness";
+import { Agent, Checkpoint, EventLog, History, Runner, Thread } from "effect-agent-harness";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
@@ -73,16 +74,35 @@ const StoresLayer = Layer.mergeAll(
   EventLog.layerMemory,
 );
 
-const ChatQuery = Schema.Struct({
+const ChatQuery = {
   threadId: Schema.String,
   runId: Schema.optional(Schema.String),
   offset: Schema.optional(Schema.String),
-});
+};
 
-const ResumeHeaders = Schema.Struct({ "last-event-id": Schema.optional(Schema.String) });
+const ResumeHeaders = { "last-event-id": Schema.optional(Schema.String) };
 
 /** What TanStack AI's `stop()` posts to `cancelUrl`. */
 const CancelBody = Schema.Struct({ threadId: Schema.String, runId: Schema.String });
+
+/** An event from the log as an SSE frame: its cursor is the frame's `id`, which a reconnecting client sends back as `Last-Event-ID`. */
+const StoredEvent = Schema.Struct({
+  id: Schema.String,
+  event: Schema.String,
+  data: Schema.fromJsonString(Schema.toCodecJson(AgUiSchema.Event)),
+});
+
+/** A run's events, followed from the log. */
+const RunEvents = HttpApiSchema.WithHeaders(HttpApiSchema.StreamSse({ events: StoredEvent }), {
+  "cache-control": Schema.Literal("no-cache"),
+});
+
+/** TanStack AI's server hydrate: the thread's `UIMessage`s, its open approvals, and the run still going, if any. */
+const Hydrate = Schema.Struct({
+  messages: Schema.Array(Schema.Unknown),
+  interrupts: Schema.NullOr(Schema.Unknown),
+  activeRun: Schema.NullOr(Schema.Unknown),
+});
 
 /** How long a run's event stream stays open with nothing new. Longer than the slowest model or tool step. */
 const IDLE_TIMEOUT = "2 minutes";
@@ -150,22 +170,11 @@ const toUIMessagesWithSubagents = (
   return build(undefined);
 };
 
-const ChatRoutes = HttpRouter.use((router) =>
-  Effect.gen(function* () {
-    // A detached run outlives its request and writes to the event log, so a
-    // reloaded page or a second tab can follow it. A disconnect doesn't stop
-    // it; only `detached.cancel` does (the cancel route below).
-    const detached = yield* Runner.makeDetached(assistant);
-    const log = yield* EventLog.EventLog;
-
-    // Streams a run's log as SSE, after `after`. A crashed run's log never ends,
-    // so the stream ends once nothing has arrived for a while; the client
-    // reconnects once and then reports an error.
-    const follow = (threadId: string, runId: string, after: string | undefined) =>
-      Effect.flatMap(log.subscribe(threadId, runId, after), (events) =>
-        events.pipe(Stream.timeout(IDLE_TIMEOUT), Sse.encodeStored, Sse.response),
-      );
-
+// The chat's endpoints, as TanStack AI calls them. They are not `AgUiServer.endpoint`: every run is detached, and
+// its stream follows the event log with cursors as SSE ids, so a client reconnects with `Last-Event-ID`. A real
+// server would authorise the thread on every endpoint, which also authorises its runs.
+class ChatApi extends HttpApi.make("chat").add(
+  HttpApiGroup.make("chat")
     // GET /api/chat?threadId=…: TanStack AI's server hydrate (`persistence:
     // true`). On mount, the page restores the thread's messages and its open
     // approvals from here, and learns of a run still going (`activeRun`).
@@ -173,81 +182,97 @@ const ChatRoutes = HttpRouter.use((router) =>
     // GET /api/chat?threadId=…&offset=-1&runId=…: TanStack AI's join of that
     // run, replayed from the start. `-1` is its own marker for "from the start",
     // which the log would reject as a cursor. The rejoining read leaves out what
-    // the replay shows, so each message appears once. The thread id comes from
-    // the connection URL. A real route would authorise that thread here, which
-    // also authorises its runs.
-    yield* router.add(
-      "GET",
-      "/api/chat",
-      Effect.gen(function* () {
-        const { threadId, runId, offset } = yield* HttpServerRequest.schemaSearchParams(ChatQuery);
-
-        if (runId !== undefined) {
-          const { "last-event-id": lastEventId } = yield* HttpServerRequest.schemaHeaders(ResumeHeaders);
-          return yield* follow(threadId, runId, lastEventId ?? (offset === "-1" ? undefined : offset));
-        }
-
-        const { messages, interrupts, activeRun } = yield* History.restore(threadId, { rejoin: true });
-
-        return yield* HttpServerResponse.json({
-          messages: toUIMessagesWithSubagents(messages, interrupts),
-          interrupts: interrupts === undefined ? null : interrupts,
-          activeRun: activeRun === undefined ? null : activeRun,
-        });
-      }).pipe(
-        Effect.catchTags({
-          SchemaError: () => Effect.succeed(HttpServerResponse.text("Missing threadId", { status: 400 })),
-          InvalidCursor: (error) => Effect.succeed(HttpServerResponse.text(error.message, { status: 400 })),
-        }),
-      ),
-    );
-
+    // the replay shows, so each message appears once.
+    .add(
+      HttpApiEndpoint.get("read", "/api/chat", {
+        query: ChatQuery,
+        headers: ResumeHeaders,
+        success: [Hydrate, RunEvents],
+        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+      }),
+    )
     // POST /api/chat: TanStack AI's `fetchServerSentEvents` posts an AG-UI
     // `RunAgentInput` and reads the AG-UI events back as SSE. A run that stops
-    // for an approval is answered by the next run's `resume` entries. The
-    // frames carry cursors, so after a dropped connection the client sends the
-    // same request again with `Last-Event-ID`: that only follows the run,
-    // because starting it again would fork a second attempt beside the first.
-    yield* router.add(
-      "POST",
-      "/api/chat",
-      Effect.gen(function* () {
-        const input = yield* HttpServerRequest.schemaBodyJson(AgUi.RunAgentInput);
-        const { "last-event-id": lastEventId } = yield* HttpServerRequest.schemaHeaders(ResumeHeaders);
-
-        if (lastEventId === undefined) {
-          yield* detached.start(input);
-        }
-
-        return yield* follow(input.threadId, input.runId, lastEventId);
-      }).pipe(
-        Effect.catch((error) =>
-          Effect.succeed(HttpServerResponse.text(`Invalid request: ${error.message}`, { status: 400 })),
-        ),
-      ),
-    );
-
+    // for an approval is answered by the next run's `resume` entries. After a
+    // dropped connection the client sends the same request again with
+    // `Last-Event-ID`: that only follows the run, because starting it again
+    // would fork a second attempt beside the first.
+    .add(
+      HttpApiEndpoint.post("send", "/api/chat", {
+        payload: AgUiSchema.RunAgentInput,
+        headers: ResumeHeaders,
+        success: RunEvents,
+        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+      }),
+    )
     // POST /api/chat/cancel: the page's Stop button. TanStack AI's `stop()`
     // aborts its own stream and posts the run's ids here (`cancelUrl`). The run
     // ends as cancelled: its log ends with `RUN_FINISHED` outcome `cancelled`,
     // and the partial reply is committed to the thread, which is then free for
-    // the next message. Cancelling a run that has ended does nothing. A real
-    // route would authorise the thread here, as for the other routes.
-    yield* router.add(
-      "POST",
-      "/api/chat/cancel",
-      Effect.gen(function* () {
-        const run = yield* HttpServerRequest.schemaBodyJson(CancelBody);
-        yield* detached.cancel(run);
-        return HttpServerResponse.empty({ status: 204 });
-      }).pipe(
-        Effect.catch((error) =>
-          Effect.succeed(HttpServerResponse.text(`Invalid request: ${error.message}`, { status: 400 })),
-        ),
-      ),
-    );
-  }),
-).pipe(Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)));
+    // the next message. Cancelling a run that has ended does nothing.
+    .add(HttpApiEndpoint.post("cancel", "/api/chat/cancel", { payload: CancelBody, success: HttpApiSchema.NoContent })),
+) {}
 
-/** The chat endpoint as a web handler (`Request => Promise<Response>`), mounted by `src/routes/api/chat.ts`. */
+const ChatHandlers = HttpApiBuilder.group(
+  ChatApi,
+  "chat",
+  Effect.fn(function* (handlers) {
+    // A detached run outlives its request and writes to the event log, so a
+    // reloaded page or a second tab can follow it. A disconnect doesn't stop
+    // it; only `detached.cancel` does (the cancel endpoint).
+    const detached = yield* Runner.makeDetached(assistant);
+    const log = yield* EventLog.EventLog;
+
+    // A run's log as SSE, after `after`. A crashed run's log never ends, so the
+    // stream ends once nothing has arrived for a while; the client reconnects
+    // once and then reports an error. A store failure is the server's fault
+    // (500), and aborts a stream already going; an unissued cursor is a 400.
+    const follow = (threadId: string, runId: string, after: string | undefined) =>
+      log.subscribe(threadId, runId, after).pipe(
+        Effect.catchTag("EventLogError", Effect.die),
+        Effect.map((events) =>
+          HttpApiSchema.withHeaders({
+            body: events.pipe(
+              Stream.timeout(IDLE_TIMEOUT),
+              Stream.map(({ cursor, event }) => ({ id: cursor, event: "message", data: event })),
+              Stream.orDie,
+            ),
+            headers: { "cache-control": "no-cache" as const },
+          }),
+        ),
+      );
+
+    return handlers
+      .handle("read", ({ query: { threadId, runId, offset }, headers }) => {
+        if (runId !== undefined) {
+          return follow(threadId, runId, headers["last-event-id"] ?? (offset === "-1" ? undefined : offset));
+        }
+        return History.restore(threadId, { rejoin: true }).pipe(
+          Effect.orDie,
+          Effect.map(({ messages, interrupts, activeRun }) => ({
+            messages: toUIMessagesWithSubagents(messages, interrupts),
+            interrupts: interrupts === undefined ? null : interrupts,
+            activeRun: activeRun === undefined ? null : activeRun,
+          })),
+        );
+      })
+      .handle("send", ({ payload, headers }) => {
+        const lastEventId = headers["last-event-id"];
+        return Effect.andThen(lastEventId === undefined ? detached.start(payload) : Effect.void, () =>
+          follow(payload.threadId, payload.runId, lastEventId),
+        );
+      })
+      .handle("cancel", ({ payload }) => detached.cancel(payload));
+  }),
+);
+
+// The run streams read their services from each request's context, so they must be in the layer's output
+// (`Layer.provideMerge`), which the web handler provides to every request. `Layer.provide` would hide them.
+const ChatRoutes = HttpApiBuilder.layer(ChatApi).pipe(
+  Layer.provide(ChatHandlers),
+  Layer.provideMerge(Layer.mergeAll(ModelLayer, ToolsLayer, StoresLayer)),
+  Layer.provide(HttpServer.layerServices),
+);
+
+/** The chat endpoints as a web handler (`Request => Promise<Response>`), mounted by `src/routes/api/chat.ts`. */
 export const { handler } = HttpRouter.toWebHandler(ChatRoutes, { disableLogger: true });
