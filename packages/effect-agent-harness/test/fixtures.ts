@@ -202,6 +202,61 @@ export const countingApprovalLayer = () => {
 };
 
 // -----------------------------------------------------------------------------
+// Progress tools
+// -----------------------------------------------------------------------------
+
+/** Reports `{ done, of }` for each source as a preliminary result; the final one adds `hits`. */
+export const Search = Tool.make("search", {
+  description: "Search some sources, reporting progress",
+  parameters: Schema.Struct({ query: Schema.String, sources: Schema.Finite }),
+  success: Schema.Struct({ done: Schema.Finite, of: Schema.Finite, hits: Schema.optionalKey(Schema.Finite) }),
+  failure: Schema.Struct({ message: Schema.String }),
+  failureMode: "return",
+});
+
+/** Reports each number below `to` as a preliminary result, then returns `to`: progress that isn't an object. */
+export const Count = Tool.make("count", {
+  description: "Count up to a number",
+  parameters: Schema.Struct({ to: Schema.Finite }),
+  success: Schema.Finite,
+});
+
+export const ProgressToolkit = Toolkit.make(Search, Count);
+
+/**
+ * Handlers for {@link ProgressToolkit}, recording each search query in `calls`.
+ * `between` runs after every preliminary result, so a test can block a handler
+ * mid-call. A search for "fail" fails after reporting its progress.
+ */
+export const progressLayer = (options?: { readonly between?: Effect.Effect<void> | undefined }) => {
+  const calls: Array<string> = [];
+  const between = options?.between ?? Effect.void;
+  const layer = ProgressToolkit.toLayer({
+    search: ({ query, sources }, ctx) =>
+      Effect.gen(function* () {
+        calls.push(query);
+        for (let done = 1; done <= sources; done++) {
+          yield* ctx.preliminary({ done, of: sources });
+          yield* between;
+        }
+        if (query === "fail") {
+          return yield* Effect.fail({ message: "search failed" });
+        }
+        return { done: sources, of: sources, hits: 3 };
+      }),
+    count: ({ to }, ctx) =>
+      Effect.gen(function* () {
+        for (let n = 1; n < to; n++) {
+          yield* ctx.preliminary(n);
+          yield* between;
+        }
+        return to;
+      }),
+  });
+  return { layer, calls };
+};
+
+// -----------------------------------------------------------------------------
 // Frontend tools
 // -----------------------------------------------------------------------------
 

@@ -7,10 +7,11 @@ import { convertMessagesToModelMessages, modelMessagesToUIMessages } from "@tans
 import type { ModelMessage, SubagentPart, UIMessage } from "@tanstack/ai";
 import { Agent, Checkpoint, EventLog, History, Runner, Thread } from "effect-agent-harness";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
+import { SearchDocs, searchDocs } from "../tools/search-docs.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
 
 // The agent's behaviour, independent of the model provider and of any store.
-const AssistantToolkit = Toolkit.make(GetWeather, SendEmail);
+const AssistantToolkit = Toolkit.make(GetWeather, SendEmail, SearchDocs);
 
 // A subagent: an agent of its own, which the assistant's model calls as a tool
 // named after it. Its work streams to the page as a card, and a call it makes
@@ -62,7 +63,11 @@ const ModelLayer = AnthropicLanguageModel.layer({
   Layer.provide(FetchHttpClient.layer),
 );
 
-const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-email": sendEmail });
+const ToolsLayer = AssistantToolkit.toLayer({
+  "get-weather": getWeather,
+  "send-email": sendEmail,
+  "search-docs": searchDocs,
+});
 
 // The server owns the transcript (`History.layerServer`), because the hydrate
 // route below reads each thread back from the store after a reload. Threads

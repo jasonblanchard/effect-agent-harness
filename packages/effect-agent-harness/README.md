@@ -279,6 +279,51 @@ Once enabled, reasoning reaches **every client**, on the stream and through `res
 
 Only a block's text is sent. Provider metadata such as a signature stays on the stored parts, so the model still gets its reasoning back on later steps and runs under the server history, but no event carries it (`REASONING_ENCRYPTED_VALUE` isn't emitted). A block with no text, such as a redacted one, emits nothing. Under the client history, the client's `reasoning` messages are dropped, so reasoning doesn't return to the model between runs.
 
+### Tool progress
+
+A slow tool reports progress with `effect/ai`'s own `ctx.preliminary`. effect-agent-harness adds no API for it:
+
+```ts
+const Search = Tool.make("search-docs", {
+  parameters: Schema.Struct({ query: Schema.String }),
+  success: Schema.Struct({ done: Schema.Finite, of: Schema.Finite, hits: Schema.Array(Hit) }),
+});
+
+const SearchLayer = Toolkit.make(Search).toLayer({
+  "search-docs": ({ query }, ctx) =>
+    Effect.gen(function* () {
+      const hits: Array<typeof Hit.Type> = [];
+      for (const [i, source] of sources.entries()) {
+        hits.push(...(yield* searchOne(source, query)));
+        yield* ctx.preliminary({ done: i + 1, of: sources.length, hits: [...hits] });
+      }
+      return { done: sources.length, of: sources.length, hits };
+    }),
+});
+```
+
+Each preliminary value streams as an AG-UI `ACTIVITY_SNAPSHOT` between the call's `TOOL_CALL_END` and its `TOOL_CALL_RESULT`:
+
+```ts
+{
+  type: "ACTIVITY_SNAPSHOT",
+  messageId: "…",                       // one per call; each snapshot replaces the last
+  activityType: "search-docs",          // the tool's name
+  content: { done: 2, of: 5, hits: [] }, // the value, encoded with the tool's success schema
+  metadata: { "effect-agent-harness:toolCallId": "toolu_…" }, // the call it reports on
+}
+```
+
+A value that isn't a JSON object is sent as `{ value }`, because AG-UI requires `content` to be an object. TanStack AI shows each activity as a `role: "activity"` message with an `activity` part. Clients that don't know activity ignore it.
+
+- **Only the final value reaches the model.** Preliminary values are never sent to it, committed to the thread or checkpointed. A preliminary value has the tool's `Success` type, so a tool whose progress differs from its result declares a tagged union, and must make sure its final value is the result variant: the type system can't check that.
+- **Progress is live only.** `History.restore` returns no activity, so after a reload only the call's result remains. A detached run's event log holds the snapshots, so a client that rejoins the run, or reconnects with `Last-Event-ID`, gets them.
+- **A slow reader gets the latest.** When a reader falls behind, a snapshot that a later one for the same call already follows is dropped, so it catches up on the newest progress instead of a backlog. The last snapshot before the result is always delivered. A reader that keeps up gets every snapshot. Pacing is still the handler's job: a durable event log stores each snapshot a reader keeps up with.
+- **Replays report nothing.** A call served from a checkpoint doesn't run its handler, so it emits no progress. A call run again after a crash reports under the same `messageId`, so its snapshots replace the first attempt's. A subagent's snapshots carry its `subagentRunId`.
+- **A cancelled or failed call leaves its last snapshot.** The library doesn't know the content's shape, so it doesn't finalise it. Match the activity to its call through `metadata["effect-agent-harness:toolCallId"]` and use the call's result, or the run's end, to close the widget.
+
+`Agent.Event` gains `ToolProgress` and `AgUi.Event` gains `ActivitySnapshotEvent`, so an exhaustive `switch` over either needs the new case.
+
 ### Run info
 
 Every run gets an `Agent.RunInfo`, which the system prompt and tools read through `Agent.CurrentRun`:
@@ -790,6 +835,7 @@ The core loop doesn't depend on AG-UI or any store. `Agent.run(agent, { runId, t
 | ------------------- | ---------------------------------------------------------------------- |
 | `StepStarted`       | A model step begins (`step`, `messageId`).                             |
 | `ModelPart`         | A streamed model part, live.                                           |
+| `ToolProgress`      | A handler's preliminary result (`encodedValue`), live; never replayed. |
 | `ToolResult`        | A tool call's result (`encodedResult`, `isFailure`).                   |
 | `ApprovalRequested` | A tool call waits for approval.                                        |
 | `StepFinished`      | A step ends; `entries` are the thread entries it produced.             |

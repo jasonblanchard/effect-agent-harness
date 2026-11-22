@@ -251,6 +251,24 @@ export type Event =
       readonly isFailure: boolean;
       readonly replayed: boolean;
     }
+  /**
+   * A preliminary result a tool handler reported through `ctx.preliminary` while it ran, encoded with the
+   * tool's success schema. Only an executing handler reports one, so it is never replayed, and it is never
+   * sent to the model, put in the step's entries or checkpointed.
+   */
+  | {
+      readonly _tag: "ToolProgress";
+      readonly step: number;
+      /**
+       * The assistant message id of the step that made the call. `undefined` for an approved call run in
+       * step 0, which an earlier run made.
+       */
+      readonly messageId: string | undefined;
+      readonly toolCallId: string;
+      readonly toolName: string;
+      readonly encodedValue: unknown;
+      readonly replayed: false;
+    }
   | {
       readonly _tag: "ApprovalRequested";
       readonly step: number;
@@ -363,6 +381,12 @@ const ModelStep = Schema.Struct({
 });
 type ModelStep = typeof ModelStep.Type;
 type ToolCall = ModelStep["toolCalls"][number];
+
+/** Where a call's progress is reported: see the `ToolProgress` event. */
+interface CallOrigin {
+  readonly step: number;
+  readonly messageId: string | undefined;
+}
 
 /** What a tool call stores in its checkpoint. */
 const ToolStep = Schema.Union([
@@ -608,8 +632,15 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           isFailure,
         }));
 
-      // Runs the handler, unless the call needs approval and no decision was made yet.
-      const executeTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined, gate?: Gate) =>
+      // Runs the handler, unless the call needs approval and no decision was made yet. `origin` is where its
+      // progress is reported: the step running it and the message id of the step that made the call.
+      const executeTool = (
+        call: ToolCall,
+        origin: CallOrigin,
+        prompt: Prompt.Prompt,
+        decision: Decision | undefined,
+        gate?: Gate,
+      ) =>
         memoTool(
           `tool:${call.id}`,
           Effect.gen(function* () {
@@ -621,23 +652,43 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             } else if (!decision.approved) {
               return yield* result({ type: "execution-denied", reason: decision.reason }, true);
             }
-            return yield* handleTool(call);
+            return yield* handleTool(call, origin);
           }),
           gate,
         );
 
       // The call's outcome, or `cancelledCall` if the run's cancellation stopped it first.
-      const guardedTool = (call: ToolCall, prompt: Prompt.Prompt, decision: Decision | undefined) =>
+      const guardedTool = (call: ToolCall, origin: CallOrigin, prompt: Prompt.Prompt, decision: Decision | undefined) =>
         Effect.map(
-          guard((gate) => executeTool(call, prompt, decision, gate)),
+          guard((gate) => executeTool(call, origin, prompt, decision, gate)),
           Option.match({ onNone: (): CallOutcome => cancelledCall, onSome: withoutEntries }),
         );
 
-      // Only an executed handler is traced: a replayed, denied, interrupted or pending call has no span.
-      const handleTool = (call: ToolCall) =>
+      // Only an executed handler is traced: a replayed, denied, interrupted or pending call has no span. Its
+      // preliminary results go out as progress while it runs, inside the checkpoint, so a replayed call reports
+      // none; only the last final result is kept.
+      const handleTool = (call: ToolCall, origin: CallOrigin) =>
         Effect.gen(function* () {
           const results = yield* toolkit.handle(call.name, call.params as never, call.id);
-          const final = yield* Stream.runLast(Stream.filter(results, (r) => !r.preliminary));
+          const final = yield* Stream.runFoldEffect(
+            results,
+            () => Option.none<Tool.HandlerResult<Tool.Any>>(),
+            (last, r) =>
+              r.preliminary
+                ? Effect.as(
+                    emit({
+                      _tag: "ToolProgress",
+                      step: origin.step,
+                      messageId: origin.messageId,
+                      toolCallId: call.id,
+                      toolName: call.name,
+                      encodedValue: r.encodedResult,
+                      replayed: false,
+                    }),
+                    last,
+                  )
+                : Effect.succeedSome(r),
+          );
           if (Option.isNone(final)) {
             return yield* Effect.die("Tool handler did not produce a final result");
           }
@@ -1036,7 +1087,9 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         const calls = [...decided.map(({ call }) => call), ...suspended.map(({ call }) => call)];
         const ended = yield* Effect.all(
           [
-            ...decided.map(({ call, decision }) => guardedTool(call, opening, decision)),
+            ...decided.map(({ call, decision }) =>
+              guardedTool(call, { step: 0, messageId: undefined }, opening, decision),
+            ),
             ...suspended.map(({ call, parentMessageId }) => resumeSubagent(call, parentMessageId, opening)),
           ],
           { concurrency: "unbounded" },
@@ -1100,7 +1153,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             }
             const child = subagents.get(call.name);
             return child === undefined
-              ? guardedTool(call, modelPrompt, undefined)
+              ? guardedTool(call, { step, messageId }, modelPrompt, undefined)
               : callSubagent(call, child, messageId, modelPrompt, Prompt.empty);
           },
           { concurrency: "unbounded" },

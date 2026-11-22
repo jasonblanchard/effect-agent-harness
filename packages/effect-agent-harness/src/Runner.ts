@@ -302,7 +302,12 @@ const agUiRun =
             frontendTools: input.tools.map(frontendTool),
             subagentPrompts: subagentPrompts.value,
             cancelled: how?.cancelled,
-          }).pipe(Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)));
+          }).pipe(
+            // The run's events queue up here while a slow consumer (an event log append) holds the pipeline, so
+            // this is where superseded progress is dropped: before the commits, which must not run ahead of it.
+            AgUi.conflateProgress,
+            Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)),
+          );
         }),
       ).pipe(
         failInBand,
@@ -459,7 +464,8 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
               }
             }),
         );
-        return Stream.fromQueue(queue);
+        // The run drains into the queue at once, so a slow consumer's backlog is here.
+        return AgUi.conflateActivity(Stream.fromQueue(queue));
       }),
     );
 };

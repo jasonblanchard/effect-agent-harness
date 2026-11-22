@@ -20,6 +20,8 @@ import {
   evalLayers,
   finish,
   PickFile,
+  progressLayer,
+  ProgressToolkit,
   runAgUi,
   scriptedModel,
   serverStores,
@@ -920,6 +922,35 @@ describe("AG-UI events of subagents", () => {
           .map((e) => e.type === "STEP_STARTED" && e.stepName),
       ).toEqual(["step-1", "step-2"]);
       expect(events.some((e) => e.type === "RUN_STARTED" && events.indexOf(e) > 0)).toBe(false);
+    }),
+  );
+
+  it.effect("attributes a child's tool progress to the child", () =>
+    Effect.gen(function* () {
+      const searcher = Agent.define({ name: "searcher", toolkit: ProgressToolkit });
+      const delegator = Agent.define({ toolkit: WeatherToolkit, subagents: { agents: [searcher] } });
+      const model = scriptedModel([
+        [...toolCall("c1", "searcher", { prompt: "Search the docs" }), finish("tool-calls")],
+        [...toolCall("c2", "search", { query: "docs", sources: 1 }), finish("tool-calls")],
+        [...text("0", "Found 3"), finish("stop")],
+        [...text("0", "It found 3."), finish("stop")],
+      ]);
+      const [events] = yield* runAgUi(delegator as typeof parent, [
+        {
+          tools: [],
+          context: [],
+          threadId: "t1",
+          runId: "r1",
+          messages: [{ id: "u1", role: "user", content: "Search the docs" }],
+        },
+      ]).pipe(Effect.provide([model.layer, progressLayer().layer, countingWeatherLayer().layer, evalLayers]));
+      const snapshots = events!.filter((e) => e.type === "ACTIVITY_SNAPSHOT");
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0]).toMatchObject({
+        subagentRunId: child,
+        activityType: "search",
+        metadata: { "effect-agent-harness:toolCallId": "c2" },
+      });
     }),
   );
 

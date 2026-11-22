@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, Scope, Stream } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Queue, Schema, Scope, Stream } from "effect";
 import { expectTypeOf } from "vitest";
 import { AgUiSchema, Prompt, Tool, Toolkit } from "effect/ai";
 import type { Response } from "effect/ai";
@@ -20,6 +20,8 @@ import {
   evalLayers,
   finish,
   PickFile,
+  progressLayer,
+  ProgressToolkit,
   reasoning,
   runAgUi,
   runInput,
@@ -2635,6 +2637,216 @@ describe("Runner.makeAttached streams", () => {
       ).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
       expect(types(events)).toEqual(["RUN_STARTED", "STEP_STARTED", "TEXT_MESSAGE_START"]);
       expect(interrupted).toBe(true);
+    }),
+  );
+});
+
+describe("Runner tool progress", () => {
+  const progressAgent = Agent.define({ toolkit: ProgressToolkit });
+  const search = (sources: number) => toolCall("c_search", "search", { query: "docs", sources });
+  const run1 = input("r1", [userMessage("u1", "Search the docs")]);
+
+  /** A model step that completes `called` when the model is asked for it. */
+  const signalling = (called: Deferred.Deferred<void>, parts: ReadonlyArray<Response.StreamPartEncoded>): Step =>
+    Stream.fromEffect(Deferred.succeed(called, undefined)).pipe(
+      Stream.drain,
+      Stream.concat(Stream.fromIterable(parts)),
+    );
+
+  const snapshotsOf = (events: ReadonlyArray<AgUi.Event>) =>
+    events.flatMap((e) => (e.type === "ACTIVITY_SNAPSHOT" ? [e.content as { done: number }] : []));
+
+  /** Every snapshot comes before the call's result. */
+  const beforeResult = (events: ReadonlyArray<AgUi.Event>) => {
+    const resultAt = events.findIndex((e) => e.type === "TOOL_CALL_RESULT" && e.toolCallId === "c_search");
+    return events.every((e, i) => e.type !== "ACTIVITY_SNAPSHOT" || i < resultAt);
+  };
+
+  /** The event log, with `before` run ahead of every append. */
+  const slowLog = (before: (event: AgUi.Event) => Effect.Effect<void>) =>
+    Layer.effect(
+      EventLog.EventLog,
+      Effect.gen(function* () {
+        const inner = yield* EventLog.EventLog;
+        return EventLog.EventLog.of({
+          ...inner,
+          append: (threadId, runId, event) => Effect.andThen(before(event), inner.append(threadId, runId, event)),
+        });
+      }),
+    ).pipe(Layer.provide(EventLog.layerMemory));
+
+  const followLog = Effect.flatMap(EventLog.EventLog, (log) =>
+    Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1"))).pipe(Effect.map((s) => s.map((e) => e.event))),
+  );
+
+  /** Starts `run1` detached in a new scope and returns its log once it has ended. */
+  const detachedRun = (steps: ReadonlyArray<Step>, handlers: ReturnType<typeof progressLayer>) =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const runner = yield* Runner.makeDetached(progressAgent).pipe(
+        Effect.provide([scriptedModel(steps).layer, handlers.layer]),
+        Effect.provideService(Scope.Scope, scope),
+      );
+      yield* runner.start(run1);
+      const events = yield* followLog;
+      yield* Effect.promise(() => verify(events));
+      return events;
+    });
+
+  it.effect("commits no activity, so a thread read back holds none", () =>
+    Effect.gen(function* () {
+      yield* runAgUi(progressAgent, [run1]);
+      const restored = yield* History.restore("t1");
+      expect(restored.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    }).pipe(
+      Effect.provide([
+        scriptedModel([
+          [...search(2), finish("tool-calls")],
+          [...text("0", "Found 3."), finish("stop")],
+        ]).layer,
+        progressLayer().layer,
+        evalLayers,
+        serverStores,
+      ]),
+    ),
+  );
+
+  it.effect("drops the backlog of superseded snapshots for a slow attached consumer, keeping the last", () =>
+    Effect.gen(function* () {
+      const called = yield* Deferred.make<void>();
+      let blocked = false;
+      const events = yield* Runner.makeAttached(progressAgent)(run1).pipe(
+        // Reads nothing after the first snapshot until every value is reported and the model is called again.
+        Stream.tap((event) =>
+          event.type === "ACTIVITY_SNAPSHOT" && !blocked ? ((blocked = true), Deferred.await(called)) : Effect.void,
+        ),
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+        Effect.provide([
+          scriptedModel([
+            [...search(10), finish("tool-calls")],
+            signalling(called, [...text("0", "Done."), finish("stop")]),
+          ]).layer,
+          progressLayer().layer,
+          evalLayers,
+        ]),
+      );
+      yield* Effect.promise(() => verify(events));
+      const received = snapshotsOf(events);
+      expect(received.length).toBeLessThan(10);
+      expect(received.at(-1)).toEqual({ done: 10, of: 10 });
+      const done = received.map((s) => s.done);
+      expect(done).toEqual(done.toSorted((a, b) => a - b));
+      expect(beforeResult(events)).toBe(true);
+      expect(events.at(-1)?.type).toBe("RUN_FINISHED");
+    }),
+  );
+
+  it.effect("delivers every snapshot to an attached consumer that keeps up", () =>
+    Effect.gen(function* () {
+      // The handler reports its next value only once the consumer has read the last one.
+      const read = yield* Queue.unbounded<void>();
+      const events = yield* Runner.makeAttached(progressAgent)(run1).pipe(
+        Stream.tap((event) => (event.type === "ACTIVITY_SNAPSHOT" ? Queue.offer(read, undefined) : Effect.void)),
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+        Effect.provide([
+          scriptedModel([
+            [...search(3), finish("tool-calls")],
+            [...text("0", "Done."), finish("stop")],
+          ]).layer,
+          progressLayer({ between: Queue.take(read) }).layer,
+          evalLayers,
+        ]),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(snapshotsOf(events)).toEqual([
+        { done: 1, of: 3 },
+        { done: 2, of: 3 },
+        { done: 3, of: 3 },
+      ]);
+    }),
+  );
+
+  it.effect("drops superseded progress while a detached run's log append is slow, keeping the last", () =>
+    Effect.gen(function* () {
+      const called = yield* Deferred.make<void>();
+      let blocked = false;
+      const events = yield* detachedRun(
+        [[...search(10), finish("tool-calls")], signalling(called, [...text("0", "Done."), finish("stop")])],
+        progressLayer(),
+      ).pipe(
+        Effect.provide(
+          slowLog((event) =>
+            event.type === "ACTIVITY_SNAPSHOT" && !blocked ? ((blocked = true), Deferred.await(called)) : Effect.void,
+          ),
+        ),
+      );
+      const received = snapshotsOf(events);
+      expect(received.length).toBeLessThan(10);
+      expect(received.at(-1)).toEqual({ done: 10, of: 10 });
+      expect(beforeResult(events)).toBe(true);
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores))),
+  );
+
+  it.effect("logs a detached run's snapshots where an attached client receives them", () =>
+    Effect.gen(function* () {
+      const steps: ReadonlyArray<Step> = [
+        [...search(3), finish("tool-calls")],
+        [...text("0", "Done."), finish("stop")],
+      ];
+      // Both readers keep up: the handler waits for each snapshot to be read (or logged) before the next.
+      const read = yield* Queue.unbounded<void>();
+      const ack = (event: AgUi.Event) =>
+        event.type === "ACTIVITY_SNAPSHOT" ? Queue.offer(read, undefined) : Effect.void;
+      const attached = yield* Runner.makeAttached(progressAgent)(run1).pipe(
+        Stream.tap(ack),
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+        Effect.provide([scriptedModel(steps).layer, progressLayer({ between: Queue.take(read) }).layer, evalLayers]),
+      );
+      const logged = yield* detachedRun(steps, progressLayer({ between: Queue.take(read) })).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            counterIds(),
+            serverStores,
+            slowLog((event) => Effect.asVoid(ack(event))),
+          ),
+        ),
+      );
+      expect(snapshotsOf(logged)).toHaveLength(3);
+      expect(logged).toEqual(attached);
+    }).pipe(Effect.provide(Checkpoint.layerNone)),
+  );
+
+  it.effect("reports progress from inside a call run as a workflow activity", () =>
+    Effect.gen(function* () {
+      const { workflow, layer } = Runner.makeWorkflow(progressAgent, { name: "progress" });
+      const events = yield* Effect.gen(function* () {
+        yield* workflow.execute({ input: run1 }, { discard: true });
+        return yield* followLog;
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                scriptedModel([
+                  [...search(2), finish("tool-calls")],
+                  [...text("0", "Done."), finish("stop")],
+                ]).layer,
+                progressLayer().layer,
+                counterIds(),
+                serverStores,
+                EventLog.layerMemory,
+                WorkflowEngine.layerMemory,
+              ),
+            ),
+          ),
+        ),
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(snapshotsOf(events).at(-1)).toEqual({ done: 2, of: 2 });
+      expect(beforeResult(events)).toBe(true);
     }),
   );
 });

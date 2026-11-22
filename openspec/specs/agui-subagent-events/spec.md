@@ -34,11 +34,15 @@ The child's own run lifecycle events SHALL NOT be emitted. Every sequence SHALL 
 - **THEN** no event of the replayed child is emitted again
 
 ### Requirement: Child events are attributed
-Every text message, reasoning, tool call, tool result and step event a child produces SHALL carry the child's `subagentRunId`. Events the parent produces SHALL NOT carry one. A child's step events SHALL be named `step-<n>` with the child's own step numbers.
+Every text message, reasoning, tool call, tool result, activity snapshot and step event a child produces SHALL carry the child's `subagentRunId`. Events the parent produces SHALL NOT carry one. A child's step events SHALL be named `step-<n>` with the child's own step numbers.
 
 #### Scenario: Child text
 - **WHEN** the child streams text and calls a tool
 - **THEN** its `TEXT_MESSAGE_*`, `TOOL_CALL_*`, `TOOL_CALL_RESULT` and `STEP_*` events each carry the child's `subagentRunId`, and the parent's events carry none
+
+#### Scenario: Child tool progress
+- **WHEN** a tool the child calls reports progress
+- **THEN** the resulting `ACTIVITY_SNAPSHOT` events carry the child's `subagentRunId`
 
 ### Requirement: Concurrent children stream independently
 When several children run at once, each child's text messages, reasoning and tool calls SHALL be opened and closed under its own attribution, and SHALL NOT close another child's or the parent's. Each child's open spans SHALL be closed before its closing event. When a resumed detached attempt completes an event log, the spans the earlier attempt left open SHALL be closed under their owners' attribution, and a child the earlier attempt started and did not close SHALL be continued without a second `SUBAGENT_STARTED` and closed once, with its result. Any tool call result, of the agent or of a child, that the earlier attempt checkpointed but did not publish (a step publishes its results only once all its calls finish) SHALL be emitted once when it is replayed, under its owner's attribution; this includes the spawning call of a child that finished in the earlier attempt.

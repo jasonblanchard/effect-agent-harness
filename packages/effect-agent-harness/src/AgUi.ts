@@ -68,6 +68,7 @@ export type Event =
   | AgUiSchema.ToolCallArgsEvent
   | AgUiSchema.ToolCallEndEvent
   | AgUiSchema.ToolCallResultEvent
+  | AgUiSchema.ActivitySnapshotEvent
   | AgUiSchema.SubagentStartedEvent
   | AgUiSchema.SubagentFinishedEvent
   | AgUiSchema.SubagentErrorEvent;
@@ -192,9 +193,112 @@ export const toolCallResult = (
   role: "tool",
 });
 
+/**
+ * A tool's progress as AG-UI activity: `content` is the encoded value when it
+ * is a JSON object and `{ value }` otherwise (AG-UI requires an object), and
+ * `metadata["effect-agent-harness:toolCallId"]` links the activity to its call
+ * (prefixed, as AG-UI asks of keys a producer invents, so it can't collide).
+ */
+export const activitySnapshot = (
+  messageId: string,
+  toolName: string,
+  toolCallId: string,
+  encodedValue: unknown,
+): AgUiSchema.ActivitySnapshotEvent => ({
+  type: "ACTIVITY_SNAPSHOT",
+  messageId,
+  activityType: toolName,
+  content: isJsonObject(encodedValue) ? encodedValue : { value: encodedValue },
+  metadata: { "effect-agent-harness:toolCallId": toolCallId },
+});
+
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+// -----------------------------------------------------------------------------
+// Conflating superseded progress
+//
+// A snapshot replaces the one before it, so one that a later snapshot of the
+// same activity already follows shows nothing a client would keep. A stream
+// read through a queue delivers everything queued since the last read as one
+// chunk, so dropping such snapshots within a chunk does nothing for a reader
+// that keeps up, and drops only the backlog of one that doesn't. The last
+// snapshot of an activity in a chunk always stays, in its place.
+// -----------------------------------------------------------------------------
+
+/** `chunk` without the elements a later element of the same key follows; elements without a key all stay. */
+const dropSuperseded = <A>(
+  chunk: Arr.NonEmptyReadonlyArray<A>,
+  key: (a: A) => string | undefined,
+): Arr.NonEmptyReadonlyArray<A> => {
+  const last = new Map<string, number>();
+  let keyed = 0;
+  chunk.forEach((a, i) => {
+    const k = key(a);
+    if (k !== undefined) {
+      keyed++;
+      last.set(k, i);
+    }
+  });
+  if (keyed === last.size) {
+    return chunk;
+  }
+  // The last element of each key stays, so the result is never empty.
+  return chunk.filter((a, i) => {
+    const k = key(a);
+    return k === undefined || last.get(k) === i;
+  }) as unknown as Arr.NonEmptyReadonlyArray<A>;
+};
+
+/** The activity a `ToolProgress` reports to, at any subagent depth. */
+const progressKey = (event: Agent.Event): string | undefined => {
+  if (event._tag === "ToolProgress") {
+    return JSON.stringify([event.messageId ?? null, event.toolCallId]);
+  }
+  if (event._tag === "Subagent") {
+    const inner = progressKey(event.event);
+    return inner === undefined ? undefined : JSON.stringify([event.subagentRunId, inner]);
+  }
+  return undefined;
+};
+
+/**
+ * Drops each `ToolProgress` that a later one for the same call follows in the
+ * same chunk. For a run's events read through the queue they arrive in.
+ *
+ * @internal
+ */
+export const conflateProgress = <E, R>(events: Stream.Stream<Agent.Event, E, R>): Stream.Stream<Agent.Event, E, R> =>
+  Stream.mapArray(events, (chunk) => dropSuperseded(chunk, progressKey));
+
+/**
+ * Drops each `ACTIVITY_SNAPSHOT` that a later one with the same `messageId`
+ * follows in the same chunk. For AG-UI events read through a queue.
+ *
+ * @internal
+ */
+export const conflateActivity = <E, R>(events: Stream.Stream<Event, E, R>): Stream.Stream<Event, E, R> =>
+  Stream.mapArray(events, (chunk) =>
+    dropSuperseded(chunk, (event) => (event.type === "ACTIVITY_SNAPSHOT" ? event.messageId : undefined)),
+  );
+
 // -----------------------------------------------------------------------------
 // Projection of a run's `Agent.Event`s to AG-UI
 // -----------------------------------------------------------------------------
+
+/**
+ * The message id of a tool call's activity: derived from the assistant message
+ * id of the step that made the call, and the call's id, so a call executed
+ * again reports under the same id and the ids of calls in different steps
+ * never collide, even when a provider reuses call ids. An approved call run in
+ * step 0 has no such step in its run, so its id is derived from its approval
+ * id instead, which, like the approval id, assumes call ids are unique within
+ * the thread. Treat the format as opaque.
+ */
+const activityMessageId = (stepMessageId: string | undefined, toolCallId: string): string =>
+  stepMessageId === undefined
+    ? `${Agent.approvalIdFor(toolCallId)}:activity`
+    : `${stepMessageId}:activity:${toolCallId}`;
 
 /**
  * The message id of a step's `n`th reasoning block, counted from 0 among the
@@ -218,6 +322,13 @@ export const reasoningMessageId = (stepMessageId: string, n: number): string => 
  * Each reasoning block with text is one `REASONING_START` span holding one
  * reasoning message, both under {@link reasoningMessageId}. Only its text is
  * sent: provider metadata such as a signature stays on the stored part.
+ *
+ * A tool's progress (`ToolProgress`, from `ctx.preliminary`) is an
+ * `ACTIVITY_SNAPSHOT` (see {@link activitySnapshot}), whose `activityType` is
+ * the tool's name, between the call's `TOOL_CALL_END` and its
+ * `TOOL_CALL_RESULT`. Every snapshot of a call has the same `messageId`, so
+ * each replaces the last. Activity is live only: it is never committed, so
+ * `History.restore` returns none.
  *
  * A subagent's events are tagged with its `subagentRunId`, between
  * `SUBAGENT_STARTED` (on its first event) and `SUBAGENT_ERROR` or
@@ -339,6 +450,22 @@ export const fold =
               ),
             );
             return events;
+          }
+          case "ToolProgress": {
+            const events: Array<Event> = [];
+            // A call the model left open is closed first, as its result would close it.
+            if (state.current?.openTools.delete(event.toolCallId) === true) {
+              events.push(toolCallEnd(event.toolCallId));
+            }
+            events.push(
+              activitySnapshot(
+                activityMessageId(event.messageId, event.toolCallId),
+                event.toolName,
+                event.toolCallId,
+                event.encodedValue,
+              ),
+            );
+            return own(events);
           }
           case "ApprovalRequested": {
             // Carried by the interrupt outcome.

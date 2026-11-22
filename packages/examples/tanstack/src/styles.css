@@ -88,6 +88,23 @@ header p {
   margin: 4px 0;
 }
 
+.message.activity {
+  align-self: flex-start;
+}
+
+.activity-card progress {
+  width: 100%;
+}
+
+.activity-card ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.activity-card.finished {
+  opacity: 0.55;
+}
+
 .tool pre {
   margin: 4px 0 0;
   overflow-x: auto;

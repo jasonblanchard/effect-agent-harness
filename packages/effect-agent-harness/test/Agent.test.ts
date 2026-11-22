@@ -13,6 +13,8 @@ import {
   evalLayers,
   finish,
   PickFile,
+  ProgressToolkit,
+  progressLayer,
   scriptedModel,
   type Step,
   text,
@@ -650,6 +652,204 @@ describe("Agent.run replay", () => {
         Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
       ),
     ),
+  );
+});
+
+// -----------------------------------------------------------------------------
+// Tool progress
+// -----------------------------------------------------------------------------
+
+describe("Agent.run tool progress", () => {
+  const progressAgent = Agent.define({ toolkit: ProgressToolkit });
+  const searchCall = (query: string, sources = 2) => toolCall("c_search", "search", { query, sources });
+  const ledger = Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds());
+
+  const runProgress = (steps: ReadonlyArray<Step>) =>
+    Effect.gen(function* () {
+      const model = scriptedModel(steps);
+      const handlers = progressLayer();
+      const events = yield* Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+        Stream.runCollect,
+        Effect.provide([model.layer, handlers.layer, evalLayers]),
+      );
+      return { events: Array.from(events), prompts: model.prompts, calls: handlers.calls };
+    });
+
+  it.effect("emits each preliminary result as progress, in order, before the call's result", () =>
+    Effect.gen(function* () {
+      const { events } = yield* runProgress([
+        [...searchCall("docs"), finish("tool-calls")],
+        [...text("0", "Found 3."), finish("stop")],
+      ]);
+      const stepMessageId = byTag(events, "StepStarted")[0]!.messageId;
+      expect(byTag(events, "ToolProgress")).toEqual([
+        {
+          _tag: "ToolProgress",
+          step: 1,
+          messageId: stepMessageId,
+          toolCallId: "c_search",
+          toolName: "search",
+          encodedValue: { done: 1, of: 2 },
+          replayed: false,
+        },
+        {
+          _tag: "ToolProgress",
+          step: 1,
+          messageId: stepMessageId,
+          toolCallId: "c_search",
+          toolName: "search",
+          encodedValue: { done: 2, of: 2 },
+          replayed: false,
+        },
+      ]);
+      const step1 = tags(events.filter((e) => "step" in e && e.step === 1 && e._tag !== "ModelPart"));
+      expect(step1).toEqual(["StepStarted", "ToolProgress", "ToolProgress", "ToolResult", "StepFinished"]);
+      expect(byTag(events, "ToolResult")[0]).toMatchObject({
+        encodedResult: { done: 2, of: 2, hits: 3 },
+        isFailure: false,
+      });
+    }),
+  );
+
+  it.effect("keeps progress out of the step's entries and the next prompt", () =>
+    Effect.gen(function* () {
+      const { events, prompts } = yield* runProgress([
+        [...searchCall("docs"), finish("tool-calls")],
+        [...text("0", "Found 3."), finish("stop")],
+      ]);
+      const results = byTag(events, "StepFinished")[0]!.entries.flatMap((entry) =>
+        typeof entry.message.content === "string"
+          ? []
+          : entry.message.content.flatMap((part) => (part.type === "tool-result" ? [part.result] : [])),
+      );
+      expect(results).toEqual([{ done: 2, of: 2, hits: 3 }]);
+      const sent = prompts[1]!.content.flatMap((message) =>
+        message.role === "tool"
+          ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.result] : []))
+          : [],
+      );
+      expect(sent).toEqual([{ done: 2, of: 2, hits: 3 }]);
+    }),
+  );
+
+  it.effect("returns a failure after progress as it would without it", () =>
+    Effect.gen(function* () {
+      const { events } = yield* runProgress([
+        [...searchCall("fail"), finish("tool-calls")],
+        [...text("0", "It failed."), finish("stop")],
+      ]);
+      expect(byTag(events, "ToolProgress")).toHaveLength(2);
+      expect(byTag(events, "ToolResult")[0]).toMatchObject({
+        encodedResult: { message: "search failed" },
+        isFailure: true,
+      });
+    }),
+  );
+
+  it.effect("reports progress that isn't an object as it is encoded", () =>
+    Effect.gen(function* () {
+      const { events } = yield* runProgress([
+        [...toolCall("c_count", "count", { to: 3 }), finish("tool-calls")],
+        [finish("stop")],
+      ]);
+      expect(byTag(events, "ToolProgress").map((e) => e.encodedValue)).toEqual([1, 2]);
+      expect(byTag(events, "ToolResult")[0]!.encodedResult).toBe(3);
+    }),
+  );
+
+  it.effect("emits no progress for a call served from the checkpoint store", () =>
+    Effect.gen(function* () {
+      const handlers = progressLayer();
+      const attempt = (steps: ReadonlyArray<Step>) =>
+        Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+          Stream.runCollect,
+          Effect.map((events) => Array.from(events)),
+          Effect.provide([scriptedModel(steps).layer, handlers.layer]),
+        );
+      const first = yield* attempt([
+        [...searchCall("docs"), finish("tool-calls")],
+        [...text("0", "Found 3."), finish("stop")],
+      ]);
+      const second = yield* attempt([]);
+      expect(handlers.calls).toEqual(["docs"]);
+      expect(byTag(first, "ToolProgress")).toHaveLength(2);
+      expect(byTag(second, "ToolProgress")).toEqual([]);
+      expect(byTag(second, "ToolResult")[0]).toMatchObject({ replayed: true, encodedResult: { hits: 3 } });
+    }).pipe(Effect.provide(ledger)),
+  );
+
+  it.effect("reports progress again, under the same step message id, when a crash makes the call run again", () =>
+    Effect.gen(function* () {
+      const step1: Step = [...searchCall("docs"), finish("tool-calls")];
+      // Attempt 1 crashes after the call's first progress, while the handler is still running.
+      const stuck = progressLayer({ between: Effect.never });
+      const first = yield* Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+        Stream.takeUntil((event) => event._tag === "ToolProgress"),
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+        Effect.provide([scriptedModel([step1]).layer, stuck.layer]),
+      );
+      // Attempt 2 is served the model step from the ledger and runs the handler again.
+      const handlers = progressLayer();
+      const second = yield* Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+        Effect.provide([scriptedModel([[...text("0", "Found 3."), finish("stop")]]).layer, handlers.layer]),
+      );
+      expect(stuck.calls).toEqual(["docs"]);
+      expect(handlers.calls).toEqual(["docs"]);
+      const before = byTag(first, "ToolProgress");
+      const after = byTag(second, "ToolProgress");
+      expect(before).toHaveLength(1);
+      expect(after.map((e) => e.encodedValue)).toEqual([
+        { done: 1, of: 2 },
+        { done: 2, of: 2 },
+      ]);
+      expect(after.every((e) => e.messageId === before[0]!.messageId)).toBe(true);
+    }).pipe(Effect.provide(ledger)),
+  );
+
+  it.effect("reports an approved call's progress in step 0 with no step message id", () =>
+    Effect.gen(function* () {
+      const ApprovedSearch = Tool.make("approved-search", {
+        parameters: Schema.Struct({}),
+        success: Schema.Struct({ done: Schema.Finite }),
+        needsApproval: true,
+      });
+      const toolkit = Toolkit.make(ApprovedSearch);
+      const prompt = Prompt.make([
+        { role: "user", content: "Search" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool-call", id: "c_approved", name: "approved-search", params: {} },
+            { type: "tool-approval-request", approvalId: "a1", toolCallId: "c_approved" },
+          ],
+        },
+        { role: "tool", content: [{ type: "tool-approval-response", approvalId: "a1", approved: true }] },
+      ]);
+      const events = yield* Agent.run(Agent.define({ toolkit }), { runId: "r1", threadId: "t1", prompt }).pipe(
+        Stream.runCollect,
+        Effect.provide([
+          scriptedModel([[finish("stop")]]).layer,
+          toolkit.toLayer({
+            "approved-search": (_, ctx) => Effect.as(ctx.preliminary({ done: 0 }), { done: 1 }),
+          }),
+          evalLayers,
+        ]),
+      );
+      expect(byTag(Array.from(events), "ToolProgress")).toEqual([
+        {
+          _tag: "ToolProgress",
+          step: 0,
+          messageId: undefined,
+          toolCallId: "c_approved",
+          toolName: "approved-search",
+          encodedValue: { done: 0 },
+          replayed: false,
+        },
+      ]);
+    }),
   );
 });
 

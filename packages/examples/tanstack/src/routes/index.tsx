@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { fetchServerSentEvents, useChat, type UIMessage } from "@tanstack/ai-react";
 import { Schema } from "effect";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useId, useState, type FormEvent } from "react";
 import { getBrowserTime } from "../tools/browser-time.tool.ts";
 
 export const Route = createFileRoute("/")({
@@ -66,6 +66,12 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
     }
   };
 
+  // A progress card is done once its call has a result. A run that ends without one (it
+  // failed mid-call) leaves its card stopped: the library doesn't finalise activity.
+  const answered = answeredCalls(messages);
+  const progressOf = (toolCallId: string | undefined): Progress =>
+    toolCallId !== undefined && answered.has(toolCallId) ? "done" : isLoading ? "running" : "stopped";
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const text = input.trim();
@@ -80,12 +86,13 @@ function ChatThread({ threadId }: { readonly threadId: string }) {
         <h1>effect-agent-harness × TanStack AI</h1>
         <p>
           Ask about the weather anywhere, what time it is where you are (your browser answers), or ask it to send an
-          email (it asks you first). For a report on several places, it asks its weather desk, a subagent.
+          email (it asks you first). For a report on several places, it asks its weather desk, a subagent. Ask it to
+          search the docs to watch a slow tool report its progress.
         </p>
       </header>
       <ol className="messages">
         {messages.map((message) => (
-          <Message key={message.id} message={message} />
+          <Message key={message.id} message={message} progressOf={progressOf} />
         ))}
         {isLoading && <li className="thinking">…</li>}
       </ol>
@@ -137,7 +144,83 @@ const SUBAGENT_STATUS = {
   suspended: "waiting for approval",
 } as const;
 
-function Message({ message }: { readonly message: UIMessage }) {
+/** The ids of the tool calls in `messages` that have a result, subagents' included. */
+const answeredCalls = (messages: ReadonlyArray<UIMessage>): ReadonlySet<string> =>
+  new Set(
+    messages.flatMap((message) =>
+      message.parts.flatMap((part) => {
+        if (part.type === "tool-call") return part.output === undefined ? [] : [part.id];
+        if (part.type === "subagent") return [...answeredCalls(part.subagent.messages)];
+        return [];
+      }),
+    ),
+  );
+
+/** The call an activity reports on: effect-agent-harness puts its id in the activity's metadata. */
+const toolCallOf = (message: UIMessage): string | undefined => {
+  const metadata = message.metadata as Readonly<Record<string, unknown>> | undefined;
+  const toolCallId = metadata?.["effect-agent-harness:toolCallId"];
+  return typeof toolCallId === "string" ? toolCallId : undefined;
+};
+
+/** Where a progress card's call stands: still running, answered, or cut off by the run's end. */
+type Progress = "running" | "done" | "stopped";
+
+/** What `search-docs` reports as it runs (its success type, as JSON). */
+interface SearchProgress {
+  readonly done: number;
+  readonly of: number;
+  readonly hits: ReadonlyArray<{ readonly source: string; readonly excerpt: string }>;
+}
+
+/**
+ * A tool's progress, from the `ACTIVITY_SNAPSHOT`s effect-agent-harness sends for
+ * `ctx.preliminary`. `activityType` is the tool's name. Live only: after a
+ * reload, the tool call's result is all that remains.
+ */
+function ActivityCard({
+  activityType,
+  content,
+  progress,
+}: {
+  readonly activityType: string;
+  readonly content: Record<string, unknown>;
+  readonly progress: Progress;
+}) {
+  const statusId = useId();
+  if (activityType !== "search-docs") {
+    return <pre className="tool">{JSON.stringify(content, null, 2)}</pre>;
+  }
+  const { done, of, hits } = content as unknown as SearchProgress;
+  return (
+    <div className={`tool activity-card${progress === "running" ? "" : " finished"}`}>
+      <div id={statusId} role="status">
+        🔎 search-docs ·{" "}
+        {progress === "done"
+          ? "done"
+          : progress === "stopped"
+            ? `stopped at ${done} of ${of} sources`
+            : `reading ${done} of ${of} sources`}
+      </div>
+      <progress value={done} max={of} aria-labelledby={statusId} />
+      <ul>
+        {hits.map((hit) => (
+          <li key={hit.source}>
+            <strong>{hit.source}:</strong> {hit.excerpt}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function Message({
+  message,
+  progressOf,
+}: {
+  readonly message: UIMessage;
+  readonly progressOf: (toolCallId: string | undefined) => Progress;
+}) {
   // The client adds an empty assistant message when a run starts.
   if (message.parts.length === 0) return null;
   return (
@@ -162,6 +245,16 @@ function Message({ message }: { readonly message: UIMessage }) {
                 {part.output !== undefined && <pre>{JSON.stringify(part.output, null, 2)}</pre>}
               </details>
             );
+          case "activity": {
+            return (
+              <ActivityCard
+                key={index}
+                activityType={part.activityType}
+                content={part.content}
+                progress={progressOf(toolCallOf(message))}
+              />
+            );
+          }
           case "subagent":
             // A subagent's work, as TanStack builds it from the `SUBAGENT_*` events (and the server's
             // hydrate rebuilds it after a reload): its own messages, rendered like the assistant's.
@@ -173,7 +266,7 @@ function Message({ message }: { readonly message: UIMessage }) {
                 {part.subagent.error && <p className="error">{part.subagent.error.message}</p>}
                 <ol className="messages">
                   {part.subagent.messages.map((child) => (
-                    <Message key={child.id} message={child} />
+                    <Message key={child.id} message={child} progressOf={progressOf} />
                   ))}
                 </ol>
               </details>

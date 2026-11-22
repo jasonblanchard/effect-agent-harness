@@ -11,6 +11,8 @@ import {
   finish,
   GetLocation,
   PickFile,
+  progressLayer,
+  ProgressToolkit,
   reasoning,
   scriptedModel,
   signature,
@@ -714,4 +716,217 @@ describe("AgUi.closeOpen", () => {
     expect(closers).toEqual([AgUi.reasoningEnd("b1"), AgUi.stepFinished("step-1")]);
     await verify([...history, ...closers, AgUi.runFinished(input)]);
   });
+});
+
+describe("AgUi.fold tool progress", () => {
+  const progressAgent = Agent.define({ toolkit: ProgressToolkit });
+  const input = { threadId: "t1", runId: "r1" };
+
+  /** Runs the progress agent on a scripted model and projects it onto AG-UI; every sequence is verified. */
+  const foldProgress = (steps: ReadonlyArray<Step>) =>
+    Effect.gen(function* () {
+      const events = yield* Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt }).pipe(
+        AgUi.fold(input),
+        Stream.runCollect,
+        Effect.provide([scriptedModel(steps).layer, progressLayer().layer, evalLayers]),
+      );
+      yield* Effect.promise(() => verify(events));
+      return Array.from(events);
+    });
+
+  const snapshots = (events: ReadonlyArray<AgUi.Event>) =>
+    events.filter((e): e is AgUiSchema.ActivitySnapshotEvent => e.type === "ACTIVITY_SNAPSHOT");
+
+  /** Projects synthetic agent events, verifying the sequence. */
+  const foldEvents = (events: ReadonlyArray<Agent.Event>) =>
+    Effect.gen(function* () {
+      const folded = Array.from(yield* Stream.fromIterable(events).pipe(AgUi.fold(input), Stream.runCollect));
+      yield* Effect.promise(() => verify(folded));
+      return folded;
+    });
+
+  const progress = (step: number, messageId: string | undefined, toolCallId: string, value: unknown): Agent.Event => ({
+    _tag: "ToolProgress",
+    step,
+    messageId,
+    toolCallId,
+    toolName: "search",
+    encodedValue: value,
+    replayed: false,
+  });
+
+  it.effect("streams progress as activity snapshots between the call's end and its result", () =>
+    Effect.gen(function* () {
+      const events = yield* foldProgress([
+        [...toolCall("c_search", "search", { query: "docs", sources: 2 }), finish("tool-calls")],
+        [...text("0", "Found 3."), finish("stop")],
+      ]);
+      const callEvents = events.filter(
+        (e) => ("toolCallId" in e && e.toolCallId === "c_search") || e.type === "ACTIVITY_SNAPSHOT",
+      );
+      expect(types(callEvents)).toEqual([
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "ACTIVITY_SNAPSHOT",
+        "ACTIVITY_SNAPSHOT",
+        "TOOL_CALL_RESULT",
+      ]);
+      const [first, second] = snapshots(events);
+      expect(first).toMatchObject({
+        activityType: "search",
+        content: { done: 1, of: 2 },
+        metadata: { "effect-agent-harness:toolCallId": "c_search" },
+      });
+      expect(second!.content).toEqual({ done: 2, of: 2 });
+      expect(first!.replace).toBeUndefined();
+      // One id per call, used by no other message.
+      expect(second!.messageId).toBe(first!.messageId);
+      const others = events.flatMap((e) => (e.type !== "ACTIVITY_SNAPSHOT" && "messageId" in e ? [e.messageId] : []));
+      expect(others).not.toContain(first!.messageId);
+    }),
+  );
+
+  it.effect("wraps progress that isn't an object", () =>
+    Effect.gen(function* () {
+      const events = yield* foldProgress([
+        [...toolCall("c_count", "count", { to: 3 }), finish("tool-calls")],
+        [finish("stop")],
+      ]);
+      expect(snapshots(events).map((e) => e.content)).toEqual([{ value: 1 }, { value: 2 }]);
+      expect(snapshots(events)[0]!.activityType).toBe("count");
+    }),
+  );
+
+  it.effect("gives parallel calls their own activity ids", () =>
+    Effect.gen(function* () {
+      const events = yield* foldProgress([
+        [
+          ...toolCall("c_a", "search", { query: "a", sources: 1 }),
+          ...toolCall("c_b", "search", { query: "b", sources: 1 }),
+          finish("tool-calls"),
+        ],
+        [finish("stop")],
+      ]);
+      const stepMessageId = (events.find((e) => e.type === "TOOL_CALL_START") as { parentMessageId: string })
+        .parentMessageId;
+      const ids = snapshots(events).map((e) => e.messageId);
+      expect(new Set(ids).size).toBe(2);
+      expect(ids).not.toContain(stepMessageId);
+    }),
+  );
+
+  it.effect("gives a call id the provider reuses in a later step a different activity id", () =>
+    Effect.gen(function* () {
+      const events = yield* foldEvents([
+        { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
+        progress(1, "m1", "c1", { done: 1 }),
+        { _tag: "StepFinished", step: 1, entries: [], replayed: false },
+        { _tag: "StepStarted", step: 3, messageId: "m3", replayed: false },
+        progress(3, "m3", "c1", { done: 1 }),
+        { _tag: "StepFinished", step: 3, entries: [], replayed: false },
+        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
+      ]);
+      const [first, second] = snapshots(events);
+      expect(first!.messageId).not.toBe(second!.messageId);
+    }),
+  );
+
+  it.effect("derives an approved step-0 call's activity id from its approval", () =>
+    Effect.gen(function* () {
+      const events = yield* foldEvents([
+        progress(0, undefined, "c1", { done: 1 }),
+        progress(0, undefined, "c1", { done: 2 }),
+        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
+      ]);
+      const ids = snapshots(events).map((e) => e.messageId);
+      expect(ids).toHaveLength(2);
+      expect(ids[0]).toBe(ids[1]);
+      expect(ids[0]).not.toBe(Agent.approvalIdFor("c1"));
+    }),
+  );
+
+  it.effect("closes a call the model left open before its first snapshot", () =>
+    Effect.gen(function* () {
+      const events = yield* foldEvents([
+        { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
+        {
+          _tag: "ModelPart",
+          step: 1,
+          messageId: "m1",
+          part: { type: "tool-params-start", id: "c1", name: "search" } as Response.AnyPart,
+          replayed: false,
+        },
+        progress(1, "m1", "c1", { done: 1 }),
+        { _tag: "StepFinished", step: 1, entries: [], replayed: false },
+        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
+      ]);
+      expect(types(events).slice(2, 5)).toEqual(["TOOL_CALL_START", "TOOL_CALL_END", "ACTIVITY_SNAPSHOT"]);
+    }),
+  );
+});
+
+describe("AgUi.conflateActivity", () => {
+  const snapshot = (messageId: string, done: number) => AgUi.activitySnapshot(messageId, "search", "c1", { done });
+  const result = AgUi.toolCallResult("m9", "c1", "{}");
+
+  it.effect("keeps only the last snapshot of each activity in a chunk, in its place", () =>
+    Effect.gen(function* () {
+      const chunk = [snapshot("a", 1), AgUi.stepStarted("step-2"), snapshot("a", 2), snapshot("b", 1), result];
+      const out = Array.from(yield* Stream.make(...chunk).pipe(AgUi.conflateActivity, Stream.runCollect));
+      expect(out).toEqual([AgUi.stepStarted("step-2"), snapshot("a", 2), snapshot("b", 1), result]);
+    }),
+  );
+
+  it.effect("drops nothing across chunks", () =>
+    Effect.gen(function* () {
+      const stream = Stream.make(snapshot("a", 1)).pipe(Stream.concat(Stream.make(snapshot("a", 2))));
+      const out = Array.from(yield* stream.pipe(AgUi.conflateActivity, Stream.runCollect));
+      expect(out).toEqual([snapshot("a", 1), snapshot("a", 2)]);
+    }),
+  );
+});
+
+describe("AgUi.conflateProgress", () => {
+  const progress = (toolCallId: string, done: number): Agent.Event => ({
+    _tag: "ToolProgress",
+    step: 1,
+    messageId: "m1",
+    toolCallId,
+    toolName: "search",
+    encodedValue: { done },
+    replayed: false,
+  });
+  const wrapped = (subagentRunId: string, event: Agent.Event): Agent.Event => ({
+    _tag: "Subagent",
+    subagentRunId,
+    name: "searcher",
+    description: undefined,
+    parentToolCallId: "c0",
+    parentMessageId: "m0",
+    event,
+  });
+  const started: Agent.Event = { _tag: "StepStarted", step: 2, messageId: "m2", replayed: false };
+
+  it.effect("keeps only the last progress of each call in a chunk, at any subagent depth", () =>
+    Effect.gen(function* () {
+      const chunk = [
+        progress("c1", 1),
+        wrapped("s1", progress("c1", 1)),
+        started,
+        progress("c1", 2),
+        progress("c2", 1),
+        wrapped("s1", progress("c1", 2)),
+        wrapped("s2", progress("c1", 1)),
+      ];
+      const out = Array.from(yield* Stream.make(...chunk).pipe(AgUi.conflateProgress, Stream.runCollect));
+      expect(out).toEqual([
+        started,
+        progress("c1", 2),
+        progress("c2", 1),
+        wrapped("s1", progress("c1", 2)),
+        wrapped("s2", progress("c1", 1)),
+      ]);
+    }),
+  );
 });
