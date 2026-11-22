@@ -147,6 +147,7 @@ await agent.runAgent({}, { onTextMessageContentEvent: ({ event }) => process.std
 const agent = Agent.define({
   toolkit: Tools, // an effect/ai Toolkit
   system: "…", // optional system prompt: text, or an effect (below)
+  volatileSystem: "…", // optional, sent after the conversation: text, or a function of the prompt (below)
   maxSteps: 10, // optional, a positive integer; default 10
   name: "assistant", // optional, identifies the agent in traces (and names it as a subagent)
   description: "…", // optional, in traces, and the tool description when it is a subagent
@@ -172,7 +173,83 @@ const agent = Agent.define({
 
 The effect's error type is `never`: handle failures inside it (fall back to a default) or let it die, which fails the run before any tool or model call.
 
-The system prompt is the first thing in every model call, so text that changes on every run defeats prefix prompt caching across a long thread. Keep the parts that change small.
+The system prompt is the first thing in every model call, so text that changes on every run defeats prefix prompt caching across a long thread. Put the parts that change in a volatile system prompt instead.
+
+### A volatile system prompt
+
+Instructions that change often, such as the date, the current state of something the agent works on, or context retrieved for the latest message, go in `volatileSystem`. The run sends them as a system message **after** the conversation, the last message of every model call, so changing them leaves everything before them cacheable:
+
+```ts
+const agent = Agent.define({
+  toolkit: Tools,
+  system: "You are a friendly weather assistant.", // stable
+  volatileSystem: ({ prompt }) =>
+    Effect.gen(function* () {
+      const docs = yield* (yield* Retriever).search(lastUserText(prompt));
+      return `Today is ${new Date().toDateString()}.\n<context>${docs}</context>`;
+    }),
+}); // requires Retriever
+```
+
+- It is fixed text, or a function of `prompt`, the conversation the run was given (without the system prompt). The function may read `Agent.CurrentRun`, and the services it uses become part of what the agent requires, as with `system`. Returning `undefined` or `""` sends no message.
+- It is resolved once per run, right after `system` and before anything else, and memoised (as the `volatile-system` checkpoint), so a resumed run sends the same text and doesn't repeat the retrieval. Every step of the run sends the same text; only its position moves as the run adds steps. If it dies, the run fails before any tool or model call.
+- It is never stored: no entry, event, thread or restored history holds it, and each run resolves its own.
+- A subagent's `volatileSystem` applies to its own calls, and a parent's never reaches its subagents.
+
+The provider must accept a system message after the start of the conversation. For Anthropic that is `midConversationSystemMessages`: `@effect/ai-anthropic` assumes it for newer and unknown model ids and turns it off for 4.5 and older. Claude Sonnet 5 doesn't support it, so set `midConversationSystemMessages: false` there and don't use `volatileSystem`. A provider that can't place the message moves every system message to the top-level `system`. Then the tools, the system prompt and, within a run, the conversation are still read from the cache, but each new run's conversation misses it. The same happens if the prompt doesn't end with a user message or tool results, or if a client system message sits elsewhere in it (`clientSystem: "allow"`).
+
+`effect/ai`'s `ResponseIdTracker` isn't supported with `volatileSystem`: it sends only what follows the last assistant turn, so the provider's copy of the conversation keeps earlier runs' volatile text.
+
+### Prompt caching
+
+Only the loop builds each model call's prompt, so cache breakpoints are placed through `Agent.ModelPromptTransformer`. It's an optional service: a function the run calls on every model call it executes, with the prompt as built (system prompt, conversation, volatile system prompt) and its layout. The model receives what it returns:
+
+```ts
+Layer.succeed(
+  Agent.ModelPromptTransformer,
+  (prompt, { conversationStart, conversationEnd, step, agentName }) => prompt,
+);
+```
+
+`conversationStart` is the index of the conversation's first message (1 after a system prompt, 0 without one). `conversationEnd` is the index just after its last message: the volatile message's index, or the prompt's length without one. What the function returns reaches that model call only, never an entry, an event, a memo or a subagent's prompt. Every call is built from the conversation again, so a mark never carries forward. A step replayed from its checkpoint doesn't call it. A subagent's calls use the same function, with its `agentName`. A throw fails the run. Provide it like any service: around the runner, or per run through the runner's `layer`.
+
+**Anthropic.** Mark the system message, a stable breakpoint after the tools and system prompt, and the message just before `conversationEnd`, whose mark moves forward with every step. Each call then writes a cache entry at the end of the conversation, which the next call reads:
+
+```ts
+const withBreakpoint = (message: Prompt.Message, ttl?: "1h"): Prompt.Message => {
+  const options = {
+    ...message.options,
+    anthropic: { ...message.options.anthropic, cacheControl: { type: "ephemeral", ...(ttl && { ttl }) } },
+  };
+  switch (message.role) {
+    case "system":
+      return Prompt.makeMessage("system", { content: message.content, options });
+    case "user":
+      return Prompt.makeMessage("user", { content: message.content, options });
+    case "assistant":
+      return Prompt.makeMessage("assistant", { content: message.content, options });
+    case "tool":
+      return Prompt.makeMessage("tool", { content: message.content, options });
+  }
+};
+
+const AnthropicCaching = Layer.succeed(Agent.ModelPromptTransformer, (prompt, { conversationStart, conversationEnd }) =>
+  Prompt.fromMessages(
+    prompt.content.map((message, i) =>
+      i === conversationStart - 1
+        ? withBreakpoint(message, "1h")
+        : i === conversationEnd - 1
+          ? withBreakpoint(message)
+          : message,
+    ),
+  ),
+);
+```
+
+- Don't use automatic caching (a top-level `cache_control` in the provider config) together with `volatileSystem`. It puts its one breakpoint on the last block, which is then the volatile message: each call writes an entry the next call can't use, so almost nothing is read from the cache.
+- Entries live 5 minutes by default, refreshed on use. For threads where users take longer to reply, use `ttl: "1h"`. Anthropic requires longer lifetimes to come first: the system mark's TTL must be at least the conversation mark's. The other way round isn't an error, just a silent cache miss.
+
+**OpenAI.** Caching is automatic and matches the longest exact prefix, and `@effect/ai-openai` keeps every system message in place, so before GPT-5.6 there is nothing to do: the volatile message is already where the guide says dynamic content belongs. GPT-5.6 and later also accept explicit breakpoints, which the provider reads from `options.openai.promptCacheBreakpoint: { mode: "explicit" }` on a system message or a user text part (not on a tool result). Earlier models may reject that option, so set it only for those models. For routing, `OpenAiLanguageModel.Config` is a service the provider merges into every request, so a per-run `layer` can probably set `prompt_cache_key`. That is untested.
 
 ### Tools that need the run or the user
 
@@ -924,14 +1001,14 @@ const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
 
 Everything is exported from `"effect-agent-harness"` as namespaces. The AG-UI protocol comes from `effect/ai`: `AgUiSchema` (events, messages, and the `RunAgentInput` every runner takes) and `AgUiServer` (the HTTP endpoint).
 
-| Module       | Main exports                                                                                                                                                                                                                                                                                                     |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `ApprovalResponse`, `approvalInterrupt`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors                                                                                                                                                                                                          |
-| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                 |
-| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                        |
-| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                               |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                          |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                            |
-| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                 |
-| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                |
+| Module       | Main exports                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `VolatileSystem`, `ModelPromptTransformer`, `ModelPromptLayout`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `StepLimitExceeded`, `ModelStreamError` |
+| `AgUi`       | `ApprovalResponse`, `approvalInterrupt`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors                                                                                                                                                                                                                                                                           |
+| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                                                                  |
+| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                                                                                         |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                                                |
+| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                                                                                           |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                                             |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                                                                                  |
+| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                                                                                 |

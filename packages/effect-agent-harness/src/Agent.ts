@@ -45,6 +45,18 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
    * may read {@link CurrentRun} and the services `R`.
    */
   readonly system: string | Effect.Effect<string, never, R> | undefined;
+  /**
+   * System prompt placed after the conversation, as the last message of every model call, for instructions
+   * that change often (the date, current state, retrieved context): changing them there leaves everything
+   * before them cacheable, where changing `system` invalidates the provider's cache for the whole conversation.
+   * See {@link VolatileSystem}. Never stored: no entry or event holds it, and each run resolves its own.
+   *
+   * The provider must accept a system message after the start of the conversation (for Anthropic,
+   * `midConversationSystemMessages`; not Claude Sonnet 5), or it moves every system message to the top. Place
+   * cache breakpoints through {@link ModelPromptTransformer}: Anthropic's automatic caching would put its breakpoint on
+   * this message, which changes every run.
+   */
+  readonly volatileSystem: VolatileSystem<R> | undefined;
   /** Maximum number of model steps per run. */
   readonly maxSteps: number;
   /**
@@ -72,6 +84,16 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
   /** Agents this agent may delegate to, each offered to its model as a tool named after the agent. */
   readonly subagents: Subagents | undefined;
 }
+
+/**
+ * An agent's volatile system prompt: fixed text, or a function of the prompt the run was given (the
+ * conversation as the model sees it, without the system prompt) resolved once per run, after the system
+ * prompt and before step 0, and memoised as the `volatile-system` checkpoint, so a resumed run sends the
+ * same text. It may read {@link CurrentRun} and the services `R`. `undefined` or `""` sends no message.
+ */
+export type VolatileSystem<R = never> =
+  | string
+  | ((input: { readonly prompt: Prompt.Prompt }) => Effect.Effect<string | undefined, never, R>);
 
 /** An agent of any tools and requirements, as a list of subagents holds it. */
 // `Toolkit` is invariant in its tools, so only `any` admits every agent.
@@ -123,10 +145,12 @@ const PromptInput = Schema.Struct({
 export const define = <
   Tools extends Record<string, Tool.Any>,
   R = never,
+  RV = never,
   const Agents extends ReadonlyArray<Any> = readonly [],
 >(options: {
   readonly toolkit: Toolkit.Toolkit<Tools>;
   readonly system?: string | Effect.Effect<string, never, R> | undefined;
+  readonly volatileSystem?: VolatileSystem<RV> | undefined;
   readonly maxSteps?: number | undefined;
   readonly name?: string | undefined;
   readonly description?: string | undefined;
@@ -134,7 +158,7 @@ export const define = <
   readonly context?: ContextMode | undefined;
   readonly result?: ((reply: SubagentReply) => unknown) | undefined;
   readonly subagents?: { readonly agents: Agents } | undefined;
-}): Agent<Tools, R | SubagentRequirements<Agents>> => {
+}): Agent<Tools, R | RV | SubagentRequirements<Agents>> => {
   const maxSteps = options.maxSteps ?? 10;
   if (!Number.isInteger(maxSteps) || maxSteps < 1) {
     throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
@@ -157,6 +181,7 @@ export const define = <
   return {
     toolkit: options.toolkit,
     system: options.system,
+    volatileSystem: options.volatileSystem,
     maxSteps,
     name: options.name,
     description: options.description,
@@ -226,6 +251,50 @@ export interface FrontendTool {
  * `dependencies: [Agent.CurrentRun]`. Never provide it yourself.
  */
 export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effect-agent-harness/Agent/CurrentRun") {}
+
+/** Where the parts of a model call's prompt are, as {@link ModelPromptTransformer} receives it. */
+export interface ModelPromptLayout {
+  /** Index of the conversation's first message: 1 after the agent's system prompt, 0 without one. */
+  readonly conversationStart: number;
+  /** Index just after the conversation's last message: the volatile system message's index, or the prompt's length without one. */
+  readonly conversationEnd: number;
+  /** The run's step number. */
+  readonly step: number;
+  /** The name of the agent whose model call this is, so a subagent's calls can be told apart. */
+  readonly agentName: string | undefined;
+}
+
+/**
+ * A function the run calls on every model call it executes, with the prompt exactly as it built it (the
+ * system prompt, the conversation, the volatile system prompt) and its {@link ModelPromptLayout}; the
+ * model receives what it returns. Without one, the prompt is sent as built.
+ *
+ * What it returns reaches that model call only: never an entry, an event, a memo or a subagent's prompt,
+ * and every call is built from the conversation again, so a mark added here never carries forward. A step
+ * replayed from its checkpoint doesn't call it, a subagent's calls use the same function (with its name in
+ * the layout), and a throw fails the run. Use it to place cache breakpoints, which only the loop can do,
+ * since only it builds each step's prompt. For Anthropic, mark the system message and the message just
+ * before `conversationEnd`, whose mark moves forward with every step:
+ *
+ * ```ts
+ * Layer.succeed(Agent.ModelPromptTransformer, (prompt, { conversationStart, conversationEnd }) =>
+ *   Prompt.fromMessages(
+ *     prompt.content.map((message, i) =>
+ *       i === conversationStart - 1 || i === conversationEnd - 1 ? withBreakpoint(message) : message,
+ *     ),
+ *   ),
+ * );
+ * ```
+ *
+ * where `withBreakpoint` rebuilds the message with `Prompt.makeMessage` (same role and content), its
+ * options extended with `anthropic.cacheControl: { type: "ephemeral" }`.
+ *
+ * It may reorder or drop messages, or break a tool call from its result: that breaks only the call it
+ * changes.
+ */
+export const ModelPromptTransformer = Context.Reference<
+  (prompt: Prompt.Prompt, layout: ModelPromptLayout) => Prompt.Prompt
+>("effect-agent-harness/Agent/ModelPromptTransformer", { defaultValue: () => (prompt) => prompt });
 
 /**
  * What a run emits. Events derived from a checkpoint served from the store
@@ -495,7 +564,8 @@ interface Decision {
  * needs approval, the model calls a frontend tool, or the step limit is
  * reached. A frontend call gets no result: the step's assistant entry marks it
  * as the client's (see {@link isFrontendCall}) and the outcome lists it. Every model call starts with
- * the agent's system prompt, resolved once before anything else runs. The
+ * the agent's system prompt, resolved once before anything else runs, and ends with its volatile system
+ * prompt, resolved right after it; {@link ModelPromptTransformer}, if provided, then adjusts the call's prompt. The
  * run's info is available as {@link CurrentRun} throughout.
  *
  * Every model call and every tool call is memoised through the
@@ -516,6 +586,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
     const { prompt: _, frontendTools = [], subagentPrompts, cancelled, ...info } = input;
     return Effect.gen(function* () {
       const checkpoint = yield* Checkpoint.Checkpoint;
+      const transformModelPrompt = yield* ModelPromptTransformer;
       // Completed once the signal fires. Started at once, so a signal that has already fired is seen
       // before the first step.
       const cancel = yield* Deferred.make<void>();
@@ -988,8 +1059,19 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
               progress.parts.length = 0;
               yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
               const parts = progress.parts;
+              // The hook runs here, inside the checkpoint, so a replayed step never calls it, and its result
+              // reaches this call only.
+              const conversation = forModel(prompt);
+              const conversationStart = system === undefined || system.length === 0 ? 0 : 1;
+              const built = withVolatile(withSystem(conversation));
+              const sent = transformModelPrompt(built, {
+                conversationStart,
+                conversationEnd: conversationStart + conversation.content.length,
+                step,
+                agentName: agent.name,
+              });
               yield* LanguageModel.streamText({
-                prompt: withSystem(forModel(prompt)),
+                prompt: sent,
                 toolkit: modelToolkit,
                 disableToolCallResolution: true,
               }).pipe(
@@ -1033,6 +1115,27 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         system === undefined || system.length === 0
           ? prompt
           : Prompt.fromMessages([Prompt.makeMessage("system", { content: system }), ...prompt.content]);
+
+      // Resolved once, after the system prompt and before step 0, from the prompt the run was given. "" is
+      // memoised for no text, since a ledger stores JSON.
+      const volatile =
+        agent.volatileSystem === undefined || typeof agent.volatileSystem === "string"
+          ? agent.volatileSystem
+          : (yield* checkpoint.memo(
+              {
+                threadId: input.threadId,
+                runId: input.runId,
+                name: "volatile-system",
+                success: Schema.String,
+                error: Schema.Never,
+              },
+              Effect.map(agent.volatileSystem({ prompt: forModel(input.prompt) }), (text) => text ?? ""),
+            )).value;
+      // Always last, so everything before it stays cacheable. Never stored: only model calls see it.
+      const withVolatile = (prompt: Prompt.Prompt) =>
+        volatile === undefined || volatile.length === 0
+          ? prompt
+          : Prompt.fromMessages([...prompt.content, Prompt.makeMessage("system", { content: volatile })]);
 
       const finishCancelled = emit({ _tag: "Finished", outcome: { _tag: "Cancelled" } });
 
