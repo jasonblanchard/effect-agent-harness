@@ -732,12 +732,11 @@ Every model call and every tool call in a run goes through `Checkpoint.memo`, un
 - steps that completed are replayed from the store, with the same ids and without calling the model or the tool again;
 - only the step that was in progress is executed again, with fresh ids.
 
-| Layer                          | Use                                                              |
-| ------------------------------ | ---------------------------------------------------------------- |
-| `Checkpoint.layerNone`         | Tests, evals, stateless servers: always executes, never replays. |
-| `Checkpoint.layerLedger`       | Your own store, via the `Checkpoint.Ledger` service.             |
-| `Checkpoint.layerMemoryLedger` | An in-memory `Ledger`, for tests and local development.          |
-| `Checkpoint.layerWorkflow`     | `effect/workflow` activities (used by `Runner.makeWorkflow`).    |
+| Layer                           | Use                                                                                           |
+| ------------------------------- | --------------------------------------------------------------------------------------------- |
+| `Checkpoint.layerNone`          | Tests, evals, stateless servers: always executes, never replays.                              |
+| `Checkpoint.layerKeyValueStore` | Any `effect/persistence` `KeyValueStore`: memory, file system, SQL, Web Storage, or your own. |
+| `Checkpoint.layerWorkflow`      | `effect/workflow` activities (used by `Runner.makeWorkflow`).                                 |
 
 A step that _failed_ is stored too, so re-running a failed run fails again the same way; retry with a new `runId`. Only work that was interrupted (a crash, a deploy, a cancelled fiber) is executed again.
 
@@ -985,14 +984,14 @@ const ThreadLive = Layer.effect(
 
 Entries are `{ id, message, runId? }` with `message` an effect/ai `Prompt.Message`. `Schema.encode(Messages.Entry)` gives you JSON to store. Wrap store failures in `ThreadError`.
 
-**Checkpoint ledger:** a get/set store keyed by `(threadId, runId, name)`. The values are JSON-encoded `Exit`s. Keep all three in the key: the client picks `runId`, so it is only unique within a thread.
+**Checkpoint store:** `Checkpoint.layerKeyValueStore` needs an `effect/persistence` `KeyValueStore`. Use one of Effect's layers, or build your own with `KeyValueStore.make` / `KeyValueStore.makeStringOnly`. Each step's `Exit` is stored as a JSON string under `Checkpoint.keyPrefix` followed by `JSON.stringify([threadId, runId, name])`. The client picks `runId`, so it is only unique within a thread.
 
 ```ts
-const LedgerLive = Layer.succeed(Checkpoint.Ledger)({
-  get: (threadId, runId, name) => kv.get(JSON.stringify([threadId, runId, name])), // Effect<Option<unknown>, LedgerError>
-  set: (threadId, runId, name, exit) => kv.set(JSON.stringify([threadId, runId, name]), exit),
-});
-const CheckpointLive = Checkpoint.layerLedger.pipe(Layer.provide(LedgerLive));
+import { KeyValueStore } from "effect/persistence";
+
+const CheckpointLive = Checkpoint.layerKeyValueStore.pipe(
+  Layer.provide(KeyValueStore.layerSql({ table: "checkpoints" })), // or layerFileSystem(dir), layerMemory, ...
+);
 ```
 
 **Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must check the cursor before returning its stream (failing with `InvalidCursor` for one the run's log never issued), deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`, including at once when the cursor is at or past it. `read` rejects unknown cursors the same way. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
@@ -1008,7 +1007,7 @@ Everything is exported from `"effect-agent-harness"` as namespaces. The AG-UI pr
 | `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                                                                  |
 | `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                                                                                         |
 | `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                                                |
-| `Checkpoint` | `Checkpoint`, `Ledger`, `LedgerError`, `layerNone`, `layerLedger`, `layerMemoryLedger`, `layerWorkflow`                                                                                                                                                                                                                                                                           |
+| `Checkpoint` | `Checkpoint`, `layerNone`, `layerKeyValueStore`, `keyPrefix`, `layerWorkflow`                                                                                                                                                                                                                                                                                                     |
 | `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                                             |
 | `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                                                                                  |
 | `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                                                                                 |

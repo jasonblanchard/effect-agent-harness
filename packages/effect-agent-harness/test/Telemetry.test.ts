@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Exit, Layer, Scope, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { Prompt, Response } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
 import type { Tracer } from "effect";
@@ -528,7 +529,7 @@ describe("replay", () => {
       expect(second.named("execute_tool get-weather")).toEqual([]);
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );
@@ -765,7 +766,7 @@ describe("subagent spans", () => {
       expect(again.named("execute_tool get-weather")).toEqual([]);
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );

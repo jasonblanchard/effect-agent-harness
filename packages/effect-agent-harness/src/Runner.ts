@@ -525,7 +525,7 @@ const detached =
  * whose log already ends with a terminal event. Calling it again with the same
  * input and dependencies after a crash completes the run, building its per-run
  * services again; the dependencies are not stored, so provide the ones the first call had. With a durable
- * `Checkpoint` (e.g. `Checkpoint.layerLedger`) completed steps are replayed
+ * `Checkpoint` (e.g. `Checkpoint.layerKeyValueStore`) completed steps are replayed
  * rather than executed again. Do not start the same run twice concurrently:
  * supervising runs is the caller's concern here, or use {@link makeWorkflow}.
  *

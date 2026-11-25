@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Scope, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { TestClock } from "effect/testing";
 import { Prompt } from "effect/ai";
 import type { AgUiSchema, Response } from "effect/ai";
@@ -411,7 +412,7 @@ describe("Agent.run cancellation", () => {
 
   it.effect("replays the steps an earlier attempt completed, then ends without calling the model", () =>
     Effect.gen(function* () {
-      const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+      const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
       const checkpoint = yield* Layer.build(ledger);
       const shared = Layer.succeedContext(checkpoint);
       const script: ReadonlyArray<Step> = [
@@ -569,7 +570,7 @@ const isContent = (event: AgUi.Event) => event.type === "TEXT_MESSAGE_CONTENT";
 const runEnded = (events: ReadonlyArray<AgUi.Event>) => events.at(-1);
 const cancelledEnd = { type: "RUN_FINISHED", outcome: { type: "cancelled" } };
 
-const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
 
 describe("Runner.makeAttached cancellation", () => {
   it.effect("matches the client's copy of a cancelled turn as known on the next run", () =>

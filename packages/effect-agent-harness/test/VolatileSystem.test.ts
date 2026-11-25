@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Layer, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
 import { Prompt } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
@@ -86,7 +87,10 @@ const markConversationEnd = (prompt: Prompt.Prompt, layout: Agent.ModelPromptLay
 const hook = (f: Context.Service.Shape<typeof Agent.ModelPromptTransformer>) =>
   Layer.succeed(Agent.ModelPromptTransformer, f);
 
-const ledger = Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds());
+const ledger = Layer.mergeAll(
+  Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
+  counterIds(),
+);
 
 // -----------------------------------------------------------------------------
 // Volatile system prompt

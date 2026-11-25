@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Exit, Layer, Schema, Scope, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
 import { Prompt } from "effect/ai";
 import type { AgUiSchema, LanguageModel, Response } from "effect/ai";
@@ -436,7 +437,7 @@ describe("Agent.run with subagents", () => {
       expect(toolResultOf(second.events, "c1")?.encodedResult).toBe("Paris is 18°C");
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );
@@ -1091,7 +1092,7 @@ describe("AG-UI events of subagents", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+          Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           serverStores,
           EventLog.layerMemory,
@@ -1186,7 +1187,7 @@ describe("AG-UI events of subagents", () => {
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
-            Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+            Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
             counterIds(),
             serverStores,
             EventLog.layerMemory,
@@ -1259,7 +1260,7 @@ describe("AG-UI events of subagents", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+          Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           serverStores,
           EventLog.layerMemory,

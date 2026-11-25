@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Queue, Schema, Scope, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
 import { AgUiSchema, Prompt, Tool, Toolkit } from "effect/ai";
 import type { Response } from "effect/ai";
@@ -1152,7 +1153,7 @@ describe("Runner.makeAttached prompt memo", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+          Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           spy.layer,
         ),
@@ -1162,7 +1163,7 @@ describe("Runner.makeAttached prompt memo", () => {
 });
 
 describe("Runner.makeAttached run ids", () => {
-  const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+  const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
 
   it.effect("replays nothing from a run id reused on another thread", () =>
     Effect.gen(function* () {
@@ -1260,7 +1261,7 @@ describe("Runner.makeAttached run ids", () => {
 });
 
 describe("Runner.makeDetached", () => {
-  const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+  const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
   const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, EventLog.layerMemory);
   const run1 = input("r1", [userMessage("u1", "Weather in Paris?")]);
 
@@ -1949,7 +1950,7 @@ describe("Runner run contexts", () => {
       expect(handlers.seen).toEqual(["u1@tenant-u1"]);
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );
@@ -2007,7 +2008,7 @@ describe("Runner run contexts", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+          Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           serverStores,
         ),
@@ -2019,7 +2020,7 @@ describe("Runner run contexts", () => {
     const run1 = input("r1", [userMessage("u1", "hi")]);
     const shared = () =>
       Layer.mergeAll(
-        Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)),
+        Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
         counterIds(),
         serverStores,
         EventLog.layerMemory,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Layer, Schema, Stream } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
 import { Prompt, Tool, Toolkit } from "effect/ai";
 import type { LanguageModel } from "effect/ai";
@@ -78,7 +79,7 @@ describe("Agent.define", () => {
           return model.prompts;
         });
       const none = yield* runWith(Checkpoint.layerNone);
-      const ledger = yield* runWith(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)));
+      const ledger = yield* runWith(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)));
       expect(ledger).toEqual(none);
     }),
   );
@@ -602,7 +603,7 @@ describe("Agent.run replay", () => {
       });
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );
@@ -649,7 +650,7 @@ describe("Agent.run replay", () => {
       expect(second.events.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );
@@ -662,7 +663,10 @@ describe("Agent.run replay", () => {
 describe("Agent.run tool progress", () => {
   const progressAgent = Agent.define({ toolkit: ProgressToolkit });
   const searchCall = (query: string, sources = 2) => toolCall("c_search", "search", { query, sources });
-  const ledger = Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds());
+  const ledger = Layer.mergeAll(
+    Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
+    counterIds(),
+  );
 
   const runProgress = (steps: ReadonlyArray<Step>) =>
     Effect.gen(function* () {
@@ -1163,7 +1167,7 @@ describe("Agent system prompt", () => {
       expect(second.map(systemOf)).toEqual(["It is 09:00.", "It is 09:00."]);
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger)), counterIds()),
+        Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
       ),
     ),
   );

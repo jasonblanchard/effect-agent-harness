@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { Prompt } from "effect/ai";
 import { Workflow, WorkflowEngine } from "effect/workflow";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -23,7 +24,7 @@ const memo = <A, I>(runId: string, name: string, success: Schema.Codec<A, I>, ef
     checkpoint.memo({ threadId: "t1", runId, name, success, error: Schema.Never }, effect),
   );
 
-const ledger = Checkpoint.layerLedger.pipe(Layer.provide(Checkpoint.layerMemoryLedger));
+const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
 
 describe("Checkpoint.layerNone", () => {
   it.effect("runs the same key every time", () =>
@@ -40,7 +41,7 @@ describe("Checkpoint.layerNone", () => {
   );
 });
 
-describe("Checkpoint.layerLedger", () => {
+describe("Checkpoint.layerKeyValueStore", () => {
   it.effect("serves the second call from the store", () =>
     Effect.gen(function* () {
       const c = counter();
@@ -129,6 +130,18 @@ describe("Checkpoint.layerLedger", () => {
       expect(replayed.replayed).toBe(true);
       expect(replayed.value).toEqual(prompt);
     }).pipe(Effect.provide(ledger)),
+  );
+
+  it.effect("stores each step under the prefix and its JSON key, beside other data", () =>
+    Effect.gen(function* () {
+      const store = yield* KeyValueStore.KeyValueStore;
+      yield* store.set(JSON.stringify(["t1", "r1", "step"]), "unrelated");
+      yield* memo("r1", "step", Schema.Finite, Effect.succeed(7));
+      expect([...(yield* store.keys)].sort()).toEqual(
+        [JSON.stringify(["t1", "r1", "step"]), `${Checkpoint.keyPrefix}${JSON.stringify(["t1", "r1", "step"])}`].sort(),
+      );
+      expect(yield* store.get(JSON.stringify(["t1", "r1", "step"]))).toBe("unrelated");
+    }).pipe(Effect.provide(Checkpoint.layerKeyValueStore.pipe(Layer.provideMerge(KeyValueStore.layerMemory)))),
   );
 });
 

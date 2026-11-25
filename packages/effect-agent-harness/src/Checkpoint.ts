@@ -1,4 +1,5 @@
 import { Cause, Context, Effect, Exit, Layer, Option, Schema } from "effect";
+import { KeyValueStore } from "effect/persistence";
 import { Activity } from "effect/workflow";
 import type { WorkflowEngine } from "effect/workflow";
 
@@ -44,48 +45,47 @@ export const layerNone: Layer.Layer<Checkpoint> = Layer.succeed(Checkpoint)({
 });
 
 // -----------------------------------------------------------------------------
-// Ledger
+// Key-value store
 // -----------------------------------------------------------------------------
 
-export class LedgerError extends Schema.TaggedError<LedgerError, { readonly brand: unique symbol }>()("LedgerError", {
-  cause: Schema.Defect(),
-}) {}
+/**
+ * The prefix of every key {@link layerKeyValueStore} writes, so a store shared
+ * with other data stays apart from it.
+ */
+export const keyPrefix = "effect-agent-harness/checkpoint/";
 
 /**
- * A store for completed step exits, keyed by thread id, run id and step name.
- * The value is the step's `Exit` encoded as JSON, so any key-value store can
- * hold it.
+ * Memoises steps in the `KeyValueStore` in context (`effect/persistence`), so
+ * any of its backends can hold them: `KeyValueStore.layerMemory` for tests and
+ * local development, or a file system, SQL or Web Storage layer. Each step's
+ * completed `Exit` is stored as JSON under {@link keyPrefix} followed by the
+ * JSON array `[threadId, runId, name]`. All three are in the key because the
+ * client picks the run id, so it is only unique within a thread.
+ *
+ * Store and codec errors are defects: the run cannot meaningfully continue
+ * without its store.
  */
-export class Ledger extends Context.Service<
-  Ledger,
-  {
-    readonly get: (threadId: string, runId: string, name: string) => Effect.Effect<Option.Option<unknown>, LedgerError>;
-    readonly set: (threadId: string, runId: string, name: string, exit: unknown) => Effect.Effect<void, LedgerError>;
-  }
->()("effect-agent-harness/Checkpoint/Ledger") {}
-
-/**
- * Memoises steps in the {@link Ledger} in context. Ledger and codec errors are
- * defects: the run cannot meaningfully continue without its store.
- */
-export const layerLedger: Layer.Layer<Checkpoint, never, Ledger> = Layer.effect(
+export const layerKeyValueStore: Layer.Layer<Checkpoint, never, KeyValueStore.KeyValueStore> = Layer.effect(
   Checkpoint,
   Effect.gen(function* () {
-    const ledger = yield* Ledger;
+    const store = KeyValueStore.prefix(yield* KeyValueStore.KeyValueStore, keyPrefix);
     return Checkpoint.of({
       memo: <A, I, E, EI, R>(options: MemoOptions<A, I, E, EI>, effect: Effect.Effect<A, E, R>) =>
         Effect.gen(function* () {
-          const codec = Schema.toCodecJson(Schema.Exit(options.success, options.error, Schema.Defect()));
-          const stored = yield* Effect.orDie(ledger.get(options.threadId, options.runId, options.name));
+          const exits = KeyValueStore.toSchemaStore(
+            store,
+            Schema.Exit(options.success, options.error, Schema.Defect()),
+          );
+          // JSON, so no choice of ids can make two keys collide.
+          const key = JSON.stringify([options.threadId, options.runId, options.name]);
+          const stored = yield* Effect.orDie(exits.get(key));
           if (Option.isSome(stored)) {
-            const exit = yield* Effect.orDie(Schema.decodeUnknownEffect(codec)(stored.value));
-            const value = yield* exit;
+            const value = yield* stored.value;
             return { value, replayed: true };
           }
           const exit = yield* Effect.exit(effect);
           if (Exit.isSuccess(exit) || !Cause.hasInterrupts(exit.cause)) {
-            const encoded = yield* Effect.orDie(Schema.encodeEffect(codec)(exit));
-            yield* Effect.orDie(ledger.set(options.threadId, options.runId, options.name, encoded));
+            yield* Effect.orDie(exits.set(key, exit));
           }
           const value = yield* exit;
           return { value, replayed: false };
@@ -93,20 +93,6 @@ export const layerLedger: Layer.Layer<Checkpoint, never, Ledger> = Layer.effect(
     });
   }),
 );
-
-/** A {@link Ledger} over an in-process map. For tests and local development. */
-export const layerMemoryLedger: Layer.Layer<Ledger> = Layer.sync(Ledger, () => {
-  const entries = new Map<string, unknown>();
-  // JSON, so no choice of ids can make two keys collide.
-  const key = (threadId: string, runId: string, name: string) => JSON.stringify([threadId, runId, name]);
-  return Ledger.of({
-    get: (threadId, runId, name) => Effect.sync(() => Option.fromUndefinedOr(entries.get(key(threadId, runId, name)))),
-    set: (threadId, runId, name, exit) =>
-      Effect.sync(() => {
-        entries.set(key(threadId, runId, name), exit);
-      }),
-  });
-});
 
 // -----------------------------------------------------------------------------
 // Workflow
