@@ -6,6 +6,8 @@ Effect-based AG-UI agent library. pnpm monorepo:
 - `packages/examples/ag-ui` — a runnable example wiring the library to Anthropic. See its `AGENTS.md`.
 - `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effect-agent-harness backend. See its `AGENTS.md`.
 - `openspec/` — spec-driven change proposals (see "Planning changes" below).
+- `README.md` — the project overview: goals, non-goals and core primitives. The library's own `README.md` only links here.
+- `docs/` — the user documentation (see "Documentation" below).
 
 ## Commands
 
@@ -19,7 +21,7 @@ Run from the repo root. Each one delegates to the packages via `pnpm -r --if-pre
 | `pnpm format`       | oxfmt, writes packages and root-level files |
 | `pnpm format:check` | oxfmt, check only                           |
 
-Before calling work done, run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check`, and fix every finding. Lint runs with `--deny-warnings`, so warnings fail too. Don't silence a lint rule without saying why. CI (`.github/workflows/ci.yml`) runs the same four commands on every push to `main` and on every pull request.
+Before calling work done, run `pnpm tsc && pnpm lint && pnpm test && pnpm format:check`, and fix every finding. Also update the docs and steering files the change affects (see "Documentation" below). Lint runs with `--deny-warnings`, so warnings fail too. Don't silence a lint rule without saying why. CI (`.github/workflows/ci.yml`) runs the same four commands on every push to `main` and on every pull request.
 
 To target one package, filter by name: `pnpm --filter effect-agent-harness test`. The root package is `effect-agent-harness-monorepo`, so `--filter effect-agent-harness` matches only the library.
 
@@ -42,6 +44,20 @@ To target one package, filter by name: `pnpm --filter effect-agent-harness test`
 - Prefer the most direct combinator. The linter suggests these, for example `Effect.orElseSucceed` over `Effect.catch(() => Effect.succeed(...))`.
 - Relative imports use the `.ts` extension (`./Agent.ts`). Type-only imports use `import type`, because `verbatimModuleSyntax` is on.
 - `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` are on. Optional fields are typed `?: T | undefined` where `undefined` may be passed explicitly.
+
+## Documentation
+
+Keep these up to date in the same change as the code. A change isn't done while any of them describes the old behaviour.
+
+| File                                             | Update it when                                                                                                                                                                                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docs/robodocs.md`                               | Any public API, behaviour or option changes. It is the full user guide and module reference, and the one place for usage recipes.                                                                                                     |
+| `docs/architecture.md`                           | A message type, conversion, store or workflow changes: the map, the run timeline, the nesting, the type catalog or the workflow matrix. Its Mermaid diagram labels must be quoted (`-->\|"label"\|`), or GitHub fails to render them. |
+| `docs/core-effect-comparison-audit.md`           | The library adopts or drops a core Effect module, `effect` is bumped, or a module it compares changes. It is a dated snapshot, so update its date too.                                                                                |
+| `README.md`                                      | The project's goals, non-goals or core primitives change.                                                                                                                                                                             |
+| `AGENTS.md` files (this one, and each package's) | Module responsibilities, invariants, commands, layout or conventions change.                                                                                                                                                          |
+
+Code comments and steering files that point readers to the docs name the file and section, for example `docs/robodocs.md`, "Tracing".
 
 ## Version control
 

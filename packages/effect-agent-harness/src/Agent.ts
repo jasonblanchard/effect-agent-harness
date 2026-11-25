@@ -681,7 +681,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       const outerTransformer = yield* Effect.serviceOption(AiTelemetry.CurrentSpanTransformer);
       // Reaches only the model call's own span, unlike span annotations, which would also reach the
       // provider's HTTP spans. Runs any transformer the caller provided first. One provided only when
-      // the LanguageModel layer was built can't be seen here, so it's replaced (see the README).
+      // the LanguageModel layer was built can't be seen here, so it's replaced (see docs/robodocs.md, "Known limitations").
       const modelSpanTransformer: AiTelemetry.SpanTransformer = (options) => {
         if (Option.isSome(outerTransformer)) {
           outerTransformer.value(options);

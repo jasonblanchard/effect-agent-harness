@@ -9,6 +9,10 @@ schema: spec-driven
 #     We use conventional commits
 #     Domain: e-commerce platform
 
+rules:
+  tasks:
+    - Include a final task to update every doc and steering file the change affects, as listed in the root AGENTS.md "Documentation" section (docs/robodocs.md, docs/architecture.md, docs/core-effect-comparison-audit.md, README.md and the AGENTS.md files).
+
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
 # Example:

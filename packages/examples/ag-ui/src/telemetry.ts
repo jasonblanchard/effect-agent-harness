@@ -2,7 +2,7 @@
  * Tracing to PostHog AI observability.
  *
  * The library traces each run following the OpenTelemetry GenAI semantic
- * conventions (see its README, "Tracing"). This file only exports those spans
+ * conventions (see docs/robodocs.md, "Tracing"). This file only exports those spans
  * to PostHog's OTLP endpoint, with content capture on, and adds the few
  * PostHog-specific properties its trace view and cost accounting need. Off
  * unless `POSTHOG_PROJECT_TOKEN` is set (`POSTHOG_HOST` defaults to the US
