@@ -57,7 +57,7 @@ This is a deliberate trade off between completeness and simplicity.
 - **History** - how messages state is prepared for a run. Choose between client authoritative history or server authoritative history.
 - **Thread** - abstract thread storage and lifecycle. Use the built ins or bring your own.
 - **Checkpoint** - captures moments of the agent lifecycle that you would journal in a durable compute log.
-- **EventLog** - Stream of AG-UI events. Use the built ins (ie SSE, in memory) or bring your own (durable streams).
+- **EventLog** - Stream of AG-UI events. Use the built ins (ie SSE, in memory) or bring your own (durable streams). TODO: This one needs to be re-named due to name collision with Effect's EventLog. These are different.
 
 Check out the [architecture](./docs/architecture.md) docs for more details.
 
@@ -66,6 +66,12 @@ Check out the [architecture](./docs/architecture.md) docs for more details.
 This project uses OpenSpec, so pretty much every major decision is documented as a spec or archived change proposal in `./openspec`.
 
 Check the AGENTS.md steering files for more context.
+
+## Examples
+
+There are simple examples in the `./packages/examples` directory.
+
+See [effect-agent-harness-example](https://github.com/jasonblanchard/effect-agent-harness-example) for a more full example running on Effect workflow with postgres storage and multi-process stream durability.
 
 ## Docs
 

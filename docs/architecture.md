@@ -32,7 +32,7 @@ flowchart LR
     RP["Response.AnyPart<br/>the model's streamed output:<br/>text, reasoning, tool-call…"]
     AE["Agent.Event<br/>StepStarted · ModelPart<br/>ToolResult<br/>ApprovalRequested<br/>StepFinished{entries}<br/>Finished | Failed<br/>Subagent{event}"]
   end
-  subgraph Stores
+  subgraph Backend Adapters
     TH[("Thread · durable history<br/>Entry { id, runId?, subagentRunId?,<br/>message: Prompt.Message }")]
     EL[("EventLog · per run<br/>Stored { cursor, event: AgUi.Event }")]
     CP[("Checkpoint · per step<br/>system → string<br/>model:n → ModelStep {assistant: Prompt}<br/>tool:callId → ToolStep")]
