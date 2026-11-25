@@ -50,8 +50,10 @@ export class History extends Context.Service<
  *
  * The client's messages become the run's entries under their own ids:
  *
- * - `user` messages keep their text; `system` and `developer` messages are
- *   kept as system entries only with `clientSystem: "allow"`.
+ * - `user` messages keep their text, and their image, audio, video and
+ *   document parts with inline data or a valid URL, as file parts (as
+ *   `effect/ai`'s `AgUi.toPrompt` converts them); `system` and `developer`
+ *   messages are kept as system entries only with `clientSystem: "allow"`.
  * - `assistant` messages keep their text and tool calls. A call whose
  *   arguments are not a JSON object, such as one cut off by a cancelled run,
  *   is dropped together with its results.

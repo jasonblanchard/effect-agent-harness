@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Result } from "effect";
+import { Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
 import * as Agent from "../../src/Agent.ts";
@@ -127,7 +127,7 @@ const simplify = (prompt: Prompt.Prompt) =>
           }),
   }));
 
-/** An image part, which `ingest` drops: only text is kept. */
+/** An image part from a URL with no media type. */
 const image = { type: "image", source: { type: "url", value: "https://example.com/a.png" } } as const;
 
 type ClientRole = "user" | "assistant" | "system" | "developer" | "reasoning" | "activity";
@@ -309,6 +309,43 @@ describe("delta", () => {
 });
 
 describe("restore", () => {
+  it("shows a user message's media as the client sent it", () => {
+    const sent: AgUiSchema.Message = {
+      id: "u1",
+      role: "user",
+      content: [
+        { type: "text", text: "What is this?" },
+        image,
+        { type: "image", source: { type: "url", value: "https://example.com/b.jpg", mimeType: "image/jpeg" } },
+        { type: "document", source: { type: "data", value: "aGVsbG8=", mimeType: "application/pdf" } },
+        { type: "audio", source: { type: "data", value: "aGVsbG8=", mimeType: "audio/wav" } },
+      ],
+    };
+    const stored = Conversions.ingest([sent]);
+    expect(Conversions.restore(stored).messages).toEqual([sent]);
+    // Stored as JSON and read back, as a durable thread store would.
+    const reloaded = stored.map((entry) =>
+      Schema.decodeUnknownSync(Messages.Entry)(JSON.parse(JSON.stringify(Schema.encodeSync(Messages.Entry)(entry)))),
+    );
+    expect(Conversions.restore(reloaded).messages).toEqual([sent]);
+  });
+
+  it("shows a user message's bytes as base64 data", () => {
+    const entry: Messages.Entry = {
+      id: "u1",
+      message: Prompt.makeMessage("user", {
+        content: [Prompt.makePart("file", { mediaType: "image/png", data: new TextEncoder().encode("hello") })],
+      }),
+    };
+    expect(Conversions.restore([entry]).messages).toEqual([
+      {
+        id: "u1",
+        role: "user",
+        content: [{ type: "image", source: { type: "data", value: "aGVsbG8=", mimeType: "image/png" } }],
+      },
+    ]);
+  });
+
   it("shows user, assistant and tool messages with their stored ids", () => {
     const entries = [
       user("u1", "Weather?"),
@@ -531,11 +568,33 @@ describe("ingest", () => {
         content: [{ type: "text", text: "a" }, image, { type: "text", text: "b" }],
       },
       { id: "u3", role: "user", content: [image] },
+      { id: "u4", role: "user", content: [{ type: "text", text: "" }] },
+      clientMessage("u5", "user", ""),
     ]);
-    expect(entries.map((e) => e.id)).toEqual(["u1", "u2"]);
+    expect(entries.map((e) => e.id)).toEqual(["u1", "u2", "u3"]);
     expect(simplify(Prompt.fromMessages(entries.map((e) => e.message)))).toEqual([
       { role: "user", parts: [{ type: "text", text: "hi" }] },
-      { role: "user", parts: [{ type: "text", text: "ab" }] },
+      { role: "user", parts: [{ type: "text", text: "a" }, { type: "file" }, { type: "text", text: "b" }] },
+      { role: "user", parts: [{ type: "file" }] },
+    ]);
+  });
+
+  it("converts user media as effect/ai's AgUi.toPrompt does", () => {
+    const [entry] = Conversions.ingest([
+      {
+        id: "u1",
+        role: "user",
+        content: [
+          image,
+          { type: "document", source: { type: "data", value: "aGVsbG8=", mimeType: "application/pdf" } },
+          { type: "audio", source: { type: "url", value: "not a url" } },
+          { type: "video", source: { type: "file", value: "file-1" } },
+        ],
+      },
+    ]);
+    expect(entry?.message.content).toEqual([
+      Prompt.makePart("file", { mediaType: "image/*", data: new URL("https://example.com/a.png") }),
+      Prompt.makePart("file", { mediaType: "application/pdf", data: "aGVsbG8=" }),
     ]);
   });
 

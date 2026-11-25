@@ -1,6 +1,7 @@
 import type { AgUiSchema } from "effect/ai";
 import { Option, Result, Schema } from "effect";
-import { Prompt } from "effect/ai";
+import { AgUi as EffectAgUi, Prompt } from "effect/ai";
+import { Base64 } from "effect/encoding";
 import * as Agent from "../Agent.ts";
 import * as AgUi from "../AgUi.ts";
 import type { Entry } from "../Messages.ts";
@@ -110,22 +111,23 @@ export interface IngestOptions {
 }
 
 /**
- * The entries to commit for a client delta: user messages with text, keyed by
- * the client's message id, and (only if allowed) system instructions. Every
+ * The entries to commit for a client delta: user messages, keyed by the
+ * client's message id, and (only if allowed) system instructions. A user
+ * message's content is converted as `effect/ai`'s `AgUi.toPrompt` converts it:
+ * text parts stay text, and image, audio, video and document parts with inline
+ * data or a valid URL become file parts. Empty text parts are dropped, because
+ * providers reject empty text blocks, and so is a message left with nothing.
+ * Every
  * other role is dropped: the server writes assistant and tool turns itself,
  * so a client cannot fabricate them. The one exception, a tool message
  * answering a frontend call, is taken by {@link answers}.
  */
 export const ingest = (messages: ReadonlyArray<AgUiSchema.Message>, options?: IngestOptions): ReadonlyArray<Entry> =>
   messages.flatMap((message): Array<Entry> => {
-    // A message with only media parts has no text to send, and providers
-    // reject empty text blocks.
     switch (message.role) {
       case "user": {
-        const text = textOf(message.content);
-        return text.length === 0
-          ? []
-          : [{ id: message.id, message: Prompt.makeMessage("user", { content: [Prompt.makePart("text", { text })] }) }];
+        const content = userContent(message);
+        return content.length === 0 ? [] : [{ id: message.id, message: Prompt.makeMessage("user", { content }) }];
       }
       case "system":
       case "developer":
@@ -136,6 +138,13 @@ export const ingest = (messages: ReadonlyArray<AgUiSchema.Message>, options?: In
         return [];
     }
   });
+
+/** A user message's parts as `AgUi.toPrompt` converts them, without empty text parts. */
+const userContent = (message: AgUiSchema.UserMessage): ReadonlyArray<Prompt.UserMessagePart> =>
+  // Converted on its own: a user message's conversion depends on nothing else in the input.
+  EffectAgUi.toPrompt({ threadId: "", runId: "", messages: [message], tools: [], context: [] })
+    .content.flatMap((converted) => (converted.role === "user" ? converted.content : []))
+    .filter((part) => part.type !== "text" || part.text.length > 0);
 
 const decodeApprovalResponse = Schema.decodeUnknownOption(AgUi.ApprovalResponse);
 
@@ -592,8 +601,10 @@ const shown = (entry: Entry): AgUiSchema.Message | undefined => {
   const { id, message } = entry;
   switch (message.role) {
     case "user": {
-      const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
-      return { id, role: "user", content: text };
+      // Text alone is sent back as one string, as before media was kept.
+      return message.content.every((part) => part.type === "text")
+        ? { id, role: "user", content: message.content.map((part) => part.text).join("") }
+        : { id, role: "user", content: message.content.map(contentPartOf) };
     }
     case "assistant": {
       const text = message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
@@ -639,6 +650,29 @@ const shown = (entry: Entry): AgUiSchema.Message | undefined => {
       return undefined;
     }
   }
+};
+
+/**
+ * A user entry's part as the AG-UI content part it came from: a file becomes
+ * an image, audio or video part by its media type, and a document part
+ * otherwise. A URL keeps its media type unless it is the wildcard `toPrompt`
+ * gives a URL sent without one; inline data is base64, as it was sent.
+ */
+const contentPartOf = (part: Prompt.UserMessagePart): AgUiSchema.ContentPart => {
+  if (part.type === "text") {
+    return { type: "text", text: part.text };
+  }
+  const kind = part.mediaType.split("/")[0];
+  const type = kind === "image" || kind === "audio" || kind === "video" ? kind : "document";
+  const source: AgUiSchema.PartSource =
+    part.data instanceof URL
+      ? { type: "url", value: part.data.href, ...(part.mediaType.endsWith("/*") ? {} : { mimeType: part.mediaType }) }
+      : {
+          type: "data",
+          value: typeof part.data === "string" ? part.data : Base64.encode(part.data),
+          mimeType: part.mediaType,
+        };
+  return { type, source };
 };
 
 /**
