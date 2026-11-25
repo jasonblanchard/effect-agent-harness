@@ -1,4 +1,5 @@
 import {
+  Array as Arr,
   Cause,
   Context,
   Deferred,
@@ -12,10 +13,13 @@ import {
   Schema,
   Stream,
 } from "effect";
-import { IdGenerator, LanguageModel, Prompt, Telemetry as AiTelemetry, Tool } from "effect/ai";
-import type { Response, Toolkit } from "effect/ai";
+import { AgUiServer, IdGenerator, LanguageModel, Prompt, Telemetry as AiTelemetry, Tool } from "effect/ai";
+import type { AgUiSchema, Response, Toolkit } from "effect/ai";
 import type { JsonSchema } from "effect";
 import * as Checkpoint from "./Checkpoint.ts";
+import * as Events from "./internal/events.ts";
+import { ChildReport, OnRunFailed, OnStepFinished, reportFailure } from "./internal/hooks.ts";
+import { conflictingTool } from "./internal/tools.ts";
 import * as internalTelemetry from "./internal/telemetry.ts";
 import type * as Messages from "./Messages.ts";
 import * as Telemetry from "./Telemetry.ts";
@@ -42,7 +46,7 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
   /**
    * System prompt placed before the conversation: fixed text, or an effect
    * resolved once per run (memoised as the `system` checkpoint). The effect
-   * may read {@link CurrentRun} and the services `R`.
+   * may read the run's AG-UI input (`AgUiServer.RunInput`) and the services `R`.
    */
   readonly system: string | Effect.Effect<string, never, R> | undefined;
   /**
@@ -89,7 +93,7 @@ export interface Agent<Tools extends Record<string, Tool.Any>, R = never> {
  * An agent's volatile system prompt: fixed text, or a function of the prompt the run was given (the
  * conversation as the model sees it, without the system prompt) resolved once per run, after the system
  * prompt and before step 0, and memoised as the `volatile-system` checkpoint, so a resumed run sends the
- * same text. It may read {@link CurrentRun} and the services `R`. `undefined` or `""` sends no message.
+ * same text. It may read the run's AG-UI input (`AgUiServer.RunInput`) and the services `R`. `undefined` or `""` sends no message.
  */
 export type VolatileSystem<R = never> =
   | string
@@ -196,28 +200,25 @@ export const define = <
 // Run
 // -----------------------------------------------------------------------------
 
-/**
- * Which run is executing, as the system prompt and tool handlers see it
- * through {@link CurrentRun}. Trusted per-run data, such as the verified
- * principal, is not here: the agent requires it as an ordinary service, which
- * a runner builds per run from its declared `Runner.RunContext`s.
- */
-export interface RunInfo {
-  readonly runId: string;
-  readonly threadId: string;
-  /** Set by the client (AG-UI `forwardedProps`), so untrusted: choose between known values, don't interpolate. */
-  readonly props?: unknown;
-}
-
-export interface RunInput extends RunInfo {
-  /** The conversation, without the agent's system prompt: the run adds it. */
-  readonly prompt: Prompt.Prompt;
+/** What {@link run} runs an agent on. */
+export interface RunOptions {
   /**
-   * Tools the client runs itself (AG-UI frontend tools), offered to the model
-   * next to the agent's own. A call to one is left pending for the client to
-   * answer in a later run. Set by the client, so untrusted.
+   * The run's AG-UI input. The run takes its run id and thread id from it,
+   * offers its `tools` to the model as frontend tools (a call to one is left
+   * pending for the client to answer in a later run), and provides it as
+   * `effect/ai`'s `AgUiServer.RunInput` to the system prompts, approval
+   * predicates and tool handlers. Every field comes from the client, so it is
+   * untrusted: trusted per-run data, such as the verified principal, reaches the
+   * agent as an ordinary service its runner builds. The run never reads its
+   * `messages`: the conversation is `prompt`.
    */
-  readonly frontendTools?: ReadonlyArray<FrontendTool> | undefined;
+  readonly input: AgUiSchema.RunAgentInput;
+  /**
+   * The conversation, without the agent's system prompt: the run adds it.
+   * Under the server history it is the whole stored thread, while
+   * `input.messages` holds only what the client sent.
+   */
+  readonly prompt: Prompt.Prompt;
   /**
    * The prompts of the suspended subagents in the history, at any depth, by
    * `subagentRunId` (see `Messages.projectSuspended`). A suspended subagent
@@ -231,26 +232,11 @@ export interface RunInput extends RunInfo {
    * `Effect.uninterruptible` regions), commits what the step produced and ends
    * with the `Cancelled` outcome. It is checked before every step, so a run
    * whose signal has already completed replays what an earlier attempt
-   * completed and then ends without calling the model. Not part of
-   * {@link RunInfo}: tool handlers see cancellation only as interruption.
+   * completed and then ends without calling the model. Tool handlers see
+   * cancellation only as interruption.
    */
   readonly cancelled?: Effect.Effect<void> | undefined;
 }
-
-/** A tool the client advertised and runs itself. */
-export interface FrontendTool {
-  readonly name: string;
-  readonly description?: string | undefined;
-  /** A JSON Schema for the call's arguments, sent to the model as given. */
-  readonly parameters: unknown;
-}
-
-/**
- * The run in progress. `run` provides it, so a system prompt effect can read
- * it, and so can a tool handler whose tool declares
- * `dependencies: [Agent.CurrentRun]`. Never provide it yourself.
- */
-export class CurrentRun extends Context.Service<CurrentRun, RunInfo>()("effect-agent-harness/Agent/CurrentRun") {}
 
 /** Where the parts of a model call's prompt are, as {@link ModelPromptTransformer} receives it. */
 export interface ModelPromptLayout {
@@ -297,109 +283,17 @@ export const ModelPromptTransformer = Context.Reference<
 >("effect-agent-harness/Agent/ModelPromptTransformer", { defaultValue: () => (prompt) => prompt });
 
 /**
- * What a run emits. Events derived from a checkpoint served from the store
- * rather than executed carry `replayed: true`; a replayed model step emits no
- * `ModelPart`s.
+ * The client advertised a frontend tool with the name of one of the agent's
+ * tools or subagents, so a call to that name would be ambiguous.
  */
-export type Event =
-  | { readonly _tag: "StepStarted"; readonly step: number; readonly messageId: string; readonly replayed: boolean }
-  | {
-      readonly _tag: "ModelPart";
-      readonly step: number;
-      readonly messageId: string;
-      readonly part: Response.AnyPart;
-      readonly replayed: false;
-    }
-  | {
-      readonly _tag: "ToolResult";
-      readonly step: number;
-      readonly messageId: string;
-      readonly toolCallId: string;
-      readonly toolName: string;
-      readonly encodedResult: unknown;
-      readonly isFailure: boolean;
-      readonly replayed: boolean;
-    }
-  /**
-   * A preliminary result a tool handler reported through `ctx.preliminary` while it ran, encoded with the
-   * tool's success schema. Only an executing handler reports one, so it is never replayed, and it is never
-   * sent to the model, put in the step's entries or checkpointed.
-   */
-  | {
-      readonly _tag: "ToolProgress";
-      readonly step: number;
-      /**
-       * The assistant message id of the step that made the call. `undefined` for an approved call run in
-       * step 0, which an earlier run made.
-       */
-      readonly messageId: string | undefined;
-      readonly toolCallId: string;
-      readonly toolName: string;
-      readonly encodedValue: unknown;
-      readonly replayed: false;
-    }
-  | {
-      readonly _tag: "ApprovalRequested";
-      readonly step: number;
-      readonly approvalId: string;
-      readonly toolCallId: string;
-      readonly toolName: string;
-      readonly replayed: boolean;
-    }
-  | {
-      readonly _tag: "StepFinished";
-      readonly step: number;
-      /** The thread entries this step produced, to be committed. */
-      readonly entries: ReadonlyArray<Messages.Entry>;
-      readonly replayed: boolean;
-    }
-  | { readonly _tag: "Finished"; readonly outcome: Outcome }
-  | { readonly _tag: "Failed"; readonly error: unknown; readonly code: string | undefined }
-  /**
-   * An event of a subagent the run is running, as that subagent's own run
-   * emitted it. A subagent's subagents arrive wrapped once more. Every child
-   * run ends with its own `Finished` or `Failed`, which ends only the child.
-   */
-  | {
-      readonly _tag: "Subagent";
-      readonly subagentRunId: string;
-      readonly name: string;
-      readonly description: string | undefined;
-      /** The call that spawned the subagent. */
-      readonly parentToolCallId: string;
-      /** The message id of the step holding that call. */
-      readonly parentMessageId: string;
-      readonly event: Event;
-    };
-
-export interface Approval {
-  readonly approvalId: string;
-  readonly toolCallId: string;
-  readonly toolName: string;
-  /** The subagent whose call waits for approval; absent for the agent's own calls. */
-  readonly subagentRunId?: string | undefined;
+export class FrontendToolConflict extends Schema.TaggedError<FrontendToolConflict, { readonly brand: unique symbol }>()(
+  "FrontendToolConflict",
+  { toolName: Schema.String },
+) {
+  override get message(): string {
+    return `The frontend tool ${JSON.stringify(this.toolName)} has the name of one of the agent's tools`;
+  }
 }
-
-/** A call to a frontend tool, left for the client to run and answer. */
-export interface PendingToolCall {
-  readonly toolCallId: string;
-  readonly toolName: string;
-}
-
-/** `Success` and `Interrupted` list the frontend calls the run left pending, in call order. */
-export type Outcome =
-  | { readonly _tag: "Success"; readonly pendingToolCalls: ReadonlyArray<PendingToolCall> }
-  /** The run stopped because these tool calls wait for the user's approval. */
-  | {
-      readonly _tag: "Interrupted";
-      readonly approvals: ReadonlyArray<Approval>;
-      readonly pendingToolCalls: ReadonlyArray<PendingToolCall>;
-    }
-  /**
-   * The run's cancel signal fired. Every complete call of the last step has a
-   * result, real or a failed "cancelled" one, so nothing is left pending.
-   */
-  | { readonly _tag: "Cancelled" };
 
 export class StepLimitExceeded extends Schema.TaggedError<StepLimitExceeded, { readonly brand: unique symbol }>()(
   "StepLimitExceeded",
@@ -433,10 +327,10 @@ type RunServices<Tools extends Record<string, Tool.Any>, R> =
   | Tool.ResultDecodingServices<Tools[keyof Tools]>
   | R;
 
-/** What a caller provides to run an agent whose system prompt needs `R`. */
+/** What a caller provides to run an agent whose system prompt needs `R`. The run provides the AG-UI input itself. */
 export type Requirements<Tools extends Record<string, Tool.Any>, R = never> = Exclude<
   RunServices<Tools, R>,
-  CurrentRun
+  AgUiServer.RunInput
 >;
 
 /** What a model step stores in its checkpoint. */
@@ -447,14 +341,21 @@ const ModelStep = Schema.Struct({
   /** Calls for the loop to execute, with parameters in encoded form. */
   toolCalls: Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String, params: Schema.Unknown })),
   finishReason: Schema.String,
+  /** The token counts the model reported, so a replayed step counts them too. Absent from older checkpoints. */
+  usage: Schema.optionalKey(Events.StepUsage),
 });
 type ModelStep = typeof ModelStep.Type;
 type ToolCall = ModelStep["toolCalls"][number];
 
-/** Where a call's progress is reported: see the `ToolProgress` event. */
+/**
+ * Where a call's progress is reported: the step running it, the assistant message id of the step that made the
+ * call (`undefined` for an approved call run in step 0, which an earlier run made), and that step's spans, if it
+ * executed in this attempt.
+ */
 interface CallOrigin {
   readonly step: number;
   readonly messageId: string | undefined;
+  readonly emitter: Events.StepEmitter | undefined;
 }
 
 /** What a tool call stores in its checkpoint. */
@@ -479,8 +380,14 @@ const ToolStep = Schema.Union([
 ]);
 type ToolStep = typeof ToolStep.Type;
 
-/** A tool call's step, with the entries of the subagent it ran, if any. */
-type ToolOutcome = Checkpoint.Memoized<ToolStep> & { readonly entries: ReadonlyArray<Messages.Entry> };
+/**
+ * A tool call's step, with the entries of the subagent it ran, if any, and the events that close that subagent
+ * just before the call's result (`SUBAGENT_FINISHED` with the result, for a child that finished).
+ */
+type ToolOutcome = Checkpoint.Memoized<ToolStep> & {
+  readonly entries: ReadonlyArray<Messages.Entry>;
+  readonly closing?: ReadonlyArray<AgUiSchema.Event> | undefined;
+};
 
 /**
  * A call the run's cancellation stopped before it had an outcome, with the
@@ -537,8 +444,8 @@ class ToolResultFailure extends Schema.TaggedError<ToolResultFailure, { readonly
 ) {}
 
 /**
- * Internal: carries a subagent's failure out of its `invoke_agent` span, so the span ends with an error
- * status. It's caught just outside the span and never escapes `Agent.run`.
+ * Internal: ends a subagent's `invoke_agent` span with an error when the child failed without reporting its
+ * cause. It's caught just outside the span and never escapes `Agent.run`.
  */
 class SubagentFailure extends Schema.TaggedError<SubagentFailure, { readonly brand: unique symbol }>()(
   "SubagentFailure",
@@ -550,7 +457,21 @@ class SubagentFailure extends Schema.TaggedError<SubagentFailure, { readonly bra
  * carrying it. Derived from the call, so a client's history alone links an
  * interrupt to its call. Treat it as opaque.
  */
-export const approvalIdFor = (toolCallId: string): string => `approval:${toolCallId}`;
+export const approvalIdFor: (toolCallId: string) => string = Events.approvalIdFor;
+
+/**
+ * The payload of a `resolved` answer to a tool approval interrupt. Every
+ * approval interrupt carries its JSON Schema as `responseSchema`, so a generic
+ * client can tell what to send. A payload that doesn't decode denies the call.
+ */
+export const ApprovalResponse: typeof Events.ApprovalResponse = Events.ApprovalResponse;
+export type ApprovalResponse = Events.ApprovalResponse;
+
+/** Whether an AG-UI event ends a run (`RUN_FINISHED` or `RUN_ERROR`). */
+export const isTerminal: (event: AgUiSchema.Event) => event is AgUiSchema.RunFinishedEvent | AgUiSchema.RunErrorEvent =
+  Events.isTerminal;
+
+type Approval = Events.Approval;
 
 /** A user's answer to an approval request, found in the prompt. */
 interface Decision {
@@ -559,32 +480,65 @@ interface Decision {
 }
 
 /**
- * Runs the agent on a prompt: model steps, with the tool calls of each step
- * executed after the model call, until the model stops calling tools, a tool
- * needs approval, the model calls a frontend tool, or the step limit is
- * reached. A frontend call gets no result: the step's assistant entry marks it
- * as the client's (see {@link isFrontendCall}) and the outcome lists it. Every model call starts with
- * the agent's system prompt, resolved once before anything else runs, and ends with its volatile system
- * prompt, resolved right after it; {@link ModelPromptTransformer}, if provided, then adjusts the call's prompt. The
- * run's info is available as {@link CurrentRun} throughout.
+ * Runs the agent on a prompt, emitting the run's AG-UI events: `RUN_STARTED`,
+ * then model steps (`STEP_STARTED` … `STEP_FINISHED`, with their text,
+ * reasoning and tool calls), the tool calls of each step executed after the
+ * model call, until the model stops calling tools, a tool needs approval, the
+ * model calls a frontend tool, or the step limit is reached, then one
+ * `RUN_FINISHED` (`success`, with `pendingToolCallIds` naming the frontend
+ * calls left to the client; `interrupt`, with one interrupt per approval; or
+ * `cancelled`) or `RUN_ERROR`. A frontend call gets no result: the step's
+ * assistant entry marks it as the client's (see {@link isFrontendCall}). Every
+ * model call starts with the agent's system prompt, resolved once before
+ * anything else runs, and ends with its volatile system prompt, resolved right
+ * after it; {@link ModelPromptTransformer}, if provided, then adjusts the
+ * call's prompt. The run's AG-UI input is available as
+ * `AgUiServer.RunInput` throughout.
  *
  * Every model call and every tool call is memoised through the
  * {@link Checkpoint.Checkpoint} in context, under `model:<step>` and
- * `tool:<toolCallId>`, so a run executed again with the same `threadId` and `runId` against a
- * durable store replays completed work instead of repeating it.
+ * `tool:<toolCallId>`, so a run executed again with the same `threadId` and
+ * `runId` against a durable store replays completed work instead of repeating
+ * it, and emits nothing for it, except each replayed tool result and each
+ * replayed subagent's lifecycle events, which carry
+ * `metadata["effect-agent-harness"]` `{ replayed: true }`: an earlier attempt
+ * may have stored them without publishing them, and the runners decide.
  *
- * The stream never fails. It ends with exactly one `Finished` or `Failed`
- * event. Interrupting it (the consumer stops reading) cancels the run, and
- * nothing more is emitted.
+ * A failed tool result carries `metadata["effect/ai"]` `{ isFailure: true }`,
+ * as `effect/ai`'s own agent marks one. The terminal event carries `usage`,
+ * summed over every model step, a subagent's included, when the model
+ * reported any count.
+ *
+ * The stream never fails. Interrupting it (the consumer stops reading) stops
+ * the run, and nothing more is emitted.
  */
 export const run = <Tools extends Record<string, Tool.Any>, R>(
   agent: Agent<Tools, R>,
-  input: RunInput,
-): Stream.Stream<Event, never, Requirements<Tools, R>> =>
-  Stream.callback<Event, never, Requirements<Tools, R>>((queue) => {
-    const emit = (event: Event) => Queue.offer(queue, event);
-    const { prompt: _, frontendTools = [], subagentPrompts, cancelled, ...info } = input;
+  options: RunOptions,
+): Stream.Stream<AgUiSchema.Event, never, Requirements<Tools, R>> =>
+  Stream.callback<AgUiSchema.Event, never, Requirements<Tools, R>>((queue) => {
+    const emit = (event: AgUiSchema.Event) => Queue.offer(queue, event);
+    const emitAll = (events: ReadonlyArray<AgUiSchema.Event>) => Effect.forEach(events, emit, { discard: true });
+    const { input, subagentPrompts, cancelled } = options;
+    const memoKey = { threadId: input.threadId, runId: input.runId };
+    // The spans of the model step executing in this attempt, if any: its result events close its open calls, and
+    // its end, a failure or a cancel closes the rest. A replayed step has none.
+    let current: Events.StepEmitter | undefined;
+    const usage = new Events.UsageTotal();
+    // Closes the step's spans, then the step itself, if it executed in this attempt.
+    const endStep = (step: number) => {
+      const events = current === undefined ? [] : [...current.close(), Events.stepFinished(Events.stepName(step))];
+      current = undefined;
+      return emitAll(events);
+    };
+    const finished = (outcome: AgUiSchema.RunFinishedOutcome) =>
+      emit({ ...Events.runFinished(input, outcome), ...usage.usage });
+
     return Effect.gen(function* () {
+      yield* emit(Events.runStarted(input));
+
+      const report = yield* ChildReport;
+      const onStepFinished = yield* OnStepFinished;
       const checkpoint = yield* Checkpoint.Checkpoint;
       const transformModelPrompt = yield* ModelPromptTransformer;
       // Completed once the signal fires. Started at once, so a signal that has already fired is seen
@@ -635,20 +589,22 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
       const toolkit = yield* agent.toolkit;
       // `define` checked that every subagent has a name.
       const subagents = new Map((agent.subagents?.agents ?? []).map((child) => [child.name ?? "", child]));
-      // The model is offered the agent's tools and subagents plus the client's. The agent's own win a name clash.
+      // The model is offered the agent's tools and subagents plus the client's. A client tool named like one of
+      // the agent's would make a call to that name ambiguous, so the run refuses it.
+      const conflict = conflictingTool(agent, input.tools);
+      if (conflict !== undefined) {
+        return yield* new FrontendToolConflict({ toolName: conflict });
+      }
       const frontend = new Map<string, Tool.Any>();
-      for (const tool of frontendTools) {
-        if (Object.hasOwn(toolkit.tools, tool.name) || subagents.has(tool.name)) {
-          yield* Effect.logWarning(
-            "effect-agent-harness: frontend tool ignored, a server tool has its name",
-            tool.name,
-          );
-        } else if (!frontend.has(tool.name)) {
+      for (const tool of input.tools) {
+        if (!frontend.has(tool.name)) {
           frontend.set(
             tool.name,
             Tool.dynamic(tool.name, {
               description: tool.description,
-              parameters: tool.parameters as JsonSchema.JsonSchema,
+              // AG-UI leaves `parameters` optional, and the schema goes to the model as given, so a tool
+              // without one takes no arguments.
+              parameters: (tool.parameters ?? { type: "object", properties: {} }) as JsonSchema.JsonSchema,
             }),
           );
         }
@@ -688,12 +644,18 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }
         annotateModelSpan(options, runAttributes, capture);
       };
-      // A failing step is stored as a defect: the run reports it as `Failed`, so its type does not matter.
+      // Reports a step or call served from the store to a parent running this run as a subagent.
+      const replayedHere = <A>(memoised: Checkpoint.Memoized<A>): Checkpoint.Memoized<A> => {
+        if (memoised.replayed) {
+          report.replayed();
+        }
+        return memoised;
+      };
+      // A failing step is stored as a defect: the run reports it as `RUN_ERROR`, so its type does not matter.
       const memoTool = <E>(name: string, body: Effect.Effect<ToolStep, E, RunServices<Tools, R>>, gate = ungated) =>
-        checkpoint.memo(
-          { threadId: input.threadId, runId: input.runId, name, success: ToolStep, error: Schema.Never },
-          gate(Effect.orDie(body)),
-        );
+        checkpoint
+          .memo({ ...memoKey, name, success: ToolStep, error: Schema.Never }, gate(Effect.orDie(body)))
+          .pipe(Effect.map(replayedHere));
 
       const result = (encodedResult: unknown, isFailure: boolean) =>
         Effect.map(ids.generateId(), (messageId): ToolStep => ({
@@ -704,7 +666,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }));
 
       // Runs the handler, unless the call needs approval and no decision was made yet. `origin` is where its
-      // progress is reported: the step running it and the message id of the step that made the call.
+      // progress is reported.
       const executeTool = (
         call: ToolCall,
         origin: CallOrigin,
@@ -736,7 +698,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         );
 
       // Only an executed handler is traced: a replayed, denied, interrupted or pending call has no span. Its
-      // preliminary results go out as progress while it runs, inside the checkpoint, so a replayed call reports
+      // preliminary results go out as activity while it runs, inside the checkpoint, so a replayed call reports
       // none; only the last final result is kept.
       const handleTool = (call: ToolCall, origin: CallOrigin) =>
         Effect.gen(function* () {
@@ -747,15 +709,16 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             (last, r) =>
               r.preliminary
                 ? Effect.as(
-                    emit({
-                      _tag: "ToolProgress",
-                      step: origin.step,
-                      messageId: origin.messageId,
-                      toolCallId: call.id,
-                      toolName: call.name,
-                      encodedValue: r.encodedResult,
-                      replayed: false,
-                    }),
+                    // A call the model left open is closed first, as its result would close it.
+                    emitAll([
+                      ...(origin.emitter?.closeTool(call.id) ?? []),
+                      Events.activitySnapshot(
+                        Events.activityMessageId(origin.messageId, call.id),
+                        call.name,
+                        call.id,
+                        r.encodedResult,
+                      ),
+                    ]),
                     last,
                   )
                 : Effect.succeedSome(r),
@@ -827,6 +790,27 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }),
       });
 
+      // A call's result: closing the call first if the model left it open (only for a result executed in this
+      // attempt), then whatever closes the subagent it ran, then `TOOL_CALL_RESULT`.
+      const emitResult = (
+        call: ToolCall,
+        value: Extract<ToolStep, { _tag: "Result" }>,
+        replayed: boolean,
+        closing: ReadonlyArray<AgUiSchema.Event> | undefined,
+      ) => {
+        const event = Events.toolCallResult(
+          value.messageId,
+          call.id,
+          Events.resultContent(value.encodedResult),
+          value.isFailure,
+        );
+        return emitAll([
+          ...(replayed ? [] : (current?.closeTool(call.id) ?? [])),
+          ...(closing ?? []),
+          replayed ? Events.markReplayed(event) : event,
+        ]);
+      };
+
       // -- Subagents --------------------------------------------------------------------------------------
 
       const withoutEntries = (step: Checkpoint.Memoized<ToolStep>): ToolOutcome => ({ ...step, entries: [] });
@@ -845,20 +829,21 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         child: Any,
         decoded: unknown,
         own: ReadonlyArray<Messages.Entry>,
-        terminal: Extract<Event, { _tag: "Finished" | "Failed" }>,
+        terminal: Events.Terminal,
+        approvals: ReadonlyArray<Approval>,
       ): Effect.Effect<ToolStep> => {
-        if (terminal._tag === "Failed") {
-          return result(errorMessage(terminal.error), true);
+        if (terminal.type === "RUN_ERROR") {
+          return result(terminal.message, true);
         }
-        if (terminal.outcome._tag === "Cancelled") {
+        if (terminal.outcome?.type === "cancelled") {
           // `callSubagent` handles a cancelled child before memoising anything.
           return result(CANCELLED_TOOL_CALL_RESULT, true);
         }
-        if (terminal.outcome._tag === "Interrupted") {
+        if (terminal.outcome?.type === "interrupt") {
           const subagentRunId = subagentIdFor(call.id);
           return Effect.succeed({
             _tag: "Suspended",
-            approvals: terminal.outcome.approvals.map((approval) => ({
+            approvals: approvals.map((approval) => ({
               approvalId: approval.approvalId,
               toolCallId: approval.toolCallId,
               toolName: approval.toolName,
@@ -882,12 +867,12 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         );
       };
 
-      // Runs the child a subagent call spawns, forwarding its events, and records how it ended as the call's
-      // tool step. Its prompt is the parent's conversation (under the `conversation` mode), then its brief, rebuilt from the
-      // call every time so it is never stored, then `history`: what it did in earlier runs, if it is resumed.
-      // Its entries are those of its steps, owned by it unless a deeper subagent owns them already. Not inside
-      // a checkpoint: the child's own steps are, under names prefixed by the call, so running it again replays
-      // them.
+      // Runs the child a subagent call spawns, forwarding its events attributed to it, and records how it ended
+      // as the call's tool step. Its prompt is the parent's conversation (under the `conversation` mode), then its
+      // brief, rebuilt from the call every time so it is never stored, then `history`: what it did in earlier
+      // runs, if it is resumed. Its entries are those of its steps, owned by it unless a deeper subagent owns them
+      // already. Not inside a checkpoint: the child's own steps are, under names prefixed by the call, so running
+      // it again replays them.
       const callSubagent = (
         call: ToolCall,
         child: Any,
@@ -912,47 +897,88 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           );
           const subagentRunId = subagentIdFor(call.id);
           const own: Array<Messages.Entry> = [];
-          let terminal: Extract<Event, { _tag: "Finished" | "Failed" }> | undefined;
-          // `define` made the child's requirements part of the agent's.
+          let approvals: ReadonlyArray<Approval> = [];
+          let terminal: Events.Terminal | undefined;
+          // The child's failure, as its run reported it, and the cause the call's span ended with.
+          let childCause: Cause.Cause<unknown> | undefined;
+          let raised: Cause.Cause<unknown> | undefined;
+          // Whether the child served anything from its checkpoints, and whether it emitted anything it executed in
+          // this attempt. A child that only replayed may have been published by an earlier attempt: its lifecycle
+          // events are marked for the runner to decide.
+          let replayed = false;
+          let live = false;
+          let started = false;
+          const startedEvent: AgUiSchema.SubagentStartedEvent = {
+            type: "SUBAGENT_STARTED",
+            subagentRunId,
+            name: call.name,
+            ...(child.description === undefined ? {} : { description: child.description }),
+            parentToolCallId: call.id,
+            parentMessageId,
+          };
+          const asReplayed = <A extends AgUiSchema.Event>(event: A, marked: boolean): A =>
+            marked ? Events.markReplayed(event) : event;
+          // `SUBAGENT_STARTED` goes out before the child's first event, marked when that event is.
+          const opening = (marked: boolean): Array<AgUiSchema.Event> => {
+            if (started) {
+              return [];
+            }
+            started = true;
+            return [asReplayed(startedEvent, marked)];
+          };
+          // `define` made the child's requirements part of the agent's. The child sees the parent's input, without
+          // its frontend tools, and is cancelled with its parent.
           const events = run(child, {
-            ...info,
+            input: { ...input, tools: [] },
             prompt: childPrompt,
             subagentPrompts,
-            // Cancelled with its parent.
             cancelled: cancelled === undefined ? undefined : Deferred.await(cancel),
-          }) as Stream.Stream<Event, never, RunServices<Tools, R>>;
+          }) as Stream.Stream<AgUiSchema.Event, never, RunServices<Tools, R>>;
           // The child's model and tool spans are children of one agent span for the call, as a run's are of its
-          // root. A failed child fails the span's effect, so the span ends with an error status; it's caught just
-          // outside, so the run sees no difference.
+          // root. A failed child fails the span's effect with the child's own cause, so the span ends with the
+          // original error, recorded once; it's caught just outside, so the run sees no difference.
           yield* events.pipe(
             Stream.provideService(Checkpoint.Checkpoint, prefixed(checkpoint, `sub:${call.id}/`)),
-
+            Stream.provideService(OnStepFinished, (entries) => Effect.sync(() => own.push(...entries))),
+            // Not logged: the parent reports the failure as a failed tool result.
+            Stream.provideService(OnRunFailed, (cause) =>
+              Effect.sync(() => {
+                childCause = cause;
+              }),
+            ),
+            Stream.provideService(ChildReport, {
+              replayed: () => {
+                replayed = true;
+              },
+              approvals: (waiting) => {
+                approvals = waiting;
+              },
+            }),
             Stream.runForEach((event) => {
-              if (event._tag === "StepFinished") {
-                own.push(...event.entries);
-              } else if (event._tag === "Finished" || event._tag === "Failed") {
-                terminal = event;
+              if (event.type === "RUN_STARTED") {
+                return Effect.void;
               }
-
-              return emit({
-                _tag: "Subagent",
-                subagentRunId,
-                name: call.name,
-                description: child.description,
-                parentToolCallId: call.id,
-                parentMessageId,
-                event,
-              });
+              if (Events.isTerminal(event)) {
+                terminal = event;
+                usage.add(event.usage?.[0]);
+                return Effect.void;
+              }
+              const marked = Events.isReplayed(event);
+              live ||= !marked;
+              return emitAll([...opening(marked), Events.attributeToChild(event, subagentRunId)]);
             }),
             Effect.andThen(
               Effect.suspend(() => {
                 const ended = terminal;
-                return ended?._tag === "Failed"
-                  ? Effect.andThen(
-                      Effect.annotateCurrentSpan({ [Attr.errorType]: ended.code ?? "Error" }),
-                      new SubagentFailure({ error: ended.error }),
-                    )
-                  : Effect.void;
+                if (ended?.type !== "RUN_ERROR") {
+                  return Effect.void;
+                }
+                raised = childCause ?? Cause.fail(new SubagentFailure({ error: ended.message }));
+                return Effect.andThen(
+                  Effect.annotateCurrentSpan({ [Attr.errorType]: ended.code ?? "Error" }),
+                  // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context -- the child's own cause, so the span records the original error; caught just outside the span.
+                  Effect.failCause(raised),
+                );
               }),
             ),
             Effect.withSpan(internalTelemetry.agentSpanName(call.name), {
@@ -965,18 +991,68 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
                 [Attr.toolCallId]: call.id,
               },
             }),
-            Effect.catchTag("SubagentFailure", () => Effect.void),
+            Effect.catchCause((cause) =>
+              raised !== undefined && !Cause.hasInterrupts(cause)
+                ? Effect.void
+                : // Without the child's failure, the span's effect fails only by interruption or a defect.
+                  Effect.failCause(cause as Cause.Cause<never>),
+            ),
           );
 
-          if (terminal === undefined) {
+          const ended: Events.Terminal | undefined = terminal;
+          if (ended === undefined) {
             return yield* Effect.die("A subagent run ended without a terminal event");
           }
-
-          const ended = terminal;
           const entries = own.map((entry) => (entry.subagentRunId === undefined ? { ...entry, subagentRunId } : entry));
-          // Not memoised: the parent is ending too, and a stored outcome would turn a later replay into a fake result.
-          if (ended._tag === "Finished" && ended.outcome._tag === "Cancelled") {
+          // Its lifecycle is marked when nothing it emitted was executed in this attempt.
+          const marked = replayed && !live;
+          if (ended.type === "RUN_ERROR") {
+            yield* emitAll([
+              ...opening(marked),
+              asReplayed(
+                {
+                  type: "SUBAGENT_ERROR",
+                  subagentRunId,
+                  message: ended.message,
+                  ...(ended.code === undefined ? {} : { code: ended.code }),
+                },
+                marked,
+              ),
+            ]);
+          } else if (ended.outcome?.type === "cancelled") {
+            // AG-UI has no cancelled subagent outcome. Not memoised: the parent is ending too, and a stored outcome
+            // would turn a later replay into a fake result.
+            yield* emitAll([
+              ...opening(marked),
+              asReplayed(
+                {
+                  type: "SUBAGENT_ERROR",
+                  subagentRunId,
+                  message: "The subagent was cancelled with its parent run",
+                  code: "Cancelled",
+                },
+                marked,
+              ),
+            ]);
             return { cancelled: true, entries } satisfies CancelledCall;
+          } else if (ended.outcome?.type === "interrupt") {
+            // Only the interrupts it owns directly; a descendant's are its own.
+            const interruptIds = ended.outcome.interrupts
+              .filter((interrupt) => interrupt.subagentRunId === undefined)
+              .map((interrupt) => interrupt.id);
+            yield* emitAll([
+              ...opening(marked),
+              asReplayed(
+                {
+                  type: "SUBAGENT_FINISHED",
+                  subagentRunId,
+                  outcome: interruptIds.length === 0 ? { type: "suspended" } : { type: "suspended", interruptIds },
+                },
+                marked,
+              ),
+            ]);
+          } else {
+            yield* emitAll(opening(marked));
           }
           const step = yield* memoTool(
             `tool:${call.id}`,
@@ -987,11 +1063,16 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
                 decoded,
                 own.filter((entry) => entry.subagentRunId === undefined),
                 ended,
+                approvals,
               ),
             ),
           );
-
-          return { ...step, entries } satisfies ToolOutcome;
+          // A finished child closes when its parent receives the result, which it carries.
+          const closing =
+            ended.type === "RUN_FINISHED" && ended.outcome?.type !== "interrupt" && step.value._tag === "Result"
+              ? [asReplayed(Events.subagentFinished(subagentRunId, step.value.encodedResult), marked)]
+              : undefined;
+          return { ...step, entries, closing } satisfies ToolOutcome;
         });
 
       // A suspended subagent call in the prompt: the child resumes from what it did in earlier runs.
@@ -1003,27 +1084,19 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           : callSubagent(call, child, parentMessageId, forModel(promptBefore(parentPrompt, call.id)), history);
       };
 
-      // Emits the outcome of each call of a step, in call order, and sorts the step's approvals and entries.
-      const settle = (step: number, calls: ReadonlyArray<ToolCall>, outcomes: ReadonlyArray<ToolOutcome>) =>
+      // Emits the result of each call of a step, in call order, and sorts the step's approvals and entries.
+      const settle = (calls: ReadonlyArray<ToolCall>, outcomes: ReadonlyArray<ToolOutcome>) =>
         Effect.gen(function* () {
           const approvals: Array<Approval> = [];
           const childEntries: Array<Messages.Entry> = [];
           const toolEntries: Array<Messages.Entry> = [];
           const suspended = new Set<string>();
           for (const [i, call] of calls.entries()) {
-            const { value, replayed, entries } = outcomes[i]!;
+            const { value, replayed, entries, closing } = outcomes[i]!;
             childEntries.push(...entries);
             switch (value._tag) {
               case "ApprovalRequested": {
                 approvals.push({ approvalId: value.approvalId, toolCallId: call.id, toolName: call.name });
-                yield* emit({
-                  _tag: "ApprovalRequested",
-                  step,
-                  approvalId: value.approvalId,
-                  toolCallId: call.id,
-                  toolName: call.name,
-                  replayed,
-                });
                 break;
               }
               case "Suspended": {
@@ -1034,7 +1107,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
               }
               case "Result": {
                 toolEntries.push(toolEntry(call, value));
-                yield* emit(toolResultEvent(step, call, value, replayed));
+                yield* emitResult(call, value, replayed, closing);
                 break;
               }
             }
@@ -1044,71 +1117,65 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
 
       // A step's parts go to `progress` as they stream, so a cancelled step can commit them.
       const modelStep = (step: number, prompt: Prompt.Prompt, progress: StepProgress, gate: Gate) =>
-        checkpoint.memo(
-          {
-            threadId: input.threadId,
-            runId: input.runId,
-            name: `model:${step}`,
-            success: ModelStep,
-            error: Schema.Never,
-          },
-          gate(
-            Effect.gen(function* () {
-              const messageId = yield* ids.generateId();
-              progress.messageId = messageId;
-              progress.parts.length = 0;
-              yield* emit({ _tag: "StepStarted", step, messageId, replayed: false });
-              const parts = progress.parts;
-              // The hook runs here, inside the checkpoint, so a replayed step never calls it, and its result
-              // reaches this call only.
-              const conversation = forModel(prompt);
-              const conversationStart = system === undefined || system.length === 0 ? 0 : 1;
-              const built = withVolatile(withSystem(conversation));
-              const sent = transformModelPrompt(built, {
-                conversationStart,
-                conversationEnd: conversationStart + conversation.content.length,
-                step,
-                agentName: agent.name,
-              });
-              yield* LanguageModel.streamText({
-                prompt: sent,
-                toolkit: modelToolkit,
-                disableToolCallResolution: true,
-              }).pipe(
-                Stream.provideService(AiTelemetry.CurrentSpanTransformer, modelSpanTransformer),
-                Stream.runForEach((streamed) => {
-                  // The toolkit's own part type is narrower; this only widens tool names and parameters.
-                  const part = streamed as Response.AnyPart;
-                  if (part.type === "error") {
-                    return Effect.fail(new ModelStreamError({ error: part.error }));
-                  }
-                  parts.push(part);
-                  return emit({ _tag: "ModelPart", step, messageId, part, replayed: false });
-                }),
-              );
-              const finish = parts.find((part) => part.type === "finish");
-              return {
-                messageId,
-                assistant: Prompt.fromResponseParts(parts),
-                toolCalls: callsIn(parts),
-                finishReason: finish?.type === "finish" ? finish.reason : "unknown",
-              } satisfies ModelStep;
-            }).pipe(Effect.orDie),
-          ),
-        );
+        checkpoint
+          .memo(
+            { ...memoKey, name: `model:${step}`, success: ModelStep, error: Schema.Never },
+            gate(
+              Effect.gen(function* () {
+                const messageId = yield* ids.generateId();
+                progress.messageId = messageId;
+                progress.parts.length = 0;
+                const emitter = new Events.StepEmitter(messageId);
+                current = emitter;
+                yield* emit(Events.stepStarted(Events.stepName(step)));
+                const parts = progress.parts;
+                // The hook runs here, inside the checkpoint, so a replayed step never calls it, and its result
+                // reaches this call only.
+                const conversation = forModel(prompt);
+                const conversationStart = system === undefined || system.length === 0 ? 0 : 1;
+                const built = withVolatile(withSystem(conversation));
+                const sent = transformModelPrompt(built, {
+                  conversationStart,
+                  conversationEnd: conversationStart + conversation.content.length,
+                  step,
+                  agentName: agent.name,
+                });
+                yield* LanguageModel.streamText({
+                  prompt: sent,
+                  toolkit: modelToolkit,
+                  disableToolCallResolution: true,
+                }).pipe(
+                  Stream.provideService(AiTelemetry.CurrentSpanTransformer, modelSpanTransformer),
+                  Stream.runForEach((streamed) => {
+                    // The toolkit's own part type is narrower; this only widens tool names and parameters.
+                    const part = streamed as Response.AnyPart;
+                    if (part.type === "error") {
+                      return Effect.fail(new ModelStreamError({ error: part.error }));
+                    }
+                    parts.push(part);
+                    return emitAll(emitter.part(part));
+                  }),
+                );
+                const finish = parts.find((part) => part.type === "finish");
+                const counted = finish?.type === "finish" ? Events.usageOf(finish.usage) : undefined;
+                return {
+                  messageId,
+                  assistant: Prompt.fromResponseParts(parts),
+                  toolCalls: callsIn(parts),
+                  finishReason: finish?.type === "finish" ? finish.reason : "unknown",
+                  ...(counted === undefined ? {} : { usage: counted }),
+                } satisfies ModelStep;
+              }).pipe(Effect.orDie),
+            ),
+          )
+          .pipe(Effect.map(replayedHere));
 
       // Resolved before step 0, so a system prompt that fails runs no tool.
       const system =
         agent.system === undefined || typeof agent.system === "string"
           ? agent.system
           : (yield* checkpoint.memo(
-              {
-                threadId: input.threadId,
-                runId: input.runId,
-                name: "system",
-                success: Schema.String,
-                error: Schema.Never,
-              },
+              { ...memoKey, name: "system", success: Schema.String, error: Schema.Never },
               agent.system,
             )).value;
       const withSystem = (prompt: Prompt.Prompt) =>
@@ -1122,14 +1189,8 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         agent.volatileSystem === undefined || typeof agent.volatileSystem === "string"
           ? agent.volatileSystem
           : (yield* checkpoint.memo(
-              {
-                threadId: input.threadId,
-                runId: input.runId,
-                name: "volatile-system",
-                success: Schema.String,
-                error: Schema.Never,
-              },
-              Effect.map(agent.volatileSystem({ prompt: forModel(input.prompt) }), (text) => text ?? ""),
+              { ...memoKey, name: "volatile-system", success: Schema.String, error: Schema.Never },
+              Effect.map(agent.volatileSystem({ prompt: forModel(options.prompt) }), (text) => text ?? ""),
             )).value;
       // Always last, so everything before it stays cacheable. Never stored: only model calls see it.
       const withVolatile = (prompt: Prompt.Prompt) =>
@@ -1137,7 +1198,8 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           ? prompt
           : Prompt.fromMessages([...prompt.content, Prompt.makeMessage("system", { content: volatile })]);
 
-      const finishCancelled = emit({ _tag: "Finished", outcome: { _tag: "Cancelled" } });
+      // The cancelled outcome carries no `result`, and no approvals or pending calls: nothing is left open.
+      const finishCancelled = finished({ type: "cancelled" });
 
       // Ends a step the signal stopped: the assistant entry under the step's message id (`undefined` for step
       // 0, which has none) with the calls whose input was complete, each call's real result if it has one and
@@ -1173,16 +1235,22 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
                     isFailure: true,
                   };
             toolEntries.push(toolEntry(call, value));
-            yield* emit(toolResultEvent(step, call, value, kept?.value._tag === "Result" && kept.replayed));
+            yield* emitResult(
+              call,
+              value,
+              kept?.value._tag === "Result" && kept.replayed,
+              kept?.value._tag === "Result" ? kept.closing : undefined,
+            );
           }
           entries.push(...toolEntries);
-          yield* emit({ _tag: "StepFinished", step, entries, replayed: false });
+          yield* onStepFinished(entries);
+          yield* endStep(step);
           return yield* finishCancelled;
         });
 
       // Step 0: approval answers carried by the prompt, and suspended subagents, are resolved before the model
-      // is called.
-      let prompt = input.prompt;
+      // is called. It has no step events.
+      let prompt = options.prompt;
       const decided = pendingDecisions(prompt);
       const suspended = suspendedCalls(prompt);
       if (decided.length > 0 || suspended.length > 0) {
@@ -1191,7 +1259,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         const ended = yield* Effect.all(
           [
             ...decided.map(({ call, decision }) =>
-              guardedTool(call, { step: 0, messageId: undefined }, opening, decision),
+              guardedTool(call, { step: 0, messageId: undefined, emitter: undefined }, opening, decision),
             ),
             ...suspended.map(({ call, parentMessageId }) => resumeSubagent(call, parentMessageId, opening)),
           ],
@@ -1201,18 +1269,14 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         if (outcomes === undefined) {
           return yield* cancelStep(0, undefined, Prompt.empty, calls, byCall(calls, ended));
         }
-        const settled = yield* settle(0, calls, outcomes);
-        yield* emit({
-          _tag: "StepFinished",
-          step: 0,
-          entries: [...settled.childEntries, ...settled.toolEntries],
-          replayed: outcomes.every((outcome) => outcome.replayed),
-        });
+        const settled = yield* settle(calls, outcomes);
+        yield* onStepFinished([...settled.childEntries, ...settled.toolEntries]);
         // A resumed subagent waits again. A decision always yields a result.
-        if (settled.approvals.length > 0) {
-          return yield* emit({
-            _tag: "Finished",
-            outcome: { _tag: "Interrupted", approvals: settled.approvals, pendingToolCalls: [] },
+        if (Arr.isReadonlyArrayNonEmpty(settled.approvals)) {
+          report.approvals(settled.approvals);
+          return yield* finished({
+            type: "interrupt",
+            interrupts: Arr.map(settled.approvals, Events.approvalInterrupt),
           });
         }
         // The prompt may continue past the calls (e.g. a new user message), so place the results right after them.
@@ -1223,6 +1287,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
 
       for (let step = 1; ; step++) {
         const progress: StepProgress = { messageId: undefined, parts: [] };
+        current = undefined;
         const memoised = yield* guard((gate) => modelStep(step, prompt, progress, gate));
         if (Option.isNone(memoised)) {
           // A step that never started produced nothing: the signal had fired before it.
@@ -1238,9 +1303,12 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }
         const model = memoised.value;
         const { messageId, assistant, toolCalls, finishReason } = model.value;
+        usage.add(model.value.usage);
         if (model.replayed) {
-          yield* emit({ _tag: "StepStarted", step, messageId, replayed: true });
+          // A replayed step published nothing of its own in this attempt.
+          current = undefined;
         }
+        const origin: CallOrigin = { step, messageId, emitter: current };
 
         const complete = finishReason === "tool-calls" || finishReason === "stop";
         const modelPrompt = forModel(prompt);
@@ -1256,7 +1324,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
             }
             const child = subagents.get(call.name);
             return child === undefined
-              ? guardedTool(call, { step, messageId }, modelPrompt, undefined)
+              ? guardedTool(call, origin, modelPrompt, undefined)
               : callSubagent(call, child, messageId, modelPrompt, Prompt.empty);
           },
           { concurrency: "unbounded" },
@@ -1266,7 +1334,7 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           // Every complete call, frontend calls included, gets a result: the cancelled outcome leaves none pending.
           return yield* cancelStep(step, messageId, assistant, toolCalls, byCall(executed, ended));
         }
-        const { approvals, childEntries, toolEntries, suspended } = yield* settle(step, executed, tools);
+        const { approvals, childEntries, toolEntries, suspended } = yield* settle(executed, tools);
 
         const assistantMessage = assistant.content.find((message) => message.role === "assistant");
         const entries: Array<Messages.Entry> = [];
@@ -1295,19 +1363,20 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
         }
         const own = [...entries, ...toolEntries];
         entries.push(...childEntries, ...toolEntries);
-        yield* emit({
-          _tag: "StepFinished",
-          step,
-          entries,
-          replayed: model.replayed && tools.every((t) => t.replayed),
-        });
+        yield* onStepFinished(entries);
+        yield* endStep(step);
 
-        const pendingToolCalls = pending.map((call) => ({ toolCallId: call.id, toolName: call.name }));
-        if (approvals.length > 0) {
-          return yield* emit({ _tag: "Finished", outcome: { _tag: "Interrupted", approvals, pendingToolCalls } });
+        if (Arr.isReadonlyArrayNonEmpty(approvals)) {
+          // AG-UI's interrupt outcome carries no pending calls: the client finds them in the stream.
+          report.approvals(approvals);
+          return yield* finished({ type: "interrupt", interrupts: Arr.map(approvals, Events.approvalInterrupt) });
         }
-        if (pendingToolCalls.length > 0 || finishReason !== "tool-calls" || toolCalls.length === 0) {
-          return yield* emit({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls } });
+        if (pending.length > 0 || finishReason !== "tool-calls" || toolCalls.length === 0) {
+          return yield* finished(
+            pending.length === 0
+              ? { type: "success" }
+              : { type: "success", pendingToolCallIds: pending.map((call) => call.id) },
+          );
         }
         if (step + 1 > agent.maxSteps) {
           return yield* new StepLimitExceeded({ maxSteps: agent.maxSteps });
@@ -1321,12 +1390,19 @@ export const run = <Tools extends Record<string, Tool.Any>, R>(
           return Queue.failCause(queue, cause as Cause.Cause<never>);
         }
         const error = Cause.squash(cause);
-        return emit({ _tag: "Failed", error, code: errorCode(error) });
+        // The spans the step left open are closed; the step itself is left open, as a failed run leaves it.
+        const closers = current?.close() ?? [];
+        current = undefined;
+        return reportFailure(cause).pipe(
+          Effect.andThen(
+            emitAll([...closers, { ...Events.runError(errorMessage(error), errorCode(error)), ...usage.usage }]),
+          ),
+        );
       }),
       Effect.andThen(Queue.end(queue)),
       // No span of its own: model and tool spans are children of the caller's span (a runner's
       // `invoke_agent` root), so a backend that keeps only GenAI spans sees an unbroken tree.
-      Effect.provideService(CurrentRun, info),
+      Effect.provideService(AgUiServer.RunInput, input),
     );
   });
 
@@ -1396,22 +1472,6 @@ export const withoutUnansweredProviderCalls = (
 /** Each call's outcome, by call id. */
 const byCall = (calls: ReadonlyArray<ToolCall>, outcomes: ReadonlyArray<CallOutcome>): Map<string, CallOutcome> =>
   new Map(calls.flatMap((call, i) => (outcomes[i] === undefined ? [] : [[call.id, outcomes[i]] as const])));
-
-const toolResultEvent = (
-  step: number,
-  call: ToolCall,
-  result: Extract<ToolStep, { _tag: "Result" }>,
-  replayed: boolean,
-): Event => ({
-  _tag: "ToolResult",
-  step,
-  messageId: result.messageId,
-  toolCallId: call.id,
-  toolName: call.name,
-  encodedResult: result.encodedResult,
-  isFailure: result.isFailure,
-  replayed,
-});
 
 // -----------------------------------------------------------------------------
 // Approvals

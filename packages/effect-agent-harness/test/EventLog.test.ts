@@ -1,11 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Stream } from "effect";
-import * as AgUi from "../src/AgUi.ts";
+import type { AgUiSchema } from "effect/ai";
+import * as Events from "../src/internal/events.ts";
 import * as EventLog from "../src/EventLog.ts";
 
 const input = { threadId: "t1", runId: "r1" };
 
-const append = (...events: ReadonlyArray<AgUi.Event>) =>
+const append = (...events: ReadonlyArray<AgUiSchema.Event>) =>
   Effect.flatMap(EventLog.EventLog, (log) => Effect.forEach(events, (event) => log.append("t1", "r1", event)));
 
 const subscribe = (after?: string) =>
@@ -15,7 +16,7 @@ describe("EventLog.layerMemory", () => {
   it.effect("assigns increasing cursors and reads in append order", () =>
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      const events = [AgUi.runStarted(input), AgUi.textMessageStart("m1"), AgUi.textMessageEnd("m1")];
+      const events = [Events.runStarted(input), Events.textMessageStart("m1"), Events.textMessageEnd("m1")];
       yield* append(...events);
       const stored = yield* log.read("t1", "r1");
       expect(stored.map((s) => s.event)).toEqual(events);
@@ -29,9 +30,9 @@ describe("EventLog.layerMemory", () => {
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
       const [, second, third] = yield* append(
-        AgUi.runStarted(input),
-        AgUi.textMessageStart("m1"),
-        AgUi.textMessageEnd("m1"),
+        Events.runStarted(input),
+        Events.textMessageStart("m1"),
+        Events.textMessageEnd("m1"),
       );
       expect(yield* log.read("t1", "r1", second!.cursor)).toEqual([third]);
       expect(yield* log.read("t1", "unknown")).toEqual([]);
@@ -41,9 +42,9 @@ describe("EventLog.layerMemory", () => {
   it.effect("keeps runs with the same run id on different threads apart", () =>
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      yield* append(AgUi.runStarted(input), AgUi.runFinished(input));
+      yield* append(Events.runStarted(input), Events.runFinished(input));
       expect(yield* log.read("t2", "r1")).toEqual([]);
-      yield* log.append("t2", "r1", AgUi.runStarted({ threadId: "t2", runId: "r1" }));
+      yield* log.append("t2", "r1", Events.runStarted({ threadId: "t2", runId: "r1" }));
       expect((yield* log.read("t2", "r1")).map((s) => s.cursor)).toEqual(["0"]);
       expect(yield* log.read("t1", "r1")).toHaveLength(2);
     }).pipe(Effect.provide(EventLog.layerMemory)),
@@ -52,13 +53,13 @@ describe("EventLog.layerMemory", () => {
   it.effect("delivers history then each live event once when reconnecting mid-run", () =>
     Effect.gen(function* () {
       const [, c2] = yield* append(
-        AgUi.runStarted(input),
-        AgUi.textMessageStart("m1"),
-        AgUi.textMessageContent("m1", "a"),
+        Events.runStarted(input),
+        Events.textMessageStart("m1"),
+        Events.textMessageContent("m1", "a"),
       );
       const fiber = yield* subscribe(c2!.cursor).pipe(Effect.forkChild);
       yield* Effect.yieldNow;
-      yield* append(AgUi.textMessageEnd("m1"), AgUi.runFinished(input));
+      yield* append(Events.textMessageEnd("m1"), Events.runFinished(input));
       const received = yield* Fiber.join(fiber);
       expect(received.map((s) => s.event.type)).toEqual(["TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "RUN_FINISHED"]);
       expect(received.map((s) => s.cursor)).toEqual(["2", "3", "4"]);
@@ -67,7 +68,7 @@ describe("EventLog.layerMemory", () => {
 
   it.effect("completes when subscribing to a completed run", () =>
     Effect.gen(function* () {
-      yield* append(AgUi.runStarted(input), AgUi.runError("boom"));
+      yield* append(Events.runStarted(input), Events.runError("boom"));
       const received = yield* subscribe();
       expect(received.map((s) => s.event.type)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
     }).pipe(Effect.provide(EventLog.layerMemory)),
@@ -75,7 +76,7 @@ describe("EventLog.layerMemory", () => {
 
   it.effect("completes at once when reconnecting after the terminal event", () =>
     Effect.gen(function* () {
-      const [, finished] = yield* append(AgUi.runStarted(input), AgUi.runFinished(input));
+      const [, finished] = yield* append(Events.runStarted(input), Events.runFinished(input));
       expect(yield* subscribe(finished!.cursor)).toEqual([]);
     }).pipe(Effect.provide(EventLog.layerMemory)),
   );
@@ -83,7 +84,7 @@ describe("EventLog.layerMemory", () => {
   it.effect("rejects a cursor the run's log never issued, before streaming anything", () =>
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      yield* append(AgUi.runStarted(input), AgUi.textMessageStart("m1"));
+      yield* append(Events.runStarted(input), Events.textMessageStart("m1"));
       for (const cursor of ["abc", "", "-1", "01", "1.0", "2"]) {
         expect(yield* Effect.flip(log.subscribe("t1", "r1", cursor))).toEqual(new EventLog.InvalidCursor({ cursor }));
         expect(yield* Effect.flip(log.read("t1", "r1", cursor))).toEqual(new EventLog.InvalidCursor({ cursor }));
@@ -104,9 +105,9 @@ describe("EventLog.layerMemory", () => {
         Effect.forkChild,
       );
       yield* Effect.yieldNow;
-      yield* append(AgUi.runStarted(input));
+      yield* append(Events.runStarted(input));
       yield* Deferred.await(first);
-      yield* append(AgUi.runFinished(input));
+      yield* append(Events.runFinished(input));
       const received = yield* Fiber.join(fiber);
       expect(received.map((s) => s.event.type)).toEqual(["RUN_STARTED", "RUN_FINISHED"]);
     }).pipe(Effect.provide(EventLog.layerMemory)),
@@ -117,8 +118,8 @@ describe("EventLog.layerMemory", () => {
       const a = yield* subscribe().pipe(Effect.forkChild);
       const b = yield* subscribe().pipe(Effect.forkChild);
       yield* Effect.yieldNow;
-      yield* append(AgUi.runStarted(input), AgUi.textMessageStart("m1"), AgUi.textMessageEnd("m1"));
-      yield* append(AgUi.runFinished(input));
+      yield* append(Events.runStarted(input), Events.textMessageStart("m1"), Events.textMessageEnd("m1"));
+      yield* append(Events.runFinished(input));
       const [first, second] = [yield* Fiber.join(a), yield* Fiber.join(b)];
       expect(first).toHaveLength(4);
       expect(second).toEqual(first);

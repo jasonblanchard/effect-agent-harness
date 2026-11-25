@@ -1,0 +1,110 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "send-email",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{\"to\":\"a@b.c\",\"body\":\"Hi\"}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1",
+      "outcome": {
+        "type": "interrupt",
+        "interrupts": [
+          {
+            "id": "approval:c1",
+            "reason": "tool-approval",
+            "toolCallId": "c1",
+            "message": "Approve call to send-email?",
+            "responseSchema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "approved": {
+                  "type": "boolean"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "approved"
+              ],
+              "additionalProperties": true
+            }
+          }
+        ]
+      }
+    }
+  ],
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r2",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-2",
+      "toolCallId": "c1",
+      "content": "{\"sent\":true}",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-3",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-3",
+      "delta": "Sent."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-3"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r2",
+      "outcome": {
+        "type": "success"
+      }
+    }
+  ]
+]

@@ -1,0 +1,206 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "writer",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{\"prompt\":\"Email them\"}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1"
+    },
+    {
+      "type": "SUBAGENT_STARTED",
+      "subagentRunId": "subagent:c1",
+      "name": "writer",
+      "parentToolCallId": "c1",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c2",
+      "toolCallName": "send-email",
+      "parentMessageId": "id-2",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c2",
+      "delta": "{\"to\":\"a@b.c\",\"body\":\"Hi\"}",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c2",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "SUBAGENT_FINISHED",
+      "subagentRunId": "subagent:c1",
+      "outcome": {
+        "type": "suspended",
+        "interruptIds": [
+          "approval:c2"
+        ]
+      }
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1",
+      "outcome": {
+        "type": "interrupt",
+        "interrupts": [
+          {
+            "id": "approval:c2",
+            "reason": "tool-approval",
+            "toolCallId": "c2",
+            "message": "Approve call to send-email?",
+            "responseSchema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "approved": {
+                  "type": "boolean"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "approved"
+              ],
+              "additionalProperties": true
+            },
+            "subagentRunId": "subagent:c1"
+          }
+        ]
+      }
+    }
+  ],
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r2",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "SUBAGENT_STARTED",
+      "subagentRunId": "subagent:c1",
+      "name": "writer",
+      "parentToolCallId": "c1",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-3",
+      "toolCallId": "c2",
+      "content": "{\"sent\":true}",
+      "role": "tool",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-4",
+      "role": "assistant",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-4",
+      "delta": "Sent it.",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-4",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "SUBAGENT_FINISHED",
+      "subagentRunId": "subagent:c1",
+      "result": "Sent it.",
+      "outcome": {
+        "type": "success"
+      }
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-5",
+      "toolCallId": "c1",
+      "content": "\"Sent it.\"",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-6",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-6",
+      "delta": "Done."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-6"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r2",
+      "outcome": {
+        "type": "success"
+      }
+    }
+  ]
+]

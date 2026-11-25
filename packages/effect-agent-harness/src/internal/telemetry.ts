@@ -4,9 +4,9 @@
  * formats. Every attribute name the library writes is here, so a change in
  * the conventions, which are still in development, is a change to this file.
  */
+import type { Tracer } from "effect";
 import { Prompt, Tool } from "effect/ai";
 import type { Response } from "effect/ai";
-import type { Tracer } from "effect";
 
 export const Attr = {
   operationName: "gen_ai.operation.name",

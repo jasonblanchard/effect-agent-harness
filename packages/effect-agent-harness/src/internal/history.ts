@@ -1,9 +1,11 @@
 import { Cause, Effect } from "effect";
 import * as Agent from "../Agent.ts";
 import type { AgUiSchema } from "effect/ai";
+import * as Events from "./events.ts";
 import type * as Messages from "../Messages.ts";
 import type * as Thread from "../Thread.ts";
 import * as Conversions from "./conversions.ts";
+import { reportFailure } from "./hooks.ts";
 
 // -----------------------------------------------------------------------------
 // The private side of `History`: what the runner calls on it. Not exported from
@@ -13,8 +15,8 @@ import * as Conversions from "./conversions.ts";
 export const TypeId: unique symbol = Symbol.for("effect-agent-harness/History");
 export type TypeId = typeof TypeId;
 
-/** A terminal event of `Agent.run`. */
-export type Terminal = Extract<Agent.Event, { readonly _tag: "Finished" | "Failed" }>;
+/** A run's terminal AG-UI event. */
+export type Terminal = Events.Terminal;
 
 /** What opening a run can fail with. Only the server history fails. */
 export type AttemptError =
@@ -61,13 +63,28 @@ export interface Attempt {
   /** Called with each step's entries. */
   readonly commit: (entries: ReadonlyArray<Messages.Entry>) => Effect.Effect<void, Thread.ThreadError>;
   /** Called once with the terminal event, before it is emitted. Returns the event to emit. */
-  readonly end: (event: Terminal) => Effect.Effect<Agent.Event>;
+  readonly end: (event: Terminal) => Effect.Effect<Terminal>;
 }
 
-/** A failure as the `Failed` event that reports it. */
-export const failed = (cause: Cause.Cause<unknown>): Terminal => {
+/** A failure as the `RUN_ERROR` that reports it. */
+export const failed = (cause: Cause.Cause<unknown>): AgUiSchema.RunErrorEvent => {
   const error = Cause.squash(cause);
-  return { _tag: "Failed", error, code: Agent.errorCode(error) };
+  return Events.runError(Agent.errorMessage(error), Agent.errorCode(error));
+};
+
+/** How a run ended, as the thread store is told. */
+const outcomeOf = (event: Terminal): Thread.RunOutcome => {
+  if (event.type === "RUN_ERROR") {
+    return { _tag: "Failed", code: event.code };
+  }
+  switch (event.outcome?.type) {
+    case "interrupt":
+      return { _tag: "Interrupted" };
+    case "cancelled":
+      return { _tag: "Cancelled" };
+    default:
+      return { _tag: "Success" };
+  }
 };
 
 const logMalformed = (input: AgUiSchema.RunAgentInput) =>
@@ -127,26 +144,27 @@ export const client: Service = {
 /**
  * Calls `runEnded` and then releases the thread, even if `runEnded` failed. If
  * either fails, a successful, interrupted or cancelled run ends as failed
- * instead; a run that already failed keeps its own error.
+ * instead, keeping its usage, and the failure is reported to `OnRunFailed`; a
+ * run that already failed keeps its own error.
  */
 const endRun = (thread: Thread.Thread["Service"], threadId: string, runId: string, event: Terminal) =>
-  thread
-    .runEnded(
-      threadId,
-      runId,
-      event._tag === "Finished" ? { _tag: event.outcome._tag } : { _tag: "Failed", code: event.code },
-    )
-    .pipe(
-      Effect.exit,
-      Effect.flatMap((ended) => Effect.andThen(thread.release(threadId, runId), ended)),
-      Effect.as<Agent.Event>(event),
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? // An interrupt-only cause has no failures, so its error type is irrelevant.
-            Effect.failCause(cause as Cause.Cause<never>)
-          : Effect.succeed(event._tag === "Failed" ? event : failed(cause)),
-      ),
-    );
+  thread.runEnded(threadId, runId, outcomeOf(event)).pipe(
+    Effect.exit,
+    Effect.flatMap((ended) => Effect.andThen(thread.release(threadId, runId), ended)),
+    Effect.as<Terminal>(event),
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? // An interrupt-only cause has no failures, so its error type is irrelevant.
+          Effect.failCause(cause as Cause.Cause<never>)
+        : event.type === "RUN_ERROR"
+          ? Effect.succeed<Terminal>(event)
+          : // The run's usage still goes out with the failure that replaces its end.
+            Effect.as(reportFailure(cause), {
+              ...failed(cause),
+              ...(event.usage === undefined ? {} : { usage: event.usage }),
+            }),
+    ),
+  );
 
 /**
  * The server history over `thread`: the run claims the thread (so it has one

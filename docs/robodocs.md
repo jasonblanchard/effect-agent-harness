@@ -109,7 +109,7 @@ const agent = Agent.define({
 
 ### A system prompt computed per run
 
-`system` can be an effect. It runs once per run, before anything else, and its result is memoised (as the `system` checkpoint), so a resumed run sends the same text. It can read the run it's in through `Agent.CurrentRun` (`{ runId, threadId, props }`), and any services it uses become part of what the agent requires, including per-run ones such as the current user (see [Authentication and run context](#authentication-and-run-context)):
+`system` can be an effect. It runs once per run, before anything else, and its result is memoised (as the `system` checkpoint), so a resumed run sends the same text. It can read the run's AG-UI input through `effect/ai`'s `AgUiServer.RunInput` (its `threadId`, `runId`, `forwardedProps`, `state`, …; see [The run's input](#the-runs-input)), and any services it uses become part of what the agent requires, including per-run ones such as the current user (see [Authentication and run context](#authentication-and-run-context)):
 
 ```ts
 const agent = Agent.define({
@@ -118,7 +118,7 @@ const agent = Agent.define({
     const user = yield* CurrentUser;
     return `You are helping ${user.displayName}. Today is ${new Date().toDateString()}.`;
   }),
-}); // requires CurrentUser; never CurrentRun, which Agent.run provides
+}); // requires CurrentUser; never AgUiServer.RunInput, which Agent.run provides
 ```
 
 The effect's error type is `never`: handle failures inside it (fall back to a default) or let it die, which fails the run before any tool or model call.
@@ -141,7 +141,7 @@ const agent = Agent.define({
 }); // requires Retriever
 ```
 
-- It is fixed text, or a function of `prompt`, the conversation the run was given (without the system prompt). The function may read `Agent.CurrentRun`, and the services it uses become part of what the agent requires, as with `system`. Returning `undefined` or `""` sends no message.
+- It is fixed text, or a function of `prompt`, the conversation the run was given (without the system prompt). The function may read `AgUiServer.RunInput`, and the services it uses become part of what the agent requires, as with `system`. Returning `undefined` or `""` sends no message.
 - It is resolved once per run, right after `system` and before anything else, and memoised (as the `volatile-system` checkpoint), so a resumed run sends the same text and doesn't repeat the retrieval. Every step of the run sends the same text; only its position moves as the run adds steps. If it dies, the run fails before any tool or model call.
 - It is never stored: no entry, event, thread or restored history holds it, and each run resolves its own.
 - A subagent's `volatileSystem` applies to its own calls, and a parent's never reaches its subagents.
@@ -203,7 +203,7 @@ const AnthropicCaching = Layer.succeed(Agent.ModelPromptTransformer, (prompt, { 
 
 ### Tools that need the run or the user
 
-A tool handler can read services that differ per run, too. Declare them as dependencies: `Agent.CurrentRun` for the run's ids and props, or a per-run service such as `CurrentUser`:
+A tool handler can read services that differ per run, too. Declare them as dependencies: `AgUiServer.RunInput` for the run's AG-UI input (its ids, `forwardedProps`, `state`), or a per-run service such as `CurrentUser`. A tool written for `effect/ai`'s own `AgUiServer.agent` reads `AgUiServer.RunInput` the same way, so it runs here unchanged:
 
 ```ts
 const ListMyOrders = Tool.make("list-my-orders", {
@@ -239,10 +239,10 @@ Tool tips:
 1. Build the per-run services from the dependencies the caller provided. See [Authentication and run context](#authentication-and-run-context).
 2. Check the input against what was stored for its run id (`RunInputMismatch` if it differs).
 3. Build the prompt from the run's history. By default that is the client's messages as sent; with `History.layerServer` it is the stored thread, which the run claims and loads, plus what the client may add to it. See [Histories](#histories).
-4. Run the agent with the run's info (below), the client's frontend tools and its per-run services. Under the server history, each finished step is committed to the thread.
+4. Run the agent on the run's AG-UI input (below) and its per-run services. `Agent.run` emits the AG-UI events itself. Under the server history, each finished step is committed to the thread before its `STEP_FINISHED` goes out.
 5. Emit the terminal event. Under the server history, the run's end is reported to the store (`runEnded`) and the thread released first.
 
-AG-UI events are emitted throughout.
+AG-UI events are emitted throughout. When a run executed again replays work from its checkpoints, the runner publishes only what an earlier attempt may not have: a replayed tool result or subagent end missing from the earlier attempt's log.
 
 Pick a runner by what should happen when the client goes away:
 
@@ -258,10 +258,21 @@ None of them requires a thread store: a run's history is optional, and `History.
 
 `Runner.makeAttached` returns a plain function: nothing is captured, and each stream requires the agent's services. The library has no HTTP code of its own: serve the stream with `effect/ai`'s `AgUiServer.endpoint` and `AgUiServer.handler((input) => runAgent(input))`. The endpoint decodes the body as AG-UI's `RunAgentInput` (a body that doesn't decode is a 400 before any stream opens), sends each event as an SSE `data:` frame with `cache-control: no-cache` and a keepalive comment every 15 seconds, and the handler provides its context to the stream, since the body is read after the handler has returned. Whatever the stream still needs becomes a requirement of the handler: keep those services in the app layer's output (`Layer.provideMerge`). The web handler provides them to every request, while `Layer.provide` would hide them and leave the handler asking for a context argument. For the same reason, a per-request service the route forgets to provide, such as the principal, is not reported at the route but where the web handler is built or called. On another transport, close over the context yourself (`Stream.provideContext(yield* Effect.context())`) and encode the events as you need.
 
+**In place of `effect/ai`'s own agent.** An app that serves `AgUiServer.agent({ toolkit, system, maxSteps })` can serve an agent defined with the same toolkit, system prompt and step limit instead, with `Runner.toAgUiServerAgent`:
+
+```ts
+const AgentRoute = AgUiServer.layerHttp({ path: "/agent", agent: Runner.toAgUiServerAgent(agent) });
+```
+
+It isn't a runner of its own: each run is a `makeAttached` run, cancelled when the client disconnects. It adds the check `effect/ai`'s agent makes before the stream opens: a frontend tool named like one of the agent's tools is answered with 400. `AgUiServer.layerHttp` and `agentHandler` capture their services once, when the route is built, so a run served this way never sees what middleware provides per request, such as an authenticated principal. For that, serve `makeAttached` through `AgUiServer.endpoint` and `AgUiServer.handler`, as above.
+
 Guarantees for every runner:
 
 - **The stream never fails.** Errors arrive in-band as `RUN_ERROR`, with `code` set to the error's tag (`ModelStreamError`, `StepLimitExceeded`, `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`, `RunInputMismatch`, `ThreadBusy`, `ThreadError`, an error from the per-run layer, a provider error such as `RateLimitError`, …).
 - **Every sequence is valid AG-UI.** It starts with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Text messages, reasoning, tool calls and steps are always closed, including when a run fails mid-message.
+- **The terminal event reports token usage.** `RUN_FINISHED` (and `RUN_ERROR`) carries `usage`: one entry summing the input, output, total, reasoning, cached-input and cache-write counts the model reported for every model step, a subagent's included, as `AgUiServer.agent` does. A step replayed from its checkpoint counts what it recorded, so a resumed run reports the same totals. It's left out when the model reports no count.
+- **A failed tool result is marked as `effect/ai` marks one.** Its `TOOL_CALL_RESULT` carries `metadata: { "effect/ai": { isFailure: true } }`. An AG-UI client copies event metadata onto the tool message it builds, so when it sends its history back the result is still failed. `History.restore` puts the same marker, and `error`, on a failed tool message.
+- **A frontend tool can't take a server tool's name.** A run whose `tools` reuse the name of one of the agent's tools or subagents ends with `RUN_ERROR` code `FrontendToolConflict` before the model is called.
 
 What a client sees for a tool-using reply:
 
@@ -349,19 +360,34 @@ A value that isn't a JSON object is sent as `{ value }`, because AG-UI requires 
 - **Replays report nothing.** A call served from a checkpoint doesn't run its handler, so it emits no progress. A call run again after a crash reports under the same `messageId`, so its snapshots replace the first attempt's. A subagent's snapshots carry its `subagentRunId`.
 - **A cancelled or failed call leaves its last snapshot.** The library doesn't know the content's shape, so it doesn't finalise it. Match the activity to its call through `metadata["effect-agent-harness:toolCallId"]` and use the call's result, or the run's end, to close the widget.
 
-`Agent.Event` gains `ToolProgress` and `AgUi.Event` gains `ActivitySnapshotEvent`, so an exhaustive `switch` over either needs the new case.
+`Agent.run`'s events are typed as `effect/ai`'s `AgUiSchema.Event`, which includes `ActivitySnapshotEvent`, so an exhaustive `switch` needs that case (and a `default` for the event types the run never emits).
 
-### Run info
+### The run's input
 
-Every run gets an `Agent.RunInfo`, which the system prompt and tools read through `Agent.CurrentRun`:
+`Agent.run` provides the run's AG-UI input, the decoded `RunAgentInput`, as `effect/ai`'s `AgUiServer.RunInput`, exactly as `effect/ai`'s own agent does. The system prompt, the volatile system prompt, approval predicates and tool handlers (a subagent's included) read it, and nothing needs to provide it:
 
-| Field      | From                                    | Trust     |
-| ---------- | --------------------------------------- | --------- |
-| `runId`    | the AG-UI input                         |           |
-| `threadId` | the AG-UI input                         |           |
-| `props`    | the input's `forwardedProps`, unchanged | untrusted |
+```ts
+const WhoAmI = Tool.make("who-am-i", {
+  parameters: Schema.Struct({}),
+  success: Schema.String,
+  dependencies: [AgUiServer.RunInput],
+});
 
-Trusted data such as the verified principal is not run info. Whoever starts the run provides it as a service (a per-run dependency), and the agent reads it as services the runner builds per run:
+const handlers = Tools.toLayer({
+  "who-am-i": () =>
+    Effect.gen(function* () {
+      const run = yield* AgUiServer.RunInput;
+      return `${run.threadId}/${run.runId}`;
+    }),
+});
+```
+
+- **Every field comes from the client.** `forwardedProps`, `state` and `context` are whatever it sent: choose between values you know, and don't paste them into a prompt.
+- **`messages` is not the conversation.** It's what the client sent. Under the server history that's only what it adds; the model gets the stored thread. Read the conversation from the prompt the agent is given, not from here.
+- **A subagent sees its parent's input**, without the parent's frontend tools.
+- **Tool's `needsApproval` type admits no services**, so a predicate that reads the input needs a cast (`as Effect.Effect<boolean>`), though the run does provide it while the predicate runs.
+
+Trusted data such as the verified principal is not in the input. Whoever starts the run provides it as a service (a per-run dependency), and the agent reads it as services the runner builds per run:
 
 ```ts
 runAgent(input).pipe(Stream.provideService(AuthContext, principal)); // runAgent = Runner.makeAttached(agent, …)
@@ -386,7 +412,7 @@ With nothing provided, the client owns the transcript. Its messages are converte
 
 - user text, and `system` / `developer` messages only with `clientSystem: "allow"`;
 - assistant text and tool calls. A call whose arguments aren't a JSON object, such as one cut off by a cancelled run, is dropped with its results, with a logged warning;
-- `tool` messages as their call's result, decoded like a [frontend tool](#frontend-tools) result, the first per call. One whose call isn't in the history is dropped with a logged warning;
+- `tool` messages as their call's result, decoded like a [frontend tool](#frontend-tools) result, the first per call: failed when it has `error` set or carries the failure marker the run put on the result's `TOOL_CALL_RESULT`. One whose call isn't in the history is dropped with a logged warning;
 - other roles are dropped.
 
 Edited and regenerated histories are taken as sent, and two runs on one thread may run at once. [Approvals](#tool-approvals) and [frontend calls](#frontend-tools) work from the history alone: an interrupt's id is derived from its tool call (`Agent.approvalIdFor`), so a `resume` entry answers the unanswered call it names. The run can't know what the previous run left open, so it never fails with `UnansweredInterrupt` or `UnansweredToolCall`: a call with no result and no answer is sent to the model with a failed result. Compaction is the client's concern too, since it sends everything on every run.
@@ -549,14 +575,14 @@ How it fits together:
 - **The layer is ordinary Effect.** It reads `AuthContext` like any service, and services that depend on each other compose as layers do (a tenant from the user, say). What it needs besides, such as `UserDirectory`, stays on the stream too, provided the same way as the stores. What it provides is not required from outside.
 - **It's built for every run attempt, before the thread is claimed.** A run that fails to build it ends with `RUN_ERROR` (code: the error's tag), claims nothing and isn't reported to the store. Its finalizers run when the attempt ends. It's not memoised: a resumed run builds it again, so steps not yet run see the new services. A computed system prompt is memoised (as `system`), though, so it keeps the first attempt's text.
 - **You can provide the layer yourself with `makeAttached`.** Leave `layer` out and provide it on each run's stream: `runAgent(input).pipe(Stream.provide(CurrentUserLayer), Stream.provideService(AuthContext, principal))`. It's still built per run, but a failure to build it fails the stream (a broken response) instead of ending the run with `RUN_ERROR`. Detached and workflow runs need `layer`: a detached run's services must outlive the call to `start`, and a workflow rebuilds them from its persisted dependencies on every replay.
-- **"Context" means two things here.** A per-run service is an entry in the run's Effect context (the services it can `yield*`). It's unrelated to the AG-UI input's own `context` field, which never reaches it.
+- **"Context" means two things here.** A per-run service is an entry in the run's Effect context (the services it can `yield*`). It's unrelated to the AG-UI input's own `context` field, which tools can read through `AgUiServer.RunInput` like the rest of the input but which never becomes a service.
 - **Keys must be unique**, as for any Effect service: two services with the same key are one service.
 
 Three rules:
 
 - **Put the verified principal in a dependency, not the raw token.** A workflow's dependencies are persisted by `Runner.makeWorkflow` (and may end up in logs), and a token can expire before a resumed run reaches a tool. A tool that calls another API as the user should get credentials from a service keyed by the principal.
 - **Check that the principal may use the thread.** `threadId` comes from the client, and `Thread.load` does no access control, so without a check a signed-in user can send someone else's thread id and read its history. `Thread` sees only ids, so do this in the route: claim an unknown thread for the caller, and reject one that belongs to someone else. This is also the only check runs need. The client picks `runId` too, but effect-agent-harness keys everything it stores for a run (checkpoints, the workflow execution, the event log) by thread id _and_ run id, so a run id reused on another thread finds nothing. Routes that read a run, such as an event stream, take the thread id as well and check it the same way.
-- **Treat `props` as untrusted.** They are whatever the client sent. Use them to choose between values you know (a locale, a display mode), and don't paste them into the system prompt.
+- **Treat the AG-UI input as untrusted.** `forwardedProps`, `state` and everything else in `AgUiServer.RunInput` is whatever the client sent. Use it to choose between values you know (a locale, a display mode), and don't paste it into the system prompt.
 
 ## Tool approvals
 
@@ -610,7 +636,7 @@ await agent.runAgent({
 
 The answered call is executed (or denied) before the model is called again, and the model then sees the result. The rules:
 
-- **Approved** only when `status` is `"resolved"` and `payload` is an approval response (`AgUi.ApprovalResponse`, `{ approved: boolean, reason?: string }`) with `approved: true`. Anything else is a denial. `payload.reason` is passed to the model as the reason. Each approval interrupt carries this contract as its `responseSchema`, so a generic client can tell what to send.
+- **Approved** only when `status` is `"resolved"` and `payload` is an approval response (`Agent.ApprovalResponse`, `{ approved: boolean, reason?: string }`) with `approved: true`. Anything else is a denial. `payload.reason` is passed to the model as the reason. Each approval interrupt carries this contract as its `responseSchema`, so a generic client can tell what to send.
 - A `resolved` answer whose payload is not an approval response, such as `{ approve: true }` or `"yes"`, is denied, and the runner logs a warning naming the interrupt ids.
 - `status: "cancelled"` is denied with reason `"cancelled"`.
 - **Every open interrupt must be answered.** Under the server history, a run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredInterrupt`, and nothing it sent is committed. AG-UI 1.0 forbids treating a missing answer as a decision, and `HttpAgent` already refuses to send such a run. To move on without approving, for example when the user types a new message instead, answer each open interrupt with `status: "cancelled"` in the same run as the new message. Under the client history, an unanswered call is sent to the model with a failed result instead ([Client history](#client-history)).
@@ -624,14 +650,14 @@ If a `needsApproval` predicate fails or throws, the tool is treated as not needi
 
 A client can advertise tools of its own in `RunAgentInput.tools` (AG-UI frontend tools): the agent proposes a call, and the application runs it. TanStack AI's `useChat` sends its client tools this way, and `HttpAgent` sends the ones you pass to `runAgent({ tools })`. The server needs no code for them:
 
-- **They're offered to the model next to the agent's tools**, with the name, description and JSON Schema the client sent. If one has the same name as a server tool, the server tool is offered and the client's is ignored, with a logged warning.
+- **They're offered to the model next to the agent's tools**, with the name, description and JSON Schema the client sent. One with the same name as a server tool or subagent would make a call to that name ambiguous, so the run refuses it: it ends with `RUN_ERROR` code `FrontendToolConflict` before the model is called (served through `Runner.toAgUiServerAgent`, the request is answered with 400 instead).
 - **A call to one runs nothing on the server.** The call is streamed (`TOOL_CALL_START` / `ARGS` / `END`) but gets no `TOOL_CALL_RESULT`, other calls in the same step still run, and the run ends after that step with a **success** that names the calls left to the client:
 
   ```json
   { "type": "RUN_FINISHED", "outcome": { "type": "success", "pendingToolCallIds": ["toolu_…"] } }
   ```
 
-- **The client answers in its next run's `messages`**, with one `tool` message per call, keyed by `toolCallId`. `error` makes it a failed result. Content that is JSON text is stored as the parsed value, any other text as itself, and a list of content parts as its text; other parts (images, files) are dropped with a logged warning, and the call is still answered. To decline a call, answer it saying so.
+- **The client answers in its next run's `messages`**, with one `tool` message per call, keyed by `toolCallId`. `error`, or the failure marker `metadata: { "effect/ai": { isFailure: true } }`, makes it a failed result. Content that is JSON text is stored as the parsed value, any other text as itself, and a list of content parts as its text; other parts (images, files) are dropped with a logged warning, and the call is still answered. To decline a call, answer it saying so.
 - **Every pending call must be answered.** Under the server history, a run on the thread that leaves one out fails with `RUN_ERROR` code `UnansweredToolCall`, and nothing it sent is committed. A client that abandons the thread answers nothing, which is fine.
 - **A step can mix kinds.** If the model calls a server tool, a frontend tool and a tool that needs approval in one step, the server call runs and the run ends with the approval interrupt. AG-UI's interrupt outcome carries no `pendingToolCallIds`, so the client finds the frontend call in the stream. The next run must carry both the `resume` entry and the `tool` message (if both are missing, `UnansweredInterrupt` is reported); the approved call then runs before the model is called with every result.
 
@@ -792,12 +818,12 @@ Runs trace themselves whenever the application provides an Effect `Tracer`, foll
 
 Each runner attempt produces:
 
-| Span                                          | Attributes                                                                                                                                                                                                                                       |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `invoke_agent {name}` (the root)              | `gen_ai.operation.name`, `gen_ai.agent.name` and `gen_ai.agent.description` (when the agent has them), `gen_ai.conversation.id` (the thread id), `effect_agent_harness.run.id`; `error.type` and error status when the run ends with `RUN_ERROR` |
-| `LanguageModel.streamText`, per model call    | what the provider writes (model, usage, finish reasons), plus `gen_ai.conversation.id`                                                                                                                                                           |
-| `execute_tool {tool}`, per executed tool call | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`, `gen_ai.conversation.id`; `error.type` when the result is a failure                                                                                                               |
-| `invoke_agent {subagent}`, per subagent call  | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.agent.description`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`; the child's model and tool spans nest under it; `error.type` when the child fails                                     |
+| Span                                          | Attributes                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `invoke_agent {name}` (the root)              | `gen_ai.operation.name`, `gen_ai.agent.name` and `gen_ai.agent.description` (when the agent has them), `gen_ai.conversation.id` (the thread id), `effect_agent_harness.run.id`; `error.type` (the `RUN_ERROR` code) and error status when the run ends with `RUN_ERROR`; the span ends with the original error, which an exporter records as one `exception` event |
+| `LanguageModel.streamText`, per model call    | what the provider writes (model, usage, finish reasons), plus `gen_ai.conversation.id`                                                                                                                                                                                                                                                                             |
+| `execute_tool {tool}`, per executed tool call | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`, `gen_ai.conversation.id`; `error.type` when the result is a failure                                                                                                                                                                                                                                 |
+| `invoke_agent {subagent}`, per subagent call  | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.agent.description`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`; the child's model and tool spans nest under it; `error.type` when the child fails, and the span ends with the child's error (not logged: the parent reports it as a failed tool result)                                                 |
 
 The root span starts a new trace, linked to the span the runner was called in (for example the HTTP request's), so a backend sees the run as its own trace. Only work an attempt actually does is traced: a step replayed from a checkpoint, a call awaiting approval, a denied call and a frontend call get no span, so tokens and cost are never counted twice. A resumed attempt is a separate trace with the same `gen_ai.conversation.id`.
 
@@ -855,42 +881,32 @@ The root span was named `effect-agent-harness/Runner.run` before this tracing su
 
 ## Testing and evals
 
-The core loop doesn't depend on AG-UI or any store. `Agent.run(agent, { runId, threadId, props?, prompt })` takes the run info and an effect/ai `Prompt` (without the system prompt, which the agent adds) and emits `Agent.Event`s:
+The core loop depends on no store and no transport. `Agent.run(agent, { input, prompt })` takes the run's AG-UI input and an effect/ai `Prompt` (the conversation, without the system prompt, which the agent adds), and emits the run's AG-UI events, the same ones a client receives: `RUN_STARTED`, steps, text, reasoning, tool calls and results, activity, subagent events, then `RUN_FINISHED` or `RUN_ERROR`.
 
-| Event               | When                                                                   |
-| ------------------- | ---------------------------------------------------------------------- |
-| `StepStarted`       | A model step begins (`step`, `messageId`).                             |
-| `ModelPart`         | A streamed model part, live.                                           |
-| `ToolProgress`      | A handler's preliminary result (`encodedValue`), live; never replayed. |
-| `ToolResult`        | A tool call's result (`encodedResult`, `isFailure`).                   |
-| `ApprovalRequested` | A tool call waits for approval.                                        |
-| `StepFinished`      | A step ends; `entries` are the thread entries it produced.             |
-| `Finished`          | The run ended: `Success`, or `Interrupted` with the pending approvals. |
-| `Failed`            | The run failed (`error`, `code`). Nothing follows.                     |
-
-Events served from the checkpoint store carry `replayed: true`.
-
-That makes evals and unit tests straightforward: provide a model (real or scripted), the tool handlers, and `Checkpoint.layerNone`:
+That makes evals and unit tests straightforward: provide a model (real or scripted), the tool handlers, and `Checkpoint.layerNone`, then read the events:
 
 ```ts
 import { Effect, Stream } from "effect";
 import { Prompt } from "effect/ai";
 
-const events =
+const events = Array.from(
   yield *
-  Agent.run(agent, {
-    runId: "eval-1",
-    threadId: "eval",
-    prompt: Prompt.make([{ role: "user", content: "Weather in Paris?" }]),
-  }).pipe(Stream.runCollect, Effect.provide([ModelLayer, ToolsLayer, Checkpoint.layerNone]));
+    Agent.run(agent, {
+      input: { threadId: "eval", runId: "eval-1", messages: [], tools: [], context: [] },
+      prompt: Prompt.make([{ role: "user", content: "Weather in Paris?" }]),
+    }).pipe(Stream.runCollect, Effect.provide([ModelLayer, ToolsLayer, Checkpoint.layerNone])),
+);
+
+const end = events.at(-1); // RUN_FINISHED, with `outcome` and `usage`; or RUN_ERROR, with `code`
+const results = events.filter((event) => event.type === "TOOL_CALL_RESULT"); // a failed one has metadata["effect/ai"].isFailure
 ```
 
 Provide an `IdGenerator` (from `effect/ai`) to make message ids deterministic.
 
-To check how the agent behaves for different users or settings, pass the run info as literals and provide the per-run services directly. The same definition is used, and no HTTP, token or runner is involved:
+To check how the agent behaves for different users or settings, give the input literal values and provide the per-run services directly. The same definition is used, and no HTTP, token or runner is involved:
 
 ```ts
-Agent.run(agent, { runId: "eval-2", threadId: "eval", prompt }).pipe(
+Agent.run(agent, { input: { ...evalInput, forwardedProps: { locale: "fr" } }, prompt }).pipe(
   Stream.runCollect,
   Effect.provide([
     ModelLayer,
@@ -901,7 +917,27 @@ Agent.run(agent, { runId: "eval-2", threadId: "eval", prompt }).pipe(
 );
 ```
 
-To project core events onto AG-UI yourself, use `AgUi.fold({ threadId, runId })`. To check that a sequence is valid AG-UI in tests, run it through `@ag-ui/client`'s `verifyEvents`.
+What `Agent.run` doesn't emit is what the run stores: the thread entries each step commits. To check those, run the agent through a runner with `History.layerServer` over `Thread.layerMemory`, and read the thread back with `History.restore`. A run executed again with a durable `Checkpoint` emits nothing for the work it replays, except each replayed tool result and subagent end, which carry `metadata["effect-agent-harness"]` `{ replayed: true }` for the runners, which remove it. To check that a sequence is valid AG-UI in tests, run it through `@ag-ui/client`'s `verifyEvents`.
+
+**Migrating from `Agent.Event`.** Earlier versions emitted a library-specific `Agent.Event` and projected it with `AgUi.fold`. Each maps onto AG-UI:
+
+| Before                                                                | Now                                                                                                            |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `Agent.run(agent, { runId, threadId, props, prompt, frontendTools })` | `Agent.run(agent, { input, prompt })`: ids, `forwardedProps` and `tools` come from `input`                     |
+| `Agent.CurrentRun`, `Agent.RunInfo`                                   | `AgUiServer.RunInput`, the whole AG-UI input (`forwardedProps` was `props`)                                    |
+| `StepStarted` / `StepFinished`                                        | `STEP_STARTED` / `STEP_FINISHED` (`step-<n>`); step 0 has none                                                 |
+| `StepFinished.entries`                                                | not emitted: committed by the runner's history; read them back with `History.restore`                          |
+| `ModelPart`                                                           | `TEXT_MESSAGE_*`, `REASONING_*`, `TOOL_CALL_START` / `ARGS` / `END`                                            |
+| `ToolResult` (`encodedResult`, `isFailure`)                           | `TOOL_CALL_RESULT` (`content` is the result as JSON; a failure has `metadata["effect/ai"].isFailure`)          |
+| `ToolProgress`                                                        | `ACTIVITY_SNAPSHOT`                                                                                            |
+| `ApprovalRequested`                                                   | the interrupts of `RUN_FINISHED` outcome `interrupt`                                                           |
+| `Finished` (`Success`, `Interrupted`, `Cancelled`)                    | `RUN_FINISHED` outcome `success` (with `pendingToolCallIds`), `interrupt` or `cancelled`                       |
+| `Failed` (`error`, `code`)                                            | `RUN_ERROR` (`message`, `code`); the error itself is logged and ends the run's span                            |
+| `Subagent` (wrapped events)                                           | the child's events tagged with its `subagentRunId`, between `SUBAGENT_STARTED` and its end                     |
+| `replayed: true`                                                      | not emitted, except a replayed result or subagent end, marked in `metadata`                                    |
+| `AgUi.fold`, `AgUi.conflateProgress`                                  | gone: `Agent.run` emits AG-UI itself                                                                           |
+| `AgUi`'s event builders, `closeOpen`, `conflateActivity`              | no longer exported: write expected events as `AgUiSchema.Event` object literals                                |
+| `AgUi.Event`, `AgUi.isTerminal`, `AgUi.ApprovalResponse`              | `AgUiSchema.Event` (from `effect/ai`), `Agent.isTerminal`, `Agent.ApprovalResponse`; the `AgUi` module is gone |
 
 ## Writing your own stores
 
@@ -950,14 +986,13 @@ const CheckpointLive = Checkpoint.layerKeyValueStore.pipe(
 
 Everything is exported from `"effect-agent-harness"` as namespaces. The AG-UI protocol comes from `effect/ai`: `AgUiSchema` (events, messages, and the `RunAgentInput` every runner takes) and `AgUiServer` (the HTTP endpoint).
 
-| Module       | Main exports                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `VolatileSystem`, `ModelPromptTransformer`, `ModelPromptLayout`, `RunInfo`, `RunInput`, `FrontendTool`, `PendingToolCall`, `CurrentRun`, `Event`, `Outcome`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `StepLimitExceeded`, `ModelStreamError` |
-| `AgUi`       | `ApprovalResponse`, `approvalInterrupt`, `Event`, `isTerminal`, `fold`, `closeOpen`, event constructors                                                                                                                                                                                                                                                                           |
-| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                                                                  |
-| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                                                                                         |
-| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                                                |
-| `Checkpoint` | `Checkpoint`, `layerNone`, `layerKeyValueStore`, `keyPrefix`, `layerWorkflow`                                                                                                                                                                                                                                                                                                     |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                                             |
-| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                                                                                  |
-| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                                                                                 |
+| Module       | Main exports                                                                                                                                                                                                                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Agent`      | `define`, `run`, `Agent`, `Any`, `Subagents`, `SubagentReply`, `ContextMode`, `VolatileSystem`, `ModelPromptTransformer`, `ModelPromptLayout`, `RunOptions`, `Requirements`, `isFrontendCall`, `isSuspendedSubagentCall`, `approvalIdFor`, `subagentIdFor`, `ApprovalResponse`, `isTerminal`, `FrontendToolConflict`, `StepLimitExceeded`, `ModelStreamError` |
+| `Runner`     | `makeAttached`, `makeDetached`, `makeWorkflow`, `toAgUiServerAgent`, `RunContext`, `Options`, `DetachedOptions`, `Requirements`, `DependencyServices`, `WorkflowOptions`, `WorkflowPayloadFields`, `RunInputMismatch`                                                                                                                                         |
+| `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                                                                     |
+| `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                            |
+| `Checkpoint` | `Checkpoint`, `layerNone`, `layerKeyValueStore`, `keyPrefix`, `layerWorkflow`                                                                                                                                                                                                                                                                                 |
+| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                         |
+| `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                                                              |
+| `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                                                             |

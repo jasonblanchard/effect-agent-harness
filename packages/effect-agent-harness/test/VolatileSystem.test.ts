@@ -2,13 +2,15 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Layer, Stream } from "effect";
 import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
-import { Prompt } from "effect/ai";
+import { AgUiServer, Prompt } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as Thread from "../src/Thread.ts";
 import {
+  agentRun,
   ApprovalToolkit,
+  collect,
   counterIds,
   countingApprovalLayer,
   countingWeatherLayer,
@@ -21,6 +23,7 @@ import {
   type Step,
   text,
   toolCall,
+  types,
   WeatherToolkit,
 } from "./fixtures.ts";
 
@@ -41,11 +44,10 @@ const weatherTurn: ReadonlyArray<Step> = [
 const runOn = (agent: Agent.Agent<typeof WeatherToolkit.tools>, steps: ReadonlyArray<Step>, prompt = userPrompt) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt }).pipe(
-      Stream.runCollect,
+    const { events, steps: committed } = yield* collect(agentRun(agent, { prompt })).pipe(
       Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
     );
-    return { events: Array.from(events), prompts: model.prompts };
+    return { events, committed, prompts: model.prompts };
   });
 
 /** Each message as its role, or as its text for a system message. */
@@ -108,7 +110,7 @@ describe("Agent volatile system prompt", () => {
       system: "Be helpful.",
       volatileSystem: ({ prompt }) =>
         Effect.gen(function* () {
-          const run = yield* Agent.CurrentRun;
+          const run = yield* AgUiServer.RunInput;
           return `${yield* (yield* Retriever).search(lastUserText(prompt))} (${run.runId})`;
         }),
     });
@@ -189,10 +191,10 @@ describe("Agent volatile system prompt", () => {
             return `It is ${yield* (yield* WallClock).now}.`;
           }),
       });
-      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUiSchema.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Agent.run(agent, { runId: "r1", threadId: "t1", prompt: userPrompt });
+          const events = agentRun(agent, { prompt: userPrompt });
           yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, clock]),
@@ -203,7 +205,7 @@ describe("Agent volatile system prompt", () => {
       // Attempt 1 stops (as if the process crashed) while step 1 is streaming.
       const first = yield* attempt(
         [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))],
-        (event) => event._tag === "ModelPart" && event.step === 1,
+        (event) => event.type === "TEXT_MESSAGE_CONTENT",
       );
       now = "10:00";
       const second = yield* attempt(weatherTurn);
@@ -217,11 +219,9 @@ describe("Agent volatile system prompt", () => {
     Effect.gen(function* () {
       const model = scriptedModel(oneReply);
       const handlers = countingApprovalLayer();
-      const events = yield* Agent.run(
+      const events = yield* agentRun(
         Agent.define({ toolkit: ApprovalToolkit, volatileSystem: () => Effect.die("retriever down") }),
         {
-          runId: "r1",
-          threadId: "t1",
           prompt: Prompt.make([
             { role: "user", content: "Email Ada" },
             {
@@ -235,7 +235,7 @@ describe("Agent volatile system prompt", () => {
           ]),
         },
       ).pipe(Stream.runCollect, Effect.provide([model.layer, handlers.layer, evalLayers]));
-      expect(Array.from(events).map((event) => event._tag)).toEqual(["Failed"]);
+      expect(types(Array.from(events))).toEqual(["RUN_STARTED", "RUN_ERROR"]);
       expect(model.prompts).toEqual([]);
       expect(handlers.emails).toEqual([]);
     }),
@@ -244,8 +244,9 @@ describe("Agent volatile system prompt", () => {
   it.effect("puts the volatile text in no entry or event", () =>
     Effect.gen(function* () {
       const agent = Agent.define({ toolkit: WeatherToolkit, volatileSystem: "Today is Monday." });
-      const { events } = yield* runOn(agent, weatherTurn);
-      expect(JSON.stringify(events)).not.toContain("Today is Monday.");
+      const { events, committed } = yield* runOn(agent, weatherTurn);
+      expect(committed).toHaveLength(2);
+      expect(JSON.stringify([events, committed])).not.toContain("Today is Monday.");
     }),
   );
 
@@ -300,7 +301,7 @@ describe("Agent volatile system prompt", () => {
         subagents: { agents: [researcher] },
       });
       const model = scriptedModel(delegation);
-      yield* Agent.run(parent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      yield* agentRun(parent, { prompt: userPrompt }).pipe(
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, recording, counterIds()]),
       );
@@ -400,11 +401,11 @@ describe("Agent.ModelPromptTransformer", () => {
         return prompt;
       });
       const agent = Agent.define({ toolkit: WeatherToolkit });
-      const attempt = (script: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
+      const attempt = (script: ReadonlyArray<Step>, stopAfter?: (event: AgUiSchema.Event) => boolean) =>
         Effect.gen(function* () {
           steps.length = 0;
           const model = scriptedModel(script);
-          const events = Agent.run(agent, { runId: "r1", threadId: "t1", prompt: userPrompt });
+          const events = agentRun(agent, { prompt: userPrompt });
           yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runDrain,
             Effect.provide([model.layer, countingWeatherLayer().layer, counting]),
@@ -415,7 +416,7 @@ describe("Agent.ModelPromptTransformer", () => {
       // Attempt 1 completes step 1 and stops (as if the process crashed) while step 2 is streaming.
       const first = yield* attempt(
         [weatherTurn[0]!, Stream.fromIterable(text("0", "18").slice(0, 2)).pipe(Stream.concat(Stream.never))],
-        (event) => event._tag === "ModelPart" && event.step === 2,
+        (event) => event.type === "TEXT_MESSAGE_CONTENT",
       );
       const second = yield* attempt([weatherTurn[1]!]);
 
@@ -441,7 +442,7 @@ describe("Agent.ModelPromptTransformer", () => {
       });
       const parent = Agent.define({ toolkit: WeatherToolkit, subagents: { agents: [researcher] } });
       const model = scriptedModel(delegation);
-      yield* Agent.run(parent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      yield* agentRun(parent, { prompt: userPrompt }).pipe(
         Stream.runDrain,
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, marking]),
       );
@@ -460,8 +461,8 @@ describe("Agent.ModelPromptTransformer", () => {
           }),
         ),
       );
-      expect(events.filter((event) => event._tag === "Failed")).toHaveLength(1);
-      expect(events.at(-1)?._tag).toBe("Failed");
+      expect(events.filter((event) => event.type === "RUN_ERROR")).toHaveLength(1);
+      expect(events.at(-1)?.type).toBe("RUN_ERROR");
     }),
   );
 });

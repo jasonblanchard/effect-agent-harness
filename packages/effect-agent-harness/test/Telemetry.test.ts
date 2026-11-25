@@ -1,11 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Context, Effect, Exit, Layer, Scope, Stream } from "effect";
+import { Cause, Context, Effect, Exit, Layer, Logger, Schema, Scope, Stream } from "effect";
 import { KeyValueStore } from "effect/persistence";
 import { Prompt, Response } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
 import type { Tracer } from "effect";
 import * as Agent from "../src/Agent.ts";
-import type * as AgUi from "../src/AgUi.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as internal from "../src/internal/telemetry.ts";
@@ -28,6 +27,7 @@ import {
   verify,
   WeatherToolkit,
   WeatherToolkitLayer,
+  agentRun,
 } from "./fixtures.ts";
 
 const assistant = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful.", name: "assistant" });
@@ -61,6 +61,26 @@ const CONTENT_KEYS = [
 
 const attr = (span: Tracer.Span, key: string) => span.attributes.get(key);
 const parsed = (span: Tracer.Span, key: string) => JSON.parse(attr(span, key) as string);
+
+/** Collects the messages logged at error level into `errors`. */
+const errorLogs = (errors: Array<unknown>) =>
+  Logger.layer([
+    Logger.make(({ logLevel, message }) => {
+      if (logLevel === "Error") {
+        errors.push(message);
+      }
+    }),
+  ]);
+
+class LayerFailed extends Schema.TaggedError<LayerFailed, { readonly brand: unique symbol }>()("LayerFailed", {
+  reason: Schema.String,
+}) {}
+
+/** The exception events an exporter adds for the exit `span` ended with, as `OtlpTracer` derives them. */
+const exportedExceptions = (span: Tracer.Span) =>
+  span.status._tag === "Ended" && Exit.isFailure(span.status.exit)
+    ? Cause.prettyErrors(span.status.exit.cause).map(({ name, message }) => ({ name, message }))
+    : [];
 
 /** Runs `inputs` through `Runner.makeAttached` against `steps`, recording every span. */
 const traced = (
@@ -262,6 +282,49 @@ describe("run root span", () => {
       const root = tracer.one("invoke_agent assistant");
       expect(attr(root, "error.type")).toBe("ModelStreamError");
       expect(root.status._tag === "Ended" && Exit.isFailure(root.status.exit)).toBe(true);
+    }),
+  );
+
+  it.effect("ends with the run's original error, which an exporter records as its one exception event", () =>
+    Effect.gen(function* () {
+      const errors: Array<unknown> = [];
+      const { tracer } = yield* traced(
+        [[...text("0", "It").slice(0, 2), { type: "error", error: { message: "overloaded" } }]],
+        [run1],
+      ).pipe(Effect.provide(errorLogs(errors)));
+      expect(errors).toHaveLength(1);
+      const root = tracer.one("invoke_agent assistant");
+      // The span records no exception itself: an exporter (`OtlpTracer`) adds one per error in the exit's cause.
+      expect(root.events.filter(([name]) => name === "exception")).toEqual([]);
+      expect(exportedExceptions(root)).toEqual([{ name: "ModelStreamError", message: "overloaded" }]);
+    }),
+  );
+
+  it.effect("ends with the runner's own failure when the run fails before the agent starts", () =>
+    Effect.gen(function* () {
+      // The per-run layer fails, so the run fails in the runner, before the agent runs.
+      const tracer = recordingTracer();
+      const runs = yield* runAgUi(assistant, [run1], {
+        // `runAgUi` takes untyped runner options; the layer's error is what the run reports.
+        layer: Layer.effect(
+          Telemetry.SpanAttributes,
+          Effect.fail(new LayerFailed({ reason: "no tenant" })),
+        ) as unknown as Layer.Layer<never>,
+      }).pipe(Effect.provide([scriptedModel([]).layer, WeatherToolkitLayer, tracer.layer, evalLayers]));
+      expect(runs[0]!.at(-1)).toMatchObject({ type: "RUN_ERROR", code: "LayerFailed" });
+      const root = tracer.one("invoke_agent assistant");
+      expect(attr(root, "error.type")).toBe("LayerFailed");
+      expect(root.events.filter(([name]) => name === "exception")).toEqual([]);
+      expect(exportedExceptions(root)).toHaveLength(1);
+    }),
+  );
+
+  it.effect("records no exception event for a run that finishes", () =>
+    Effect.gen(function* () {
+      const { tracer } = yield* traced([[...text("0", "Hi"), finish("stop")]], [run1]);
+      const root = tracer.one("invoke_agent assistant");
+      expect(root.events.filter(([name]) => name === "exception")).toEqual([]);
+      expect(root.status._tag === "Ended" && Exit.isSuccess(root.status.exit)).toBe(true);
     }),
   );
 
@@ -505,7 +568,7 @@ describe("content capture", () => {
 describe("replay", () => {
   it.effect("traces only the work the resumed attempt performs", () =>
     Effect.gen(function* () {
-      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUi.Event) => boolean) =>
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUiSchema.Event) => boolean) =>
         Effect.gen(function* () {
           const tracer = recordingTracer();
           const events = Runner.makeAttached(assistant)(run1);
@@ -736,14 +799,18 @@ describe("subagent spans", () => {
         name: "assistant",
         subagents: { agents: [hasty] },
       }) as unknown as typeof assistant;
+      const errors: Array<unknown> = [];
       const { tracer } = yield* traced(
         [delegation[0]!, delegation[1]!, [...text("0", "Sorry."), finish("stop")]],
         [run1],
         { agent: withHasty },
-      );
+      ).pipe(Effect.provide(errorLogs(errors)));
+      // The parent reports the failure as a failed tool result, and succeeds: nothing is logged as an error.
+      expect(errors).toEqual([]);
       const span = tracer.one("invoke_agent researcher");
       expect(attr(span, "error.type")).toBe("StepLimitExceeded");
-      expect(span.status._tag === "Ended" && Exit.isFailure(span.status.exit)).toBe(true);
+      expect(span.events.filter(([name]) => name === "exception")).toEqual([]);
+      expect(exportedExceptions(span).map((error) => error.name)).toEqual(["StepLimitExceeded"]);
       const root = tracer.one("invoke_agent assistant");
       expect(root.status._tag === "Ended" && Exit.isSuccess(root.status.exit)).toBe(true);
     }),
@@ -754,7 +821,7 @@ describe("subagent spans", () => {
       const attempt = (steps: ReadonlyArray<Step>) =>
         Effect.gen(function* () {
           const tracer = recordingTracer();
-          yield* Agent.run(lead, { runId: "r1", threadId: "t1", prompt: Prompt.make("Weather?") }).pipe(
+          yield* agentRun(lead, { prompt: Prompt.make("Weather?") }).pipe(
             Stream.runDrain,
             Effect.provide([scriptedModel(steps).layer, WeatherToolkitLayer, tracer.layer]),
           );

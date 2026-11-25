@@ -1,10 +1,13 @@
+import { expect } from "@effect/vitest";
 import { verifyEvents } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { Effect, Layer, Option, Schema, Stream, Tracer } from "effect";
 import { AgUiSchema, AiError, IdGenerator, LanguageModel, Response, Tool, Toolkit } from "effect/ai";
 import type { Prompt } from "effect/ai";
-import type * as Agent from "../src/Agent.ts";
-import type * as AgUi from "../src/AgUi.ts";
+import * as Agent from "../src/Agent.ts";
+import { isReplayed } from "../src/internal/events.ts";
+import { OnStepFinished } from "../src/internal/hooks.ts";
+import type * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
 import { from, lastValueFrom, toArray } from "rxjs";
 import * as Checkpoint from "../src/Checkpoint.ts";
@@ -109,7 +112,7 @@ export const reasoning = (
 
 /**
  * A reasoning block delivered whole. Not a stream part, so `LanguageModel`
- * rejects it from a scripted step: pass it to `AgUi.fold` as a `ModelPart`.
+ * rejects it from a scripted step: pass it straight to a `StepEmitter`.
  */
 export const wholeReasoning = (reasoningText: string): Response.ReasoningPart =>
   Response.makePart("reasoning", { text: reasoningText });
@@ -126,10 +129,22 @@ export const toolCall = (
   { type: "tool-call", id, name, params },
 ];
 
-export const finish = (reason: Response.FinishReason): Response.StreamPartEncoded => ({
+export const finish = (
+  reason: Response.FinishReason,
+  usage?: { readonly input?: number; readonly output?: number; readonly reasoning?: number; readonly cached?: number },
+): Response.StreamPartEncoded => ({
   type: "finish",
   reason,
-  usage: { inputTokens: {}, outputTokens: {} },
+  usage: {
+    inputTokens: {
+      ...(usage?.input === undefined ? {} : { total: usage.input }),
+      ...(usage?.cached === undefined ? {} : { cacheRead: usage.cached }),
+    },
+    outputTokens: {
+      ...(usage?.output === undefined ? {} : { total: usage.output }),
+      ...(usage?.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
+    },
+  },
 });
 
 // -----------------------------------------------------------------------------
@@ -300,6 +315,73 @@ export const runInput = (
 ): AgUiSchema.RunAgentInput => ({ tools: [], context: [], ...input });
 
 // -----------------------------------------------------------------------------
+// Running an agent directly
+// -----------------------------------------------------------------------------
+
+/** The AG-UI input of a run on thread `t1`, run `r1`, with no messages, unless `input` says otherwise. */
+export const agentInput = (input?: Partial<AgUiSchema.RunAgentInput>): AgUiSchema.RunAgentInput =>
+  runInput({ threadId: "t1", runId: "r1", messages: [], ...input });
+
+/** `Agent.run` on `prompt`, with {@link agentInput}'s input unless the options give one. */
+export const agentRun = <Tools extends Record<string, Tool.Any>, R>(
+  agent: Agent.Agent<Tools, R>,
+  options: Omit<Agent.RunOptions, "input"> & { readonly input?: Partial<AgUiSchema.RunAgentInput> | undefined },
+) => Agent.run(agent, { ...options, input: agentInput(options.input) });
+
+/** A run's AG-UI events, and the entries each step handed to whatever runs it, in order. */
+export interface Collected {
+  readonly events: Array<AgUiSchema.Event>;
+  readonly steps: Array<ReadonlyArray<Messages.Entry>>;
+}
+
+/** Collects a run's events, recording the entries each step hands to its runner as a runner's commit would. */
+export const collect = <E, R>(events: Stream.Stream<AgUiSchema.Event, E, R>): Effect.Effect<Collected, E, R> =>
+  Effect.gen(function* () {
+    const steps: Array<ReadonlyArray<Messages.Entry>> = [];
+    const collected = yield* events.pipe(
+      Stream.provideService(OnStepFinished, (entries) => Effect.sync(() => steps.push(entries))),
+      Stream.runCollect,
+    );
+    return { events: Array.from(collected), steps };
+  });
+
+/** The events' types, in order. */
+export const types = (events: ReadonlyArray<AgUiSchema.Event>) => events.map((event) => event.type);
+
+/** The events of one type. */
+export const ofType = <T extends AgUiSchema.Event["type"]>(events: ReadonlyArray<AgUiSchema.Event>, type: T) =>
+  events.filter((event): event is Extract<AgUiSchema.Event, { type: T }> => event.type === type);
+
+/** Each `TOOL_CALL_RESULT`, read back: its decoded value, whether it failed, and whether it is marked replayed. */
+export const resultsOf = (events: ReadonlyArray<AgUiSchema.Event>) =>
+  ofType(events, "TOOL_CALL_RESULT").map((event) => ({
+    toolCallId: event.toolCallId,
+    messageId: event.messageId,
+    value: typeof event.content === "string" ? (JSON.parse(event.content) as unknown) : event.content,
+    isFailure: (event.metadata?.["effect/ai"] as { isFailure?: boolean } | undefined)?.isFailure === true,
+    replayed: isReplayed(event),
+    ...(event.subagentRunId === undefined ? {} : { subagentRunId: event.subagentRunId }),
+  }));
+
+/** The run's terminal event. */
+export const terminalOf = (events: ReadonlyArray<AgUiSchema.Event>) => {
+  const last = events.at(-1);
+  if (last?.type !== "RUN_FINISHED" && last?.type !== "RUN_ERROR") {
+    throw new Error(`the run did not end with a terminal event, but with ${last?.type}`);
+  }
+  return last;
+};
+
+/** The run's `RUN_FINISHED` outcome; throws if it ended otherwise. */
+export const outcomeOf = (events: ReadonlyArray<AgUiSchema.Event>) => {
+  const last = terminalOf(events);
+  if (last.type !== "RUN_FINISHED") {
+    throw new Error(`the run failed: ${last.message}`);
+  }
+  return last.outcome;
+};
+
+// -----------------------------------------------------------------------------
 // Evals
 // -----------------------------------------------------------------------------
 
@@ -328,10 +410,14 @@ const decodeEvent = Schema.decodeUnknownSync(AgUiSchema.Event);
  * The client types `type` as its `EventType` enum, whose values are the wire
  * strings our events carry, hence the cast.
  */
-export const verify = async (events: ReadonlyArray<AgUi.Event>): Promise<Array<BaseEvent>> => {
+export const verify = async (events: ReadonlyArray<AgUiSchema.Event>): Promise<Array<BaseEvent>> => {
   for (const event of events) {
     decodeEvent(event, { onExcessProperty: "error" });
   }
+  // What goes out never carries the library's marker, and a result never goes out twice.
+  expect(JSON.stringify(events)).not.toContain('"effect-agent-harness":');
+  const results = events.flatMap((event) => (event.type === "TOOL_CALL_RESULT" ? [event.toolCallId] : []));
+  expect(new Set(results).size).toBe(results.length);
   return lastValueFrom(from(events as ReadonlyArray<BaseEvent>).pipe(verifyEvents(), toArray()));
 };
 

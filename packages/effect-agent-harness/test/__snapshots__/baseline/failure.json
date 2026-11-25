@@ -1,0 +1,76 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-1",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-1",
+      "delta": "par"
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-1"
+    },
+    {
+      "type": "RUN_ERROR",
+      "message": "overloaded",
+      "code": "ModelStreamError"
+    }
+  ],
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "get-weather",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{\"location\":\"Paris\"}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-2",
+      "toolCallId": "c1",
+      "content": "{\"temperature\":18}",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "RUN_ERROR",
+      "message": "Step limit exceeded: the model was still calling tools after 1 steps",
+      "code": "StepLimitExceeded"
+    }
+  ]
+]

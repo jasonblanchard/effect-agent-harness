@@ -6,7 +6,7 @@ import { Prompt } from "effect/ai";
 import type { AgUiSchema, Response } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
-import * as AgUi from "../src/AgUi.ts";
+import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as History from "../src/History.ts";
@@ -14,17 +14,24 @@ import type * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
 import {
+  agentRun,
+  collect,
   counterIds,
   evalLayers,
   finish,
+  ofType,
+  outcomeOf,
   PickFile,
   reasoning,
   recordingTracer,
+  resultsOf,
   scriptedModel,
   serverStores,
   type Step,
+  terminalOf,
   text,
   toolCall,
+  types,
   verify,
   WeatherToolkit,
 } from "./fixtures.ts";
@@ -88,22 +95,25 @@ const blockingWeather = (gates: {
 
 /**
  * Runs `agent` with a cancel signal that fires on the first event `when` accepts, or once `trigger`
- * completes. Returns the events, the prompts the model received, and the handlers' records.
+ * completes. Returns the events, the entries each step committed, the prompts the model received, and the
+ * handlers' records. Every sequence is verified.
  */
 const runCancelled = (
   agent: Agent.Any,
   steps: ReadonlyArray<Step>,
   options: {
-    readonly when?: (event: Agent.Event) => boolean;
+    readonly when?: (event: AgUiSchema.Event) => boolean;
     /** Runs alongside the run, given the handlers' gates and a way to fire the signal. */
     readonly trigger?: (
       gates: { readonly started: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> },
       fire: Effect.Effect<void>,
     ) => Effect.Effect<void>;
-    readonly input?: Partial<Agent.RunInput>;
+    readonly input?: Partial<AgUiSchema.RunAgentInput>;
+    /** The run's signal, instead of one `when` and `trigger` fire. */
+    readonly cancelled?: Effect.Effect<void>;
     readonly checkpoint?: Layer.Layer<Checkpoint.Checkpoint>;
     /** Runs on every event, before the signal check. */
-    readonly tap?: (event: Agent.Event) => Effect.Effect<void>;
+    readonly tap?: (event: AgUiSchema.Event) => Effect.Effect<void>;
   },
 ) =>
   Effect.gen(function* () {
@@ -116,32 +126,32 @@ const runCancelled = (
     if (options.trigger !== undefined) {
       yield* Effect.forkChild(options.trigger(gates, Effect.asVoid(Deferred.succeed(cancel, undefined))));
     }
-    const events = yield* Agent.run(agent as typeof parent, {
-      runId: "r1",
-      threadId: "t1",
-      prompt: userPrompt,
-      cancelled: Deferred.await(cancel),
-      ...options.input,
-    }).pipe(
-      Stream.tap((event) =>
-        Effect.gen(function* () {
-          if (event._tag === "Finished") {
-            sentAtEnd = weather.sent.length;
-          }
-          yield* options.tap?.(event) ?? Effect.void;
-          if (options.when?.(event) === true) {
-            yield* Deferred.succeed(cancel, undefined);
-          }
-        }),
+    const collected = yield* collect(
+      agentRun(agent as typeof parent, {
+        prompt: userPrompt,
+        input: options.input,
+        cancelled: options.cancelled ?? Deferred.await(cancel),
+      }).pipe(
+        Stream.tap((event) =>
+          Effect.gen(function* () {
+            if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
+              sentAtEnd = weather.sent.length;
+            }
+            yield* options.tap?.(event) ?? Effect.void;
+            if (options.when?.(event) === true) {
+              yield* Deferred.succeed(cancel, undefined);
+            }
+          }),
+        ),
       ),
-      Stream.runCollect,
+    ).pipe(
       Effect.provide([
         model.layer,
         weather.layer,
         options.checkpoint === undefined ? evalLayers : Layer.mergeAll(options.checkpoint, counterIds()),
       ]),
     );
-    return { events: Array.from(events), prompts: model.prompts, sentAtEnd, ...weather };
+    return { ...collected, prompts: model.prompts, sentAtEnd, ...weather };
   });
 
 /** Runs every step (no replay), completing `done` once the step `name` has completed. */
@@ -154,15 +164,11 @@ const signalling = (name: string, done: Deferred.Deferred<void>): Layer.Layer<Ch
       ),
   });
 
-const tags = (events: ReadonlyArray<Agent.Event>) => events.map((event) => event._tag);
+/** The first `TEXT_MESSAGE_CONTENT` with this text, of the agent or of the subagent `subagentRunId`. */
+const isContent = (delta: string, subagentRunId?: string) => (event: AgUiSchema.Event) =>
+  event.type === "TEXT_MESSAGE_CONTENT" && event.delta === delta && event.subagentRunId === subagentRunId;
 
-const byTag = <T extends Agent.Event["_tag"]>(events: ReadonlyArray<Agent.Event>, tag: T) =>
-  events.filter((event): event is Extract<Agent.Event, { _tag: T }> => event._tag === tag);
-
-const isPart = (type: string, delta?: string) => (event: Agent.Event) =>
-  event._tag === "ModelPart" &&
-  event.part.type === type &&
-  (delta === undefined || ("delta" in event.part && event.part.delta === delta));
+const cancelledOutcome = { type: "cancelled" } as const;
 
 /** A step's entries as roles and their parts, for comparison. */
 const shape = (entries: ReadonlyArray<Messages.Entry>) =>
@@ -193,15 +199,23 @@ const cancelledResult = JSON.stringify(Agent.CANCELLED_TOOL_CALL_RESULT);
 describe("Agent.run cancellation", () => {
   it.effect("stops the model stream and keeps the partial text under the step's message id", () =>
     Effect.gen(function* () {
-      const { events } = yield* runCancelled(weatherAgent, [stalled(partialText("0", "Hel"))], {
-        when: isPart("text-delta", "Hel"),
+      const { events, steps } = yield* runCancelled(weatherAgent, [stalled(partialText("0", "Hel"))], {
+        when: isContent("Hel"),
       });
-      expect(tags(events)).toEqual(["StepStarted", "ModelPart", "ModelPart", "StepFinished", "Finished"]);
-      expect(byTag(events, "Finished")[0]?.outcome).toEqual({ _tag: "Cancelled" });
-      const [started] = byTag(events, "StepStarted");
-      const [finished] = byTag(events, "StepFinished");
-      expect(finished?.step).toBe(1);
-      expect(shape(finished?.entries ?? [])).toEqual([{ id: started?.messageId, role: "assistant", parts: ["Hel"] }]);
+      yield* Effect.promise(() => verify(events));
+      expect(types(events)).toEqual([
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
+      ]);
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
+      expect(terminalOf(events)).not.toHaveProperty("result");
+      const [started] = ofType(events, "TEXT_MESSAGE_START");
+      expect(shape(steps[0] ?? [])).toEqual([{ id: started?.messageId, role: "assistant", parts: ["Hel"] }]);
     }),
   );
 
@@ -212,13 +226,14 @@ describe("Agent.run cancellation", () => {
         [[...toolCall("c1", "get-weather", { location: "Slow" }), finish("tool-calls")]],
         { trigger: ({ started }, fire) => Effect.andThen(Deferred.await(started), fire) },
       );
+      yield* Effect.promise(() => verify(events));
       expect(interrupted).toEqual(["Slow"]);
       expect(prompts).toHaveLength(1);
-      expect(byTag(events, "Finished")[0]?.outcome).toEqual({ _tag: "Cancelled" });
-      expect(byTag(events, "ToolResult").map((e) => [e.toolCallId, e.isFailure, e.encodedResult])).toEqual([
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
+      expect(resultsOf(events).map((e) => [e.toolCallId, e.isFailure, e.value])).toEqual([
         ["c1", true, Agent.CANCELLED_TOOL_CALL_RESULT],
       ]);
-      expect(tags(events).slice(-3)).toEqual(["ToolResult", "StepFinished", "Finished"]);
+      expect(types(events).slice(-3)).toEqual(["TOOL_CALL_RESULT", "STEP_FINISHED", "RUN_FINISHED"]);
     }),
   );
 
@@ -273,7 +288,7 @@ describe("Agent.run cancellation", () => {
     Effect.gen(function* () {
       // Fires once the first call's checkpoint has completed and the second handler is running.
       const firstDone = yield* Deferred.make<void>();
-      const { events } = yield* runCancelled(
+      const { steps } = yield* runCancelled(
         weatherAgent,
         [
           [
@@ -293,8 +308,7 @@ describe("Agent.run cancellation", () => {
             ),
         },
       );
-      const [step] = byTag(events, "StepFinished");
-      expect(shape(step?.entries ?? [])).toEqual([
+      expect(shape(steps[0] ?? [])).toEqual([
         { id: "id-1", role: "assistant", parts: ["call:c1", "call:c2"] },
         { id: "id-2", role: "tool", parts: ['result:c1:ok:{"temperature":18}'] },
         { id: "cancelled:c2", role: "tool", parts: [`result:c2:failed:${cancelledResult}`] },
@@ -304,7 +318,7 @@ describe("Agent.run cancellation", () => {
 
   it.effect("drops a call whose arguments were still streaming", () =>
     Effect.gen(function* () {
-      const { events } = yield* runCancelled(
+      const { events, steps } = yield* runCancelled(
         weatherAgent,
         [
           stalled([
@@ -313,11 +327,11 @@ describe("Agent.run cancellation", () => {
             { type: "tool-params-delta", id: "c1", delta: '{"loc' },
           ]),
         ],
-        { when: isPart("tool-params-delta") },
+        { when: (event) => event.type === "TOOL_CALL_ARGS" },
       );
-      const [step] = byTag(events, "StepFinished");
-      expect(shape(step?.entries ?? [])).toEqual([{ id: "id-1", role: "assistant", parts: ["Checking."] }]);
-      expect(byTag(events, "ToolResult")).toEqual([]);
+      yield* Effect.promise(() => verify(events));
+      expect(shape(steps[0] ?? [])).toEqual([{ id: "id-1", role: "assistant", parts: ["Checking."] }]);
+      expect(resultsOf(events)).toEqual([]);
     }),
   );
 
@@ -340,35 +354,40 @@ describe("Agent.run cancellation", () => {
       expect(sent).toEqual(["Send"]);
       expect(sentAtEnd).toBe(1);
       // The toolkit's steps after the handler were interrupted, so the call has no real result.
-      expect(byTag(events, "ToolResult").map((e) => e.encodedResult)).toEqual([Agent.CANCELLED_TOOL_CALL_RESULT]);
-      expect(byTag(events, "Finished")[0]?.outcome).toEqual({ _tag: "Cancelled" });
+      expect(resultsOf(events).map((e) => e.value)).toEqual([Agent.CANCELLED_TOOL_CALL_RESULT]);
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
     }),
   );
 
   it.effect("ends at once without calling the model when the signal has already fired", () =>
     Effect.gen(function* () {
       const { events, prompts } = yield* runCancelled(weatherAgent, [[...text("0", "Hi"), finish("stop")]], {
-        input: { cancelled: Effect.void },
+        cancelled: Effect.void,
       });
       expect(prompts).toEqual([]);
-      expect(events).toEqual([{ _tag: "Finished", outcome: { _tag: "Cancelled" } }]);
+      expect(events).toEqual([
+        Events.runStarted({ threadId: "t1", runId: "r1" }),
+        Events.runFinished({ threadId: "t1", runId: "r1" }, cancelledOutcome),
+      ]);
     }),
   );
 
   it.effect("reports no pending frontend call and answers it with the cancelled result", () =>
     Effect.gen(function* () {
-      const { events } = yield* runCancelled(weatherAgent, [stalled(toolCall("f1", "pick-file", { accept: "pdf" }))], {
-        when: isPart("tool-call"),
-        input: { frontendTools: [PickFile] },
-      });
-      expect(byTag(events, "Finished")[0]?.outcome).toEqual({ _tag: "Cancelled" });
-      const [step] = byTag(events, "StepFinished");
-      expect(shape(step?.entries ?? [])).toEqual([
+      // Delivered whole, so its TOOL_CALL_END goes out once the call is complete.
+      const { events, steps } = yield* runCancelled(
+        weatherAgent,
+        [stalled([{ type: "tool-call", id: "f1", name: "pick-file", params: { accept: "pdf" } }])],
+        { when: (event) => event.type === "TOOL_CALL_END", input: { tools: [PickFile] } },
+      );
+      yield* Effect.promise(() => verify(events));
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
+      expect(shape(steps[0] ?? [])).toEqual([
         { id: "id-1", role: "assistant", parts: ["call:f1"] },
         { id: "cancelled:f1", role: "tool", parts: [`result:f1:failed:${cancelledResult}`] },
       ]);
       // The call is not marked as the client's, so no later run waits for its answer.
-      const call = step?.entries[0]?.message.content[0];
+      const call = steps[0]?.[0]?.message.content[0];
       expect(
         call !== undefined && typeof call !== "string" && call.type === "tool-call" && Agent.isFrontendCall(call),
       ).toBe(false);
@@ -377,32 +396,32 @@ describe("Agent.run cancellation", () => {
 
   it.effect("cancels a running subagent with its parent", () =>
     Effect.gen(function* () {
-      const { events } = yield* runCancelled(
+      const child = Agent.subagentIdFor("c1");
+      const { events, steps } = yield* runCancelled(
         parent,
         [
           [...toolCall("c1", "researcher", { prompt: "Find the weather" }), finish("tool-calls")],
           stalled(partialText("0", "Look")),
         ],
-        { when: (event) => event._tag === "Subagent" && isPart("text-delta", "Look")(event.event) },
+        { when: isContent("Look", child) },
       );
-      const child = Agent.subagentIdFor("c1");
-      const childEvents = events.flatMap((event) => (event._tag === "Subagent" ? [event.event] : []));
-      expect(childEvents.at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Cancelled" } });
-      const top = events.filter((event) => event._tag !== "Subagent");
-      expect(tags(top)).toEqual([
-        "StepStarted",
-        "ModelPart",
-        "ModelPart",
-        "ModelPart",
-        "ModelPart",
-        "ModelPart",
-        "ToolResult",
-        "StepFinished",
-        "Finished",
+      yield* Effect.promise(() => verify(events));
+      expect(events.find((event) => event.type === "SUBAGENT_ERROR")).toMatchObject({ code: "Cancelled" });
+      const top = events.filter((event) => !("subagentRunId" in event && event.subagentRunId !== undefined));
+      expect(types(top)).toEqual([
+        "RUN_STARTED",
+        "STEP_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+        "STEP_FINISHED",
+        "RUN_FINISHED",
       ]);
-      expect(byTag(top, "Finished")[0]?.outcome).toEqual({ _tag: "Cancelled" });
-      const [step] = byTag(top, "StepFinished");
-      expect(shape(step?.entries ?? [])).toEqual([
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
+      // The child's partial step reaches only its parent's commit.
+      expect(steps).toHaveLength(1);
+      expect(shape(steps[0] ?? [])).toEqual([
         { id: "id-1", role: "assistant", parts: ["call:c1"] },
         { id: "id-2", role: "assistant", subagentRunId: child, parts: ["Look"] },
         { id: "cancelled:c1", role: "tool", parts: [`result:c1:failed:${cancelledResult}`] },
@@ -424,30 +443,29 @@ describe("Agent.run cancellation", () => {
       const first = yield* Effect.forkChild(
         runCancelled(weatherAgent, script, {
           checkpoint: shared,
-          tap: (event) => (isPart("text-delta", "It is")(event) ? Deferred.succeed(reached, undefined) : Effect.void),
+          tap: (event) => (isContent("It is")(event) ? Deferred.succeed(reached, undefined) : Effect.void),
         }),
       );
       yield* Deferred.await(reached);
       yield* Fiber.interrupt(first);
-      const { events, prompts, calls } = yield* runCancelled(weatherAgent, script, {
+      const { events, steps, prompts, calls } = yield* runCancelled(weatherAgent, script, {
         checkpoint: shared,
-        input: { cancelled: Effect.void },
+        cancelled: Effect.void,
       });
       expect(prompts).toEqual([]);
       expect(calls).toEqual([]);
-      expect(events.map((event) => [event._tag, "replayed" in event ? event.replayed : undefined])).toEqual([
-        ["StepStarted", true],
-        ["ToolResult", true],
-        ["StepFinished", true],
-        ["Finished", undefined],
-      ]);
+      // Only the replayed result goes out, marked for the runner to decide; step 1 is committed again.
+      expect(types(events)).toEqual(["RUN_STARTED", "TOOL_CALL_RESULT", "RUN_FINISHED"]);
+      expect(resultsOf(events)[0]).toMatchObject({ toolCallId: "c1", replayed: true });
+      expect(outcomeOf(events)).toEqual(cancelledOutcome);
+      expect(steps).toHaveLength(1);
     }).pipe(Effect.scoped),
   );
 
   it.effect("behaves as before without a signal", () =>
     Effect.gen(function* () {
       const model = scriptedModel([[...text("0", "Hi"), finish("stop")]]);
-      const events = yield* Agent.run(weatherAgent, { runId: "r1", threadId: "t1", prompt: userPrompt }).pipe(
+      const events = yield* agentRun(weatherAgent, { prompt: userPrompt }).pipe(
         Stream.runCollect,
         Effect.provide([
           model.layer,
@@ -455,36 +473,18 @@ describe("Agent.run cancellation", () => {
           evalLayers,
         ]),
       );
-      expect(byTag(Array.from(events), "Finished")[0]?.outcome).toEqual({ _tag: "Success", pendingToolCalls: [] });
+      expect(outcomeOf(Array.from(events))).toEqual({ type: "success" });
     }),
   );
-});
 
-// -----------------------------------------------------------------------------
-// AG-UI projection
-// -----------------------------------------------------------------------------
-
-/** The AG-UI events of `Agent.run` cancelled as `runCancelled` cancels it. */
-const foldCancelled = (...args: Parameters<typeof runCancelled>) =>
-  Effect.gen(function* () {
-    const { events } = yield* runCancelled(...args);
-    const folded = Array.from(
-      yield* Stream.runCollect(AgUi.fold({ threadId: "t1", runId: "r1" })(Stream.fromIterable(events))),
-    );
-    yield* Effect.promise(() => verify(folded));
-    return folded;
-  });
-
-const types = (events: ReadonlyArray<AgUi.Event>) => events.map((event) => event.type);
-
-describe("AgUi.fold cancellation", () => {
   it.effect("closes the open reasoning and text, ends the step, then finishes cancelled with no result", () =>
     Effect.gen(function* () {
-      const events = yield* foldCancelled(
+      const { events } = yield* runCancelled(
         weatherAgent,
         [stalled([...reasoning("r", ["Thinking"]).slice(0, 2), ...partialText("0", "Hel")])],
-        { when: isPart("text-delta", "Hel") },
+        { when: isContent("Hel") },
       );
+      yield* Effect.promise(() => verify(events));
       expect(types(events).slice(-5)).toEqual([
         "TEXT_MESSAGE_END",
         "REASONING_MESSAGE_END",
@@ -503,15 +503,16 @@ describe("AgUi.fold cancellation", () => {
 
   it.effect("closes a child cancelled with its parent with SUBAGENT_ERROR code Cancelled", () =>
     Effect.gen(function* () {
-      const events = yield* foldCancelled(
+      const child = Agent.subagentIdFor("c1");
+      const { events } = yield* runCancelled(
         parent,
         [
           [...toolCall("c1", "researcher", { prompt: "Find the weather" }), finish("tool-calls")],
           stalled(partialText("0", "Look")),
         ],
-        { when: (event) => event._tag === "Subagent" && isPart("text-delta", "Look")(event.event) },
+        { when: isContent("Look", child) },
       );
-      const child = Agent.subagentIdFor("c1");
+      yield* Effect.promise(() => verify(events));
       expect(events.slice(-6)).toEqual([
         { type: "TEXT_MESSAGE_END", messageId: "id-2", subagentRunId: child },
         { type: "STEP_FINISHED", stepName: "step-1", subagentRunId: child },
@@ -527,6 +528,7 @@ describe("AgUi.fold cancellation", () => {
           toolCallId: "c1",
           content: cancelledResult,
           role: "tool",
+          metadata: { "effect/ai": { isFailure: true } },
         },
         { type: "STEP_FINISHED", stepName: "step-1" },
         { type: "RUN_FINISHED", threadId: "t1", runId: "r1", outcome: { type: "cancelled" } },
@@ -557,7 +559,7 @@ const logOf = (threadId: string, runId: string) =>
   );
 
 /** Waits until the run's log holds an event `when` accepts. */
-const awaitLogged = (threadId: string, runId: string, when: (event: AgUi.Event) => boolean) =>
+const awaitLogged = (threadId: string, runId: string, when: (event: AgUiSchema.Event) => boolean) =>
   Effect.flatMap(EventLog.EventLog, (log) =>
     Stream.unwrap(log.subscribe(threadId, runId)).pipe(
       Stream.filter((stored) => when(stored.event)),
@@ -566,8 +568,8 @@ const awaitLogged = (threadId: string, runId: string, when: (event: AgUi.Event) 
     ),
   );
 
-const isContent = (event: AgUi.Event) => event.type === "TEXT_MESSAGE_CONTENT";
-const runEnded = (events: ReadonlyArray<AgUi.Event>) => events.at(-1);
+const isAnyContent = (event: AgUiSchema.Event) => event.type === "TEXT_MESSAGE_CONTENT";
+const runEnded = (events: ReadonlyArray<AgUiSchema.Event>) => events.at(-1);
 const cancelledEnd = { type: "RUN_FINISHED", outcome: { type: "cancelled" } };
 
 const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
@@ -578,7 +580,7 @@ describe("Runner.makeAttached cancellation", () => {
       const model = scriptedModel([stalled(partialText("0", "Hel")), [...text("0", "Hello!"), finish("stop")]]);
       const attached = (input: AgUiSchema.RunAgentInput) =>
         Runner.makeAttached(weatherAgent)(input).pipe(Stream.provide(model.layer));
-      const first = Array.from(yield* attached(run1).pipe(Stream.takeUntil(isContent), Stream.runCollect));
+      const first = Array.from(yield* attached(run1).pipe(Stream.takeUntil(isAnyContent), Stream.runCollect));
       const started = first.find((event) => event.type === "TEXT_MESSAGE_START");
       const messageId = started?.type === "TEXT_MESSAGE_START" ? started.messageId : "";
       const second = Array.from(
@@ -638,7 +640,7 @@ describe("Runner.makeAttached cancellation", () => {
       const model = scriptedModel([stalled(partialText("0", "Hel"))]);
       const consumer = yield* Effect.forkChild(
         Runner.makeAttached(weatherAgent, { cancelTimeout: "5 seconds" })(run1).pipe(
-          Stream.takeUntil(isContent),
+          Stream.takeUntil(isAnyContent),
           Stream.runDrain,
           Effect.provide([
             model.layer,
@@ -687,7 +689,7 @@ describe("Runner.makeAttached cancellation", () => {
       const tracer = recordingTracer();
       const model = scriptedModel([stalled(partialText("0", "Hel"))]);
       yield* Runner.makeAttached(weatherAgent)(run1).pipe(
-        Stream.takeUntil(isContent),
+        Stream.takeUntil(isAnyContent),
         Stream.runDrain,
         Effect.provide([
           model.layer,
@@ -699,6 +701,7 @@ describe("Runner.makeAttached cancellation", () => {
       const root = tracer.one("invoke_agent");
       expect(root.attributes.has("error.type")).toBe(false);
       expect(root.status._tag === "Ended" && Exit.isSuccess(root.status.exit)).toBe(true);
+      expect(root.events.filter(([name]) => name === "exception")).toEqual([]);
     }),
   );
 });
@@ -725,7 +728,7 @@ describe("Runner.makeDetached cancellation", () => {
       const scope = yield* Scope.make();
       const runner = yield* detachedRunner(scope, [stalled(partialText("0", "Hel"))]);
       yield* runner.start(run1);
-      yield* awaitLogged("t1", "r1", isContent);
+      yield* awaitLogged("t1", "r1", isAnyContent);
       const subscriber = yield* Effect.forkChild(logOf("t1", "r1"));
       yield* runner.cancel({ threadId: "t1", runId: "r1" });
       const events = yield* Fiber.join(subscriber);
@@ -760,11 +763,11 @@ describe("Runner.makeDetached cancellation", () => {
           userMessage("u2", "More"),
         ],
       });
-      yield* awaitLogged("t1", "r2", isContent);
+      yield* awaitLogged("t1", "r2", isAnyContent);
       yield* runner.cancel({ threadId: "t1", runId: "r2" });
       yield* runner.cancel({ threadId: "t1", runId: "r2" });
       const events = yield* logOf("t1", "r2");
-      expect(events.filter(AgUi.isTerminal)).toHaveLength(1);
+      expect(events.filter(Agent.isTerminal)).toHaveLength(1);
       expect(runEnded(events)).toMatchObject(cancelledEnd);
     }).pipe(Effect.provide(shared())),
   );
@@ -782,9 +785,9 @@ describe("Runner.makeDetached cancellation", () => {
         ),
       ]);
       yield* runner.start(run1);
-      yield* awaitLogged("t1", "r1", isContent);
+      yield* awaitLogged("t1", "r1", isAnyContent);
       yield* runner.start({ ...run1, threadId: "t2" });
-      yield* awaitLogged("t2", "r1", isContent);
+      yield* awaitLogged("t2", "r1", isAnyContent);
       yield* runner.cancel({ threadId: "t1", runId: "r1" });
       expect(runEnded(yield* logOf("t1", "r1"))).toMatchObject(cancelledEnd);
       yield* Deferred.succeed(gate, undefined);
@@ -853,11 +856,11 @@ describe("Runner.makeDetached cancellation", () => {
       const scope = yield* Scope.make();
       const runner = yield* detachedRunner(scope, [crashing, [...text("0", "Hi"), finish("stop")]]);
       yield* runner.start(run1);
-      yield* awaitLogged("t1", "r1", isContent);
+      yield* awaitLogged("t1", "r1", isAnyContent);
       // The attempt has stopped: it never wrote a terminal event.
       yield* Effect.yieldNow;
       const log = yield* EventLog.EventLog;
-      expect((yield* log.read("t1", "r1")).map((s) => s.event).some(AgUi.isTerminal)).toBe(false);
+      expect((yield* log.read("t1", "r1")).map((s) => s.event).some(Agent.isTerminal)).toBe(false);
 
       yield* runner.cancel({ threadId: "t1", runId: "r1" });
       yield* runner.start(run1);
@@ -928,7 +931,7 @@ describe("Runner.makeWorkflow cancellation", () => {
       const { runner, layer, prompts } = yield* workflowRunner([stalled(partialText("0", "Hel"))]);
       yield* Effect.gen(function* () {
         yield* runner.start(run1);
-        yield* awaitLogged("t1", "r1", isContent);
+        yield* awaitLogged("t1", "r1", isAnyContent);
         yield* runner.cancel({ threadId: "t1", runId: "r1" });
         const events = yield* logOf("t1", "r1");
         yield* Effect.promise(() => verify(events));
@@ -951,7 +954,7 @@ describe("Runner.makeWorkflow cancellation", () => {
       const elsewhere = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
         yield* runner.start(run1);
-        yield* awaitLogged("t1", "r1", isContent);
+        yield* awaitLogged("t1", "r1", isAnyContent);
         yield* elsewhere.cancel({ threadId: "t1", runId: "r1" });
         yield* TestClock.adjust("1 second");
         const events = yield* logOf("t1", "r1");
@@ -1004,7 +1007,7 @@ describe("Runner.makeWorkflow cancellation", () => {
         yield* Deferred.await(gates.started);
         yield* Scope.close(first, Exit.void);
         const log = yield* EventLog.EventLog;
-        expect((yield* log.read("t1", "r1")).map((s) => s.event).some(AgUi.isTerminal)).toBe(false);
+        expect((yield* log.read("t1", "r1")).map((s) => s.event).some(Agent.isTerminal)).toBe(false);
 
         // Registered again, as a restarted host does; the cancel resumes the execution.
         yield* Layer.buildWithScope(runner.layer, yield* Effect.scope);

@@ -65,7 +65,7 @@ export class History extends Context.Service<
  * A `resume` entry answers the call with no result whose
  * `Agent.approvalIdFor` it names, and the decision runs as step 0; an entry
  * naming no such call is ignored, and a `resolved` one whose payload is not an
- * `AgUi.ApprovalResponse` denies the call. Dropped calls, results with no
+ * `Agent.ApprovalResponse` denies the call. Dropped calls, results with no
  * call, dropped content parts and such malformed answers are logged as
  * warnings.
  *

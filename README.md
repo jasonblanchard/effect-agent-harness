@@ -52,7 +52,7 @@ This is a deliberate trade off between completeness and simplicity.
 
 ## Core primitives
 
-- **Agent** - the behavior (tools and system prompt) of the agent itself. Defined outside its runner so that it can be evaluated in isolation without runtime concerns like state, durability, etc. Agent implements the LLM loop with AG-UI behaviors built in.
+- **Agent** - the behavior (tools and system prompt) of the agent itself. Defined outside its runner so that it can be evaluated in isolation without runtime concerns like state, durability, etc. Agent implements the LLM loop with AG-UI behaviors built in, and emits the run's AG-UI events itself, so an eval reads the same events a client does.
 - **Runner** - the container that orchestrates the agent loop. This is where the Agent is decorated with runtime concerns like state, durability, etc. Choose between in-process, detached, effect workflow, or bring your own.
 - **History** - how messages state is prepared for a run. Choose between client authoritative history or server authoritative history.
 - **Thread** - abstract thread storage and lifecycle. Use the built ins or bring your own.

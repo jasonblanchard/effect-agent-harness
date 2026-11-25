@@ -2,10 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Effect, Exit, Layer, Schema, Scope, Stream } from "effect";
 import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
-import { Prompt } from "effect/ai";
+import { AgUiServer, Prompt, Tool, Toolkit } from "effect/ai";
 import type { AgUiSchema, LanguageModel, Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
-import type * as AgUi from "../src/AgUi.ts";
+import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as History from "../src/History.ts";
@@ -14,21 +14,28 @@ import type * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
 import {
+  agentRun,
   ApprovalToolkit,
+  collect,
   counterIds,
   countingApprovalLayer,
   countingWeatherLayer,
   evalLayers,
   finish,
+  ofType,
+  outcomeOf,
   PickFile,
   progressLayer,
   ProgressToolkit,
+  resultsOf,
   runAgUi,
   scriptedModel,
   serverStores,
   type Step,
+  terminalOf,
   text,
   toolCall,
+  types,
   verify,
   WeatherToolkit,
 } from "./fixtures.ts";
@@ -58,26 +65,31 @@ const delegation: ReadonlyArray<Step> = [
   [...text("0", "It's 18°C."), finish("stop")],
 ];
 
-const runAgent = (agent: Agent.Any, steps: ReadonlyArray<Step>, input?: Partial<Agent.RunInput>) =>
+const runAgent = (agent: Agent.Any, steps: ReadonlyArray<Step>, input?: Partial<AgUiSchema.RunAgentInput>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
     const weather = countingWeatherLayer();
-    const events = yield* Agent.run(agent as typeof parent, {
-      runId: "r1",
-      threadId: "t1",
-      prompt: userPrompt,
-      ...input,
-    }).pipe(Stream.runCollect, Effect.provide([model.layer, weather.layer, evalLayers]));
-    return { events: Array.from(events), model, calls: weather.calls };
+    const collected = yield* collect(agentRun(agent as typeof parent, { prompt: userPrompt, input })).pipe(
+      Effect.provide([model.layer, weather.layer, evalLayers]),
+    );
+    yield* Effect.promise(() => verify(collected.events));
+    return { ...collected, model, calls: weather.calls };
   });
 
-const top = (events: ReadonlyArray<Agent.Event>) => events.filter((event) => event._tag !== "Subagent");
+const isLifecycle = (event: AgUiSchema.Event) =>
+  event.type === "SUBAGENT_STARTED" || event.type === "SUBAGENT_FINISHED" || event.type === "SUBAGENT_ERROR";
 
-/** The events of the subagent `id`, unwrapped, at any depth. */
-const ofSubagent = (events: ReadonlyArray<Agent.Event>, id: string): Array<Agent.Event> =>
-  events.flatMap((event) =>
-    event._tag !== "Subagent" ? [] : event.subagentRunId === id ? [event.event] : ofSubagent([event.event], id),
-  );
+/** The parent's own events: no subagent's, and no subagent lifecycle. */
+const top = (events: ReadonlyArray<AgUiSchema.Event>) =>
+  events.filter((event) => !isLifecycle(event) && !("subagentRunId" in event && event.subagentRunId !== undefined));
+
+/** The events of the subagent `id` itself, without its lifecycle events. */
+const ofSubagent = (events: ReadonlyArray<AgUiSchema.Event>, id: string) =>
+  events.filter((event) => !isLifecycle(event) && "subagentRunId" in event && event.subagentRunId === id);
+
+/** The lifecycle events of the subagent `id`. */
+const lifecycleOf = (events: ReadonlyArray<AgUiSchema.Event>, id: string) =>
+  events.filter((event) => isLifecycle(event) && "subagentRunId" in event && event.subagentRunId === id);
 
 const roles = (prompt: Prompt.Prompt | undefined) =>
   (prompt?.content ?? []).map((message) =>
@@ -95,17 +107,11 @@ const roles = (prompt: Prompt.Prompt | undefined) =>
         },
   );
 
-const finishedEntries = (events: ReadonlyArray<Agent.Event>, step: number) =>
-  top(events).flatMap((event) => (event._tag === "StepFinished" && event.step === step ? event.entries : []));
-
 const owners = (entries: ReadonlyArray<Messages.Entry>) =>
   entries.map((entry) => ({ id: entry.id, role: entry.message.role, owner: entry.subagentRunId }));
 
-const toolResultOf = (events: ReadonlyArray<Agent.Event>, toolCallId: string) =>
-  top(events).find(
-    (event): event is Extract<Agent.Event, { _tag: "ToolResult" }> =>
-      event._tag === "ToolResult" && event.toolCallId === toolCallId,
-  );
+const toolResultOf = (events: ReadonlyArray<AgUiSchema.Event>, toolCallId: string) =>
+  resultsOf(top(events)).find((result) => result.toolCallId === toolCallId);
 
 // -----------------------------------------------------------------------------
 // Definition
@@ -164,7 +170,7 @@ describe("Agent.define with subagents", () => {
 describe("Agent.run with subagents", () => {
   it.effect("offers each subagent as a tool, and the child none of the client's tools", () =>
     Effect.gen(function* () {
-      const { model } = yield* runAgent(parent, delegation, { frontendTools: [PickFile] });
+      const { model } = yield* runAgent(parent, delegation, { tools: [PickFile] });
       const parentTools = model.tools[0]!.map((tool) => tool.name);
       expect(parentTools).toEqual(expect.arrayContaining(["get-weather", "researcher", "pick-file"]));
       const tool = model.tools[0]!.find((t) => t.name === "researcher")!;
@@ -188,54 +194,98 @@ describe("Agent.run with subagents", () => {
         { role: "assistant", parts: ["c1"] },
         { role: "tool", parts: ["c1"] },
       ]);
-      expect(toolResultOf(events, "c1")).toMatchObject({ encodedResult: "Paris is 18°C", isFailure: false });
-      expect(top(events).at(-1)).toEqual({ _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } });
+      expect(toolResultOf(events, "c1")).toMatchObject({ value: "Paris is 18°C", isFailure: false });
+      expect(outcomeOf(events)).toEqual({ type: "success" });
     }),
   );
 
-  it.effect("wraps the child's events with its id, name and parent", () =>
+  it.effect("attributes the child's events to it, between its lifecycle events", () =>
     Effect.gen(function* () {
       const { events } = yield* runAgent(parent, delegation);
-      const step1 = top(events).find((event) => event._tag === "StepStarted" && event.step === 1);
-      const wrapped = events.filter((event) => event._tag === "Subagent");
-      expect(wrapped.length).toBeGreaterThan(0);
-      for (const event of wrapped) {
-        expect(event).toMatchObject({
+      const parentMessageId = ofType(top(events), "TOOL_CALL_START")[0]!.parentMessageId;
+      expect(lifecycleOf(events, child)).toEqual([
+        {
+          type: "SUBAGENT_STARTED",
           subagentRunId: child,
           name: "researcher",
           description: "Looks things up",
           parentToolCallId: "c1",
-          parentMessageId: step1?._tag === "StepStarted" ? step1.messageId : "",
-        });
-      }
-      expect(ofSubagent(events, child).map((event) => event._tag)).toEqual([
-        "StepStarted",
-        ...Array(4).fill("ModelPart"),
-        "ModelPart",
-        "ToolResult",
-        "StepFinished",
-        "StepStarted",
-        ...Array(4).fill("ModelPart"),
-        "StepFinished",
-        "Finished",
+          parentMessageId,
+        },
+        { type: "SUBAGENT_FINISHED", subagentRunId: child, result: "Paris is 18°C", outcome: { type: "success" } },
       ]);
-      // The child's events come before the parent's result for the call.
-      const lastChild = events.findLastIndex((event) => event._tag === "Subagent");
-      const result = events.findIndex((event) => event._tag === "ToolResult" && event.toolCallId === "c1");
-      expect(lastChild).toBeLessThan(result);
+      expect(types(ofSubagent(events, child))).toEqual([
+        "STEP_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+        "STEP_FINISHED",
+        "STEP_STARTED",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "STEP_FINISHED",
+      ]);
+      // The child's events come between its start and its finish, which comes just before the parent's result.
+      const started = events.findIndex((event) => event.type === "SUBAGENT_STARTED");
+      const finished = events.findIndex((event) => event.type === "SUBAGENT_FINISHED");
+      const childEvents = events.flatMap((event, i) => ("subagentRunId" in event && !isLifecycle(event) ? [i] : []));
+      expect(Math.min(...childEvents)).toBeGreaterThan(started);
+      expect(Math.max(...childEvents)).toBeLessThan(finished);
+      const result = events.findIndex((event) => event.type === "TOOL_CALL_RESULT" && event.toolCallId === "c1");
+      expect(result).toBe(finished + 1);
     }),
   );
 
-  it.effect("carries the child's entries in the parent step, between its assistant entry and its results", () =>
+  it.effect("commits the child's entries with the parent step, between its assistant entry and its results", () =>
     Effect.gen(function* () {
-      const { events } = yield* runAgent(parent, delegation);
-      expect(owners(finishedEntries(events, 1))).toEqual([
+      const { steps } = yield* runAgent(parent, delegation);
+      // The child's steps reach only its parent's commit.
+      expect(steps).toHaveLength(2);
+      expect(owners(steps[0]!)).toEqual([
         { id: expect.any(String), role: "assistant", owner: undefined },
         { id: expect.any(String), role: "assistant", owner: child },
         { id: expect.any(String), role: "tool", owner: child },
         { id: expect.any(String), role: "assistant", owner: child },
         { id: expect.any(String), role: "tool", owner: undefined },
       ]);
+    }),
+  );
+
+  it.effect("gives the child the parent's AG-UI input", () =>
+    Effect.gen(function* () {
+      const seen: Array<unknown> = [];
+      const WhoAsks = Tool.make("who-asks", {
+        parameters: Schema.Struct({}),
+        success: Schema.Boolean,
+        dependencies: [AgUiServer.RunInput],
+      });
+      const asking = Toolkit.make(WhoAsks);
+      const reader = Agent.define({ name: "reader", toolkit: asking });
+      const withReader = Agent.define({ toolkit: WeatherToolkit, subagents: { agents: [reader] } });
+      const model = scriptedModel([
+        [...toolCall("c1", "reader", { prompt: "Who asks?" }), finish("tool-calls")],
+        [...toolCall("c2", "who-asks", {}), finish("tool-calls")],
+        [...text("0", "Someone."), finish("stop")],
+        [...text("0", "Done."), finish("stop")],
+      ]);
+      yield* agentRun(withReader, { prompt: userPrompt, input: { forwardedProps: { locale: "fr" } } }).pipe(
+        Stream.runDrain,
+        Effect.provide([
+          model.layer,
+          countingWeatherLayer().layer,
+          asking.toLayer({
+            "who-asks": () =>
+              Effect.gen(function* () {
+                seen.push((yield* AgUiServer.RunInput).forwardedProps);
+                return true;
+              }),
+          }),
+          evalLayers,
+        ]),
+      );
+      expect(seen).toEqual([{ locale: "fr" }]);
     }),
   );
 
@@ -278,7 +328,7 @@ describe("Agent.run with subagents", () => {
       });
       const withStructured = Agent.define({ toolkit: WeatherToolkit, subagents: { agents: [structured] } });
       const { events } = yield* runAgent(withStructured, delegation);
-      expect(toolResultOf(events, "c1")?.encodedResult).toEqual({
+      expect(toolResultOf(events, "c1")?.value).toEqual({
         answer: "Paris is 18°C",
         asked: { prompt: "Find the weather in Paris" },
       });
@@ -292,7 +342,7 @@ describe("Agent.run with subagents", () => {
       const { events } = yield* runAgent(withOdd, delegation);
       expect(toolResultOf(events, "c1")).toMatchObject({
         isFailure: true,
-        encodedResult: "The result of subagent researcher is not a JSON value",
+        value: "The result of subagent researcher is not a JSON value",
       });
     }),
   );
@@ -319,8 +369,8 @@ describe("Agent.run with subagents", () => {
         [...toolCall("c1", "researcher", { question: "?" }), finish("tool-calls")],
       ]);
       expect(model.prompts).toHaveLength(1);
-      expect(events.some((event) => event._tag === "Subagent")).toBe(false);
-      expect(top(events).at(-1)).toMatchObject({ _tag: "Failed", code: "InvalidOutputError" });
+      expect(events.some(isLifecycle)).toBe(false);
+      expect(terminalOf(events)).toMatchObject({ type: "RUN_ERROR", code: "InvalidOutputError" });
     }),
   );
 
@@ -334,10 +384,10 @@ describe("Agent.run with subagents", () => {
         [...text("0", "I couldn't find out."), finish("stop")],
       ]);
       expect(model.prompts).toHaveLength(3);
-      expect(ofSubagent(events, child).at(-1)).toMatchObject({ _tag: "Failed", code: "StepLimitExceeded" });
+      expect(lifecycleOf(events, child).at(-1)).toMatchObject({ type: "SUBAGENT_ERROR", code: "StepLimitExceeded" });
       expect(toolResultOf(events, "c1")).toMatchObject({ isFailure: true });
-      expect(String(toolResultOf(events, "c1")?.encodedResult)).toContain("Step limit exceeded");
-      expect(top(events).at(-1)).toMatchObject({ _tag: "Finished", outcome: { _tag: "Success" } });
+      expect(String(toolResultOf(events, "c1")?.value)).toContain("Step limit exceeded");
+      expect(outcomeOf(events)).toEqual({ type: "success" });
     }),
   );
 
@@ -355,7 +405,7 @@ describe("Agent.run with subagents", () => {
         reply("Both are mild."),
       ]);
       expect(model.prompts).toHaveLength(4);
-      const ids = new Set(events.flatMap((event) => (event._tag === "Subagent" ? [event.subagentRunId] : [])));
+      const ids = new Set(ofType(events, "SUBAGENT_STARTED").map((event) => event.subagentRunId));
       expect(ids).toEqual(new Set([Agent.subagentIdFor("c1"), Agent.subagentIdFor("c3")]));
       const briefs = model.prompts
         .slice(1, 3)
@@ -368,7 +418,7 @@ describe("Agent.run with subagents", () => {
     }),
   );
 
-  it.effect("runs a child's own subagent, owned by the grandchild and wrapped twice", () =>
+  it.effect("runs a child's own subagent, owned by the grandchild and nested in its parent", () =>
     Effect.gen(function* () {
       const lead = Agent.define({
         name: "lead",
@@ -377,7 +427,7 @@ describe("Agent.run with subagents", () => {
         subagents: { agents: [researcher] },
       });
       const withLead = Agent.define({ toolkit: WeatherToolkit, subagents: { agents: [lead] } });
-      const { events, model, calls } = yield* runAgent(withLead, [
+      const { events, steps, model, calls } = yield* runAgent(withLead, [
         [...toolCall("c0", "lead", { prompt: "Find out about Paris" }), finish("tool-calls")],
         [...toolCall("c1", "researcher", { prompt: "Find the weather in Paris" }), finish("tool-calls")],
         delegation[1]!,
@@ -388,26 +438,30 @@ describe("Agent.run with subagents", () => {
       expect(calls).toEqual(["Paris"]);
       expect(model.prompts).toHaveLength(6);
       const leadId = Agent.subagentIdFor("c0");
-      const grandchild = events.find(
-        (event) => event._tag === "Subagent" && event.event._tag === "Subagent",
-      ) as Extract<Agent.Event, { _tag: "Subagent" }>;
-      expect(grandchild).toMatchObject({ subagentRunId: leadId, event: { subagentRunId: child, name: "researcher" } });
-      expect(ofSubagent(events, child).at(-1)).toMatchObject({ _tag: "Finished" });
-      const entries = owners(finishedEntries(events, 1));
+      expect(lifecycleOf(events, child)[0]).toMatchObject({
+        type: "SUBAGENT_STARTED",
+        name: "researcher",
+        parentSubagentRunId: leadId,
+        parentToolCallId: "c1",
+      });
+      expect(lifecycleOf(events, child).at(-1)).toMatchObject({ type: "SUBAGENT_FINISHED" });
+      // The grandchild's call result belongs to the lead.
+      expect(resultsOf(ofSubagent(events, leadId)).map((result) => result.toolCallId)).toEqual(["c1"]);
+      const entries = owners(steps[0]!);
       expect(entries.filter((entry) => entry.owner === child)).toHaveLength(3);
       // Its call, the call's result and its reply.
       expect(entries.filter((entry) => entry.owner === leadId)).toHaveLength(3);
-      expect(toolResultOf(events, "c0")?.encodedResult).toBe("Paris is mild.");
+      expect(toolResultOf(events, "c0")?.value).toBe("Paris is mild.");
     }),
   );
 
-  it.effect("replays a child's completed work when the run is executed again", () =>
+  it.effect("replays a child's completed work when the run is executed again, marking what it replays", () =>
     Effect.gen(function* () {
       const weather = countingWeatherLayer();
-      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: Agent.Event) => boolean) =>
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUiSchema.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
-          const events = Agent.run(parent, { runId: "r1", threadId: "t1", prompt: userPrompt });
+          const events = agentRun(parent, { prompt: userPrompt });
           const collected = yield* (stopAfter === undefined ? events : Stream.takeUntil(events, stopAfter)).pipe(
             Stream.runCollect,
             Effect.provide([model.layer, weather.layer]),
@@ -422,19 +476,22 @@ describe("Agent.run with subagents", () => {
           delegation[1]!,
           Stream.fromIterable(text("0", "Paris is").slice(0, 2)).pipe(Stream.concat(Stream.never)),
         ],
-        (event) => event._tag === "Subagent" && event.event._tag === "ModelPart" && event.event.step === 2,
+        (event) => event.type === "TEXT_MESSAGE_CONTENT" && event.subagentRunId === child,
       );
       // Attempt 2 replays the parent's step 1 and the child's step 1; the model is called for the rest.
       const second = yield* attempt([delegation[2]!, delegation[3]!]);
 
       expect(weather.calls).toEqual(["Paris"]);
       expect(second.prompts).toHaveLength(2);
-      const replayed = ofSubagent(second.events, child).filter((event) => "step" in event && event.step === 1);
-      expect(replayed.every((event) => "replayed" in event && event.replayed)).toBe(true);
-      const ids = (events: ReadonlyArray<Agent.Event>) =>
-        new Set(events.flatMap((event) => (event._tag === "Subagent" ? [event.subagentRunId] : [])));
-      expect(ids(second.events)).toEqual(ids(first.events));
-      expect(toolResultOf(second.events, "c1")?.encodedResult).toBe("Paris is 18°C");
+      // The child's replayed result is marked, and what it executes again is not.
+      const [replayedResult] = resultsOf(ofSubagent(second.events, child));
+      expect(replayedResult).toMatchObject({ toolCallId: "c2", replayed: true });
+      expect(ofType(ofSubagent(second.events, child), "STEP_STARTED")).toEqual([
+        { ...Events.stepStarted("step-2"), subagentRunId: child },
+      ]);
+      expect(lifecycleOf(second.events, child).at(-1)).toMatchObject({ type: "SUBAGENT_FINISHED" });
+      expect(lifecycleOf(first.events, child)[0]).toMatchObject({ type: "SUBAGENT_STARTED" });
+      expect(toolResultOf(second.events, "c1")).toMatchObject({ value: "Paris is 18°C", replayed: false });
     }).pipe(
       Effect.provide(
         Layer.mergeAll(Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)), counterIds()),
@@ -442,16 +499,17 @@ describe("Agent.run with subagents", () => {
     ),
   );
 
-  it.effect("emits the same events and entries as before for an agent without subagents", () =>
+  it.effect("emits no subagent events or owners for an agent without subagents", () =>
     Effect.gen(function* () {
       const plain = Agent.define({ toolkit: WeatherToolkit, system: "Be helpful." });
       const script: ReadonlyArray<Step> = [
         [...toolCall("c1", "get-weather", { location: "Paris" }), finish("tool-calls")],
         [...text("0", "18°C"), finish("stop")],
       ];
-      const { events } = yield* runAgent(plain, script);
-      expect(events.some((event) => event._tag === "Subagent")).toBe(false);
-      expect(owners(finishedEntries(events, 1)).map((entry) => entry.owner)).toEqual([undefined, undefined]);
+      const { events, steps } = yield* runAgent(plain, script);
+      expect(events.some(isLifecycle)).toBe(false);
+      expect(top(events)).toEqual(events);
+      expect(owners(steps[0]!).map((entry) => entry.owner)).toEqual([undefined, undefined]);
     }),
   );
 });
@@ -539,9 +597,9 @@ describe("suspended subagents", () => {
       }).pipe(Effect.provide([model.layer, handlers.layer, evalLayers, serverStores]));
     });
 
-  const resultOf = (events: ReadonlyArray<AgUi.Event>, toolCallId: string) =>
+  const resultOf = (events: ReadonlyArray<AgUiSchema.Event>, toolCallId: string) =>
     events.find(
-      (event): event is Extract<AgUi.Event, { type: "TOOL_CALL_RESULT" }> =>
+      (event): event is Extract<AgUiSchema.Event, { type: "TOOL_CALL_RESULT" }> =>
         event.type === "TOOL_CALL_RESULT" && event.toolCallId === toolCallId,
     );
 
@@ -813,9 +871,9 @@ describe("suspended subagents", () => {
   );
 });
 
-const resultOf = (events: ReadonlyArray<AgUi.Event>, toolCallId: string) =>
+const resultOf = (events: ReadonlyArray<AgUiSchema.Event>, toolCallId: string) =>
   events.find(
-    (event): event is Extract<AgUi.Event, { type: "TOOL_CALL_RESULT" }> =>
+    (event): event is Extract<AgUiSchema.Event, { type: "TOOL_CALL_RESULT" }> =>
       event.type === "TOOL_CALL_RESULT" && event.toolCallId === toolCallId,
   );
 
@@ -884,9 +942,9 @@ describe("AG-UI events of subagents", () => {
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]));
       return events!;
     });
-  const ownerOf = (event: AgUi.Event) =>
+  const ownerOf = (event: AgUiSchema.Event) =>
     event.type.startsWith("SUBAGENT_") ? "lifecycle" : (event as { subagentRunId?: string }).subagentRunId;
-  const indexOf = (events: ReadonlyArray<AgUi.Event>, predicate: (event: AgUi.Event) => boolean) =>
+  const indexOf = (events: ReadonlyArray<AgUiSchema.Event>, predicate: (event: AgUiSchema.Event) => boolean) =>
     events.findIndex(predicate);
 
   it.effect("wraps the child's events in its lifecycle, attributed to it, before the call's result", () =>
@@ -1237,7 +1295,7 @@ describe("AG-UI events of subagents", () => {
       for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
       yield* Scope.close(crashed, Exit.void);
       const before = (yield* log.read("t1", "r1")).map((s) => s.event);
-      const finishedChild = before.find((e) => e.type === "TEXT_MESSAGE_END") as AgUi.Event | undefined;
+      const finishedChild = before.find((e) => e.type === "TEXT_MESSAGE_END") as AgUiSchema.Event | undefined;
       const done = finishedChild === undefined ? undefined : ownerOf(finishedChild);
       expect(done).toBeDefined();
       expect(before.filter((e) => e.type === "SUBAGENT_FINISHED" || e.type === "TOOL_CALL_RESULT")).toEqual([]);

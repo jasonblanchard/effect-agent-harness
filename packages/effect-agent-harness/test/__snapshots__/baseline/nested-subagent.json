@@ -1,0 +1,228 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c0",
+      "toolCallName": "lead",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c0",
+      "delta": "{\"prompt\":\"Find out about Paris\"}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c0"
+    },
+    {
+      "type": "SUBAGENT_STARTED",
+      "subagentRunId": "subagent:c0",
+      "name": "lead",
+      "parentToolCallId": "c0",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "researcher",
+      "parentMessageId": "id-2",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{\"prompt\":\"Paris?\"}",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "SUBAGENT_STARTED",
+      "subagentRunId": "subagent:c1",
+      "name": "researcher",
+      "description": "Looks things up",
+      "parentSubagentRunId": "subagent:c0",
+      "parentToolCallId": "c1",
+      "parentMessageId": "id-2"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c2",
+      "toolCallName": "get-weather",
+      "parentMessageId": "id-3",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c2",
+      "delta": "{\"location\":\"Paris\"}",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c2",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-4",
+      "toolCallId": "c2",
+      "content": "{\"temperature\":18}",
+      "role": "tool",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-2",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-5",
+      "role": "assistant",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-5",
+      "delta": "Paris is 18°C",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-5",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-2",
+      "subagentRunId": "subagent:c1"
+    },
+    {
+      "type": "SUBAGENT_FINISHED",
+      "subagentRunId": "subagent:c1",
+      "result": "Paris is 18°C",
+      "outcome": {
+        "type": "success"
+      }
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-6",
+      "toolCallId": "c1",
+      "content": "\"Paris is 18°C\"",
+      "role": "tool",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-2",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-7",
+      "role": "assistant",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-7",
+      "delta": "Paris is mild.",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-7",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-2",
+      "subagentRunId": "subagent:c0"
+    },
+    {
+      "type": "SUBAGENT_FINISHED",
+      "subagentRunId": "subagent:c0",
+      "result": "Paris is mild.",
+      "outcome": {
+        "type": "success"
+      }
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-8",
+      "toolCallId": "c0",
+      "content": "\"Paris is mild.\"",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-9",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-9",
+      "delta": "It's mild."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-9"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1",
+      "outcome": {
+        "type": "success"
+      }
+    }
+  ]
+]
