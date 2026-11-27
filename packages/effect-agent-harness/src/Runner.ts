@@ -22,7 +22,7 @@ import type { Tool } from "effect/ai";
 import { DurableDeferred, Workflow, WorkflowEngine } from "effect/workflow";
 import * as Agent from "./Agent.ts";
 import * as Checkpoint from "./Checkpoint.ts";
-import * as EventLog from "./EventLog.ts";
+import * as RunLog from "./RunLog.ts";
 import * as History from "./History.ts";
 import * as Events from "./internal/events.ts";
 import * as internal from "./internal/history.ts";
@@ -537,12 +537,12 @@ const detached =
     cancelled: Effect.Effect<void>,
   ): Effect.Effect<
     void,
-    EventLog.EventLogError,
-    Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies> | EventLog.EventLog
+    RunLog.RunLogError,
+    Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies> | RunLog.RunLog
   > => {
     const runWith = agUiRun<Tools, R, Dependencies, ROut, E, RIn>(agent, options);
     return Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       const append = (event: AgUiSchema.Event) => log.append(input.threadId, input.runId, event);
       // Without a cursor, the read cannot fail with `InvalidCursor`.
       const history = (yield* log
@@ -564,7 +564,7 @@ const detached =
 /**
  * A runner whose runs outlive the request that starts them. `start` forks the
  * run into the scope this effect was given and returns at once; the run's
- * AG-UI events go to the {@link EventLog.EventLog}, where clients subscribe
+ * AG-UI events go to the {@link RunLog.RunLog}, where clients subscribe
  * and reconnect. A client disconnecting does not affect the run; closing the
  * scope interrupts it.
  *
@@ -598,12 +598,12 @@ export const makeDetached = <
     readonly cancel: (run: RunIds) => Effect.Effect<void>;
   },
   never,
-  Requirements<Tools, R, Dependencies, ROut, RIn> | EventLog.EventLog | Scope.Scope
+  Requirements<Tools, R, Dependencies, ROut, RIn> | RunLog.RunLog | Scope.Scope
 > =>
   Effect.gen(function* () {
-    const context = yield* Effect.context<Requirements<Tools, R, Dependencies, ROut, RIn> | EventLog.EventLog>();
+    const context = yield* Effect.context<Requirements<Tools, R, Dependencies, ROut, RIn> | RunLog.RunLog>();
     const scope = yield* Scope.Scope;
-    const log = yield* EventLog.EventLog;
+    const log = yield* RunLog.RunLog;
     const body = detached(agent, options);
     // The cancel signal of each run this runner started that has not ended: one in progress, or one whose
     // attempt was interrupted (a crash), which the next `start` reuses. Only `start` adds entries, so the ids
@@ -706,7 +706,7 @@ interface PayloadParts {
  * persists the run and replays it after a crash or deploy. Give it a `name`
  * unique to this agent ({@link WorkflowOptions}), register `layer` with the
  * engine, and start a run with `start(input)`, providing its dependencies
- * around it; observe it through the {@link EventLog.EventLog}. The
+ * around it; observe it through the {@link RunLog.RunLog}. The
  * dependencies must be {@link RunContext}s, so they can be persisted.
  *
  * `start` reads the dependencies' services, persists them in the payload
@@ -779,7 +779,7 @@ export const makeWorkflow = <
     never,
     never,
     | Exclude<Requirements<Tools, R, Dependencies, ROut, RIn>, Checkpoint.Checkpoint>
-    | EventLog.EventLog
+    | RunLog.RunLog
     | WorkflowEngine.WorkflowEngine
   > = run.toLayer((payload) => {
     const { input, context } = payload as PayloadParts;

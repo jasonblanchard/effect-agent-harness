@@ -7,7 +7,7 @@ import type { AgUiSchema, LanguageModel, Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as History from "../src/History.ts";
 import * as Conversions from "../src/internal/conversions.ts";
 import type * as Messages from "../src/Messages.ts";
@@ -1104,7 +1104,7 @@ describe("AG-UI events of subagents", () => {
 
   it.effect("completes a detached run that crashed mid-child, continuing the subagent it started", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       const weather = countingWeatherLayer();
       const start = (scope: Scope.Scope, steps: ReadonlyArray<Step>) =>
         Effect.gen(function* () {
@@ -1153,7 +1153,7 @@ describe("AG-UI events of subagents", () => {
           Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           serverStores,
-          EventLog.layerMemory,
+          RunLog.layerMemory,
         ),
       ),
     ),
@@ -1204,7 +1204,7 @@ describe("AG-UI events of subagents", () => {
   for (const { at, agent, owner, steps, rest } of besideSubagent) {
     it.effect(`publishes a tool result of ${at} checkpointed beside a subagent when a crash cut the step short`, () =>
       Effect.gen(function* () {
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         const weather = countingWeatherLayer();
         const start = (scope: Scope.Scope, script: ReadonlyArray<Step>) =>
           Effect.gen(function* () {
@@ -1248,7 +1248,7 @@ describe("AG-UI events of subagents", () => {
             Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
             counterIds(),
             serverStores,
-            EventLog.layerMemory,
+            RunLog.layerMemory,
           ),
         ),
       ),
@@ -1257,7 +1257,7 @@ describe("AG-UI events of subagents", () => {
 
   it.effect("publishes the result of a child that finished before a crash its sibling was caught in", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       const start = (scope: Scope.Scope, steps: ReadonlyArray<Step>) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
@@ -1321,7 +1321,7 @@ describe("AG-UI events of subagents", () => {
           Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
           counterIds(),
           serverStores,
-          EventLog.layerMemory,
+          RunLog.layerMemory,
         ),
       ),
     ),

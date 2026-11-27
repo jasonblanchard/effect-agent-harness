@@ -249,7 +249,7 @@ Pick a runner by what should happen when the client goes away:
 | Runner                | A client disconnect…              | Cancelled by                                   | Requires                                                     |
 | --------------------- | --------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
 | `Runner.makeAttached` | cancels the run (model and tools) | the consumer stopping                          | `Checkpoint`, model, tools, and what the per-run layer needs |
-| `Runner.makeDetached` | does nothing; the run continues   | `cancel({ threadId, runId })`, in this process | the above + `EventLog`, `Scope`                              |
+| `Runner.makeDetached` | does nothing; the run continues   | `cancel({ threadId, runId })`, in this process | the above + `RunLog`, `Scope`                                |
 | `Runner.makeWorkflow` | does nothing; an engine owns it   | `cancel({ threadId, runId })`, on any host     | the above (minus `Checkpoint`) + `WorkflowEngine`            |
 
 **Cancelling a run.** A cancelled run stops its model stream or tool handlers and ends in-band: it closes everything it opened and emits `RUN_FINISHED` with outcome `cancelled` (no `result`). What the step produced is kept: the partial assistant text under the message id the client saw, each complete tool call with its real result if its handler finished and a failed "cancelled" result otherwise. Under the server history that is committed, the store is told (`runEnded` with `Cancelled`) and the thread released, so the client's next message is an ordinary run. A running subagent is cancelled with its parent and closes with `SUBAGENT_ERROR` code `Cancelled`. A cancel made while a run was down is honoured at its next step without calling the model. `cancel` returns at once and is idempotent; cancelling a run that has ended does nothing. `makeDetached`'s cancel reaches only runs started through the same runner in this process (it is lost if the process dies), and does nothing, keeping nothing, for a run it hasn't started. `makeWorkflow`'s is held by the engine, so it also reaches a run that hasn't started yet, and one running on another host, within `cancelPollInterval` (1 second by default; a cancel through the runner executing the run is immediate). A disconnected `makeAttached` run is given `cancelTimeout` (30 seconds by default) to end; after that it is interrupted and its thread released. A route for it, such as TanStack AI's `cancelUrl`, takes the ids and calls `cancel`. To keep a side effect from being torn, a handler wraps it in `Effect.uninterruptible`: the run waits for it before ending (for a `makeAttached` run, up to `cancelTimeout`). Without the runners, pass `Agent.run` a `cancelled` effect that completes when the run should stop.
@@ -483,7 +483,7 @@ The library doesn't serve this route. Expose it as a `GET` of your own, and auth
 
 TanStack AI's `useChat` does this itself with `persistence: true`: on mount it calls `GET <chat url>?threadId=…` and expects `{ messages, interrupts, activeRun }`, with `messages` as its own `UIMessage`s. Leave its `history.pageSize` unset: with paging on, it sends only the messages it hasn't loaded from the server, which effect-agent-harness rejects with `HistoryMismatch`. The `tanstack` example serves this route.
 
-A run still going can be rejoined if it was started with `Runner.makeDetached` or `Runner.makeWorkflow`, which write to the `EventLog`. Ask for it on the route that serves those joins:
+A run still going can be rejoined if it was started with `Runner.makeDetached` or `Runner.makeWorkflow`, which write to the `RunLog`. Ask for it on the route that serves those joins:
 
 ```ts
 const { messages, interrupts, activeRun } = yield * History.restore(threadId, { rejoin: true });
@@ -491,7 +491,7 @@ const { messages, interrupts, activeRun } = yield * History.restore(threadId, { 
 // messages: leaves out what activeRun's log will replay, so applying them and then the log from its start shows each message once
 ```
 
-Then serve the client's join from `EventLog.subscribe`, with an idle timeout, because a crashed run holds its thread until the claim expires and its log never ends. Don't use `rejoin` with `Runner.makeAttached`: it claims the thread but never writes to the log, so a client told to join would wait for events that never come. TanStack AI joins with `GET <chat url>?offset=-1&runId=…`, where `-1` means from the start and is not a cursor. The join has no thread id, so put it in the connection URL. See `packages/examples/tanstack`.
+Then serve the client's join from `RunLog.subscribe`, with an idle timeout, because a crashed run holds its thread until the claim expires and its log never ends. Don't use `rejoin` with `Runner.makeAttached`: it claims the thread but never writes to the log, so a client told to join would wait for events that never come. TanStack AI joins with `GET <chat url>?offset=-1&runId=…`, where `-1` means from the start and is not a cursor. The join has no thread id, so put it in the connection URL. See `packages/examples/tanstack`.
 
 `Thread.layerMemory` keeps threads in process memory. For production, implement the service over your database ([below](#writing-your-own-stores)).
 
@@ -722,7 +722,7 @@ The projected thread is memoised as well (as `prompt`), and so is a computed sys
 
 ### Detached runs
 
-`Runner.makeDetached` decouples a run from the request that started it. `start` forks the run into the scope you give it and returns at once. The run's events go to the `EventLog`.
+`Runner.makeDetached` decouples a run from the request that started it. `start` forks the run into the scope you give it and returns at once. The run's events go to the `RunLog`.
 
 ```ts
 // An endpoint in the group of Authentication and run context, answering 202 at once.
@@ -769,15 +769,15 @@ const { start, executionId, workflow, layer } = Runner.makeWorkflow(agent, {
 yield * start(input).pipe(Effect.provideService(AuthContext, principal));
 ```
 
-`name` is required. The engine registers the workflow under it, derives execution ids from it and stores it with every execution. Give each agent on an engine its own name: two workflows with the same name replace each other's registration and share execution ids. Don't rename a workflow while it has executions in flight, because they would have no handler to resume them. A workflow's history is the one in the context `layer` is built in: provide `History.layerServer` to `layer` for the server history. Agents that share a `Thread` store and `EventLog` must not share thread ids either, since both stores key by thread.
+`name` is required. The engine registers the workflow under it, derives execution ids from it and stores it with every execution. Give each agent on an engine its own name: two workflows with the same name replace each other's registration and share execution ids. Don't rename a workflow while it has executions in flight, because they would have no handler to resume them. A workflow's history is the one in the context `layer` is built in: provide `History.layerServer` to `layer` for the server history. Agents that share a `Thread` store and `RunLog` must not share thread ids either, since both stores key by thread.
 
-`start` reads the dependencies' services and builds the payload the engine persists: the input and, when the runner has dependencies, their values, encoded with their schemas. A value a schema rejects makes `start` die before any execution exists. `start` doesn't wait for the run; observe it through the `EventLog`. A resumed execution sees the original dependencies and builds its per-run services again from them. Starting the same run (same `threadId` and `runId`) again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* executionId(input))`, with the same dependencies provided, because the engine derives the id from the encoded payload.
+`start` reads the dependencies' services and builds the payload the engine persists: the input and, when the runner has dependencies, their values, encoded with their schemas. A value a schema rejects makes `start` die before any execution exists. `start` doesn't wait for the run; observe it through the `RunLog`. A resumed execution sees the original dependencies and builds its per-run services again from them. Starting the same run (same `threadId` and `runId`) again joins the existing execution. Resuming a suspended execution is the engine's job: `workflow.resume(yield* executionId(input))`, with the same dependencies provided, because the engine derives the id from the encoded payload.
 
 **Upgrading from an untyped `context`:** executions persisted before dependencies were declared carry `context: unknown`, which the new payload schema may reject. Let them finish before deploying, or register the new workflow under a new `name`.
 
 ## Reconnecting to a run
 
-The `EventLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` checks `after` and then returns a stream of the stored events after it, then live events, which completes after the terminal event (at once if `after` is already at or past it). A cursor the run's log never issued, such as a malformed `Last-Event-ID`, fails `subscribe` with `InvalidCursor` before any response starts, so the route can answer 400 instead of streaming nothing. Serve each stored event as an SSE frame whose `id` is its cursor (with `HttpApiSchema.StreamSse({ events })`), so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
+The `RunLog` stores each run's AG-UI events under increasing cursors, keyed by thread id and run id. `subscribe(threadId, runId, after?)` checks `after` and then returns a stream of the stored events after it, then live events, which completes after the terminal event (at once if `after` is already at or past it). A cursor the run's log never issued, such as a malformed `Last-Event-ID`, fails `subscribe` with `InvalidCursor` before any response starts, so the route can answer 400 instead of streaming nothing. Serve each stored event as an SSE frame whose `id` is its cursor (with `HttpApiSchema.StreamSse({ events })`), so a browser `EventSource` reconnects with `Last-Event-ID` and gets each event exactly once:
 
 ```ts
 // An event from the log as an SSE frame: its cursor is the frame's `id`.
@@ -792,16 +792,16 @@ const StoredEvent = Schema.Struct({
 //     params: { threadId: Schema.String, runId: Schema.String },
 //     headers: { "last-event-id": Schema.optional(Schema.String) },
 //     success: HttpApiSchema.StreamSse({ events: StoredEvent }),
-//     error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+//     error: RunLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
 //   })
 
 handlers.handle("events", ({ params, headers }) =>
   Effect.gen(function* () {
     yield* threadOwners.authorize(params.threadId); // as for POST /agent
-    const log = yield* EventLog.EventLog;
+    const log = yield* RunLog.RunLog;
     const events = yield* log
       .subscribe(params.threadId, params.runId, headers["last-event-id"])
-      .pipe(Effect.catchTag("EventLogError", Effect.die));
+      .pipe(Effect.catchTag("RunLogError", Effect.die));
     return events.pipe(
       Stream.map(({ cursor, event }) => ({ id: cursor, event: "message", data: event })),
       Stream.orDie,
@@ -810,7 +810,7 @@ handlers.handle("events", ({ params, headers }) =>
 );
 ```
 
-`EventLog.layerMemory` keeps logs in process memory.
+`RunLog.layerMemory` keeps logs in process memory.
 
 ## Tracing
 
@@ -980,7 +980,7 @@ const CheckpointLive = Checkpoint.layerKeyValueStore.pipe(
 );
 ```
 
-**Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must check the cursor before returning its stream (failing with `InvalidCursor` for one the run's log never issued), deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`, including at once when the cursor is at or past it. `read` rejects unknown cursors the same way. See `EventLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
+**Event log:** runs are keyed by `(threadId, runId)`. `append` assigns a cursor strictly greater than every earlier cursor of the run. `subscribe` must check the cursor before returning its stream (failing with `InvalidCursor` for one the run's log never issued), deliver history and then live events, each exactly once, and complete after `RUN_FINISHED` / `RUN_ERROR`, including at once when the cursor is at or past it. `read` rejects unknown cursors the same way. See `RunLog.layerMemory` for the reference behaviour (subscribe to live events _before_ reading history, then drop duplicates).
 
 ## Module reference
 
@@ -993,6 +993,6 @@ Everything is exported from `"effect-agent-harness"` as namespaces. The AG-UI pr
 | `History`    | `History`, `layerClient`, `layerServer`; `restore`, `Restored`: reading a thread back; `HistoryMismatch`, `HistoryDiverged`, `UnansweredInterrupt`, `UnansweredToolCall`: the server history's rejections                                                                                                                                                     |
 | `Thread`     | `Thread`, `RunOutcome`, `ThreadError`, `ThreadBusy`, `layerMemory`                                                                                                                                                                                                                                                                                            |
 | `Checkpoint` | `Checkpoint`, `layerNone`, `layerKeyValueStore`, `keyPrefix`, `layerWorkflow`                                                                                                                                                                                                                                                                                 |
-| `EventLog`   | `EventLog`, `Stored`, `EventLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                         |
+| `RunLog`     | `RunLog`, `Stored`, `RunLogError`, `InvalidCursor`, `layerMemory`                                                                                                                                                                                                                                                                                             |
 | `Messages`   | `Entry`: one message of a conversation, as runs and the thread store hold it; `project`, `projectSuspended`, `INCOMPLETE_TOOL_CALL_RESULT`: a run's entries as the model prompts                                                                                                                                                                              |
 | `Telemetry`  | `layerCaptureContent`, `ContentCapture`: opt-in prompt and response capture on spans; `SpanAttributes`: the caller's attributes for a run's spans                                                                                                                                                                                                             |

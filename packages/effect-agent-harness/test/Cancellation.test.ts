@@ -8,7 +8,7 @@ import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
 import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as History from "../src/History.ts";
 import type * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
@@ -552,7 +552,7 @@ const run1: AgUiSchema.RunAgentInput = {
 
 /** The run's log once it has ended. */
 const logOf = (threadId: string, runId: string) =>
-  Effect.flatMap(EventLog.EventLog, (log) =>
+  Effect.flatMap(RunLog.RunLog, (log) =>
     Effect.map(Stream.runCollect(Stream.unwrap(log.subscribe(threadId, runId))), (stored) =>
       Array.from(stored, (s) => s.event),
     ),
@@ -560,7 +560,7 @@ const logOf = (threadId: string, runId: string) =>
 
 /** Waits until the run's log holds an event `when` accepts. */
 const awaitLogged = (threadId: string, runId: string, when: (event: AgUiSchema.Event) => boolean) =>
-  Effect.flatMap(EventLog.EventLog, (log) =>
+  Effect.flatMap(RunLog.RunLog, (log) =>
     Stream.unwrap(log.subscribe(threadId, runId)).pipe(
       Stream.filter((stored) => when(stored.event)),
       Stream.take(1),
@@ -721,7 +721,7 @@ describe("Runner.makeDetached cancellation", () => {
       return { ...runner, prompts: model.prompts };
     });
 
-  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, EventLog.layerMemory);
+  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, RunLog.layerMemory);
 
   it.effect("ends a streaming run cancelled, and its subscriber sees the end", () =>
     Effect.gen(function* () {
@@ -814,10 +814,10 @@ describe("Runner.makeDetached cancellation", () => {
       // The runner's first read of the log (in `start`) waits until the cancel has been made.
       let reads = 0;
       const slowLog = Layer.effect(
-        EventLog.EventLog,
+        RunLog.RunLog,
         Effect.gen(function* () {
-          const inner = yield* EventLog.EventLog;
-          return EventLog.EventLog.of({
+          const inner = yield* RunLog.RunLog;
+          return RunLog.RunLog.of({
             ...inner,
             read: (threadId, runId, after) =>
               reads++ === 0
@@ -828,7 +828,7 @@ describe("Runner.makeDetached cancellation", () => {
                 : inner.read(threadId, runId, after),
           });
         }),
-      ).pipe(Layer.provideMerge(EventLog.layerMemory));
+      ).pipe(Layer.provideMerge(RunLog.layerMemory));
       yield* Effect.gen(function* () {
         const scope = yield* Scope.make();
         const runner = yield* detachedRunner(scope, [[...text("0", "Hi"), finish("stop")]]);
@@ -859,7 +859,7 @@ describe("Runner.makeDetached cancellation", () => {
       yield* awaitLogged("t1", "r1", isAnyContent);
       // The attempt has stopped: it never wrote a terminal event.
       yield* Effect.yieldNow;
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       expect((yield* log.read("t1", "r1")).map((s) => s.event).some(Agent.isTerminal)).toBe(false);
 
       yield* runner.cancel({ threadId: "t1", runId: "r1" });
@@ -899,7 +899,7 @@ describe("Runner.makeWorkflow cancellation", () => {
             weather.layer,
             counterIds(),
             serverStores,
-            EventLog.layerMemory,
+            RunLog.layerMemory,
             WorkflowEngine.layerMemory,
           ),
         ),
@@ -996,7 +996,7 @@ describe("Runner.makeWorkflow cancellation", () => {
           weather.layer,
           counterIds(),
           serverStores,
-          EventLog.layerMemory,
+          RunLog.layerMemory,
           WorkflowEngine.layerMemory,
         ),
       );
@@ -1006,7 +1006,7 @@ describe("Runner.makeWorkflow cancellation", () => {
         yield* runner.start(run1);
         yield* Deferred.await(gates.started);
         yield* Scope.close(first, Exit.void);
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         expect((yield* log.read("t1", "r1")).map((s) => s.event).some(Agent.isTerminal)).toBe(false);
 
         // Registered again, as a restarted host does; the cancel resumes the execution.

@@ -8,7 +8,7 @@ import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
 import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as History from "../src/History.ts";
 import * as Messages from "../src/Messages.ts";
 import * as Runner from "../src/Runner.ts";
@@ -1358,7 +1358,7 @@ describe("Runner.makeAttached run ids", () => {
 
 describe("Runner.makeDetached", () => {
   const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
-  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, EventLog.layerMemory);
+  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, RunLog.layerMemory);
   const run1 = input("r1", [userMessage("u1", "Weather in Paris?")]);
 
   /** Starts `run1` detached in `scope`, against a model scripted with `steps`. */
@@ -1375,7 +1375,7 @@ describe("Runner.makeDetached", () => {
     });
 
   const subscribe = (after?: string) =>
-    Effect.flatMap(EventLog.EventLog, (log) => Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1", after))));
+    Effect.flatMap(RunLog.RunLog, (log) => Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1", after))));
 
   it.effect("a rejoining read and the run's log show each message once", () =>
     Effect.gen(function* () {
@@ -1468,7 +1468,7 @@ describe("Runner.makeDetached", () => {
           Stream.concat(Stream.make(finish("stop"))),
         ),
       ]);
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       const firstThree = yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")).pipe(Stream.take(3)));
       expect(firstThree).toHaveLength(3);
       yield* Deferred.succeed(release, undefined);
@@ -1480,7 +1480,7 @@ describe("Runner.makeDetached", () => {
 
   it.effect("completes a crashed attempt without repeating its finished steps", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       // Attempt 1 stops (its scope closes, as on a crash) while step 2 is streaming.
       const crashed = yield* Scope.make();
       const first = yield* start(crashed, [
@@ -1519,7 +1519,7 @@ describe("Runner.makeDetached", () => {
 
   it.effect("completes an attempt that crashed mid-reasoning without repeating its finished steps", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       const block = (stepMessageId: string) => `${stepMessageId}:reasoning:0`;
       const crashed = yield* Scope.make();
       yield* start(crashed, [
@@ -1555,7 +1555,7 @@ describe("Runner.makeDetached", () => {
 
   it.effect("completes a log that stops between a reasoning block's two starts", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       yield* log.append("t1", "r1", Events.runStarted(run1));
       yield* log.append("t1", "r1", Events.stepStarted("step-1"));
       yield* log.append("t1", "r1", Events.reasoningStart("lost:reasoning:0"));
@@ -1576,7 +1576,7 @@ describe("Runner.makeDetached", () => {
     Effect.gen(function* () {
       const crashed = yield* Scope.make();
       yield* start(crashed, [Stream.fromIterable(text("0", "It is").slice(0, 2)).pipe(Stream.concat(Stream.never))]);
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       yield* Stream.unwrap(log.subscribe("t1", "r1")).pipe(
         Stream.takeUntil((s) => s.event.type === "TEXT_MESSAGE_CONTENT"),
         Stream.runDrain,
@@ -1599,7 +1599,7 @@ describe("Runner.makeDetached", () => {
 
   it.effect("does nothing for a run that already finished", () =>
     Effect.gen(function* () {
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       yield* start(yield* Scope.make(), weatherTurn);
       yield* subscribe();
       const before = yield* log.read("t1", "r1");
@@ -1625,7 +1625,7 @@ describe("Runner.makeWorkflow", () => {
       const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       const events = yield* Effect.gen(function* () {
         yield* workflow.execute({ input: run1 }, { discard: true });
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         const first = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
         // Executing the same run id again joins the finished execution.
         yield* workflow.execute({ input: run1 });
@@ -1640,7 +1640,7 @@ describe("Runner.makeWorkflow", () => {
                 weather.layer,
                 counterIds(),
                 serverStores,
-                EventLog.layerMemory,
+                RunLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
             ),
@@ -1677,7 +1677,7 @@ describe("Runner.makeWorkflow", () => {
                 countingWeatherLayer().layer,
                 counterIds(),
                 serverStores,
-                EventLog.layerMemory,
+                RunLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
             ),
@@ -1696,7 +1696,7 @@ describe("Runner.makeWorkflow", () => {
       const weather = countingWeatherLayer();
       const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         yield* workflow.execute({ input: run1 });
         yield* workflow.execute({ input: { ...run1, threadId: "t2" } });
         for (const threadId of ["t1", "t2"]) {
@@ -1713,7 +1713,7 @@ describe("Runner.makeWorkflow", () => {
                 weather.layer,
                 counterIds(),
                 serverStores,
-                EventLog.layerMemory,
+                RunLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
             ),
@@ -2139,9 +2139,9 @@ describe("Runner run contexts", () => {
         Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
         counterIds(),
         serverStores,
-        EventLog.layerMemory,
+        RunLog.layerMemory,
       );
-    const subscribe = Effect.flatMap(EventLog.EventLog, (log) =>
+    const subscribe = Effect.flatMap(RunLog.RunLog, (log) =>
       Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1"))).pipe(
         Effect.map((stored) => stored.map((s) => s.event)),
       ),
@@ -2206,7 +2206,7 @@ describe("Runner run contexts", () => {
 
     it.effect("builds the services again when a crashed run is started again, and not for a finished one", () =>
       Effect.gen(function* () {
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         const handlers = userHandlers();
         const perRun = userLayer();
         const crashed = yield* Scope.make();
@@ -2247,7 +2247,7 @@ describe("Runner run contexts", () => {
         handlers.layer,
         counterIds(),
         serverStores,
-        EventLog.layerMemory,
+        RunLog.layerMemory,
         WorkflowEngine.layerMemory,
       );
     const run1 = input("r1", [userMessage("u1", "hi")]);
@@ -2263,7 +2263,7 @@ describe("Runner run contexts", () => {
         });
         yield* Effect.gen(function* () {
           yield* start(run1);
-          const log = yield* EventLog.EventLog;
+          const log = yield* RunLog.RunLog;
           const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
           yield* Effect.promise(() => verify(events));
           // Starting the same run again joins the finished execution.
@@ -2317,7 +2317,7 @@ describe("Runner run contexts", () => {
         });
         const exit = yield* Effect.gen(function* () {
           const result = yield* Effect.exit(start(run1).pipe(Effect.provideService(AuthContext, { userId: "" })));
-          const log = yield* EventLog.EventLog;
+          const log = yield* RunLog.RunLog;
           expect(yield* log.read("t1", "r1")).toEqual([]);
           return result;
         }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(engine([], handlers)))));
@@ -2661,12 +2661,12 @@ describe("Runner client history", () => {
           Effect.provideService(Scope.Scope, scope),
         );
         yield* runner.start(input("r1", [userMessage("u1", "hi")])).pipe(Effect.provide(History.layerClient));
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         const events = (yield* Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1")))).map((s) => s.event);
         yield* Effect.promise(() => verify(events));
         expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
         expect(yield* loadThread).toEqual([]);
-      }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores, EventLog.layerMemory))),
+      }).pipe(Effect.provide(Layer.mergeAll(evalLayers, serverStores, RunLog.layerMemory))),
     );
   });
 
@@ -2675,7 +2675,7 @@ describe("Runner client history", () => {
       const model = scriptedModel([textTurn("Hi."), textTurn("Hi again.")]);
       const { workflow, layer } = Runner.makeWorkflow(weatherAgent, { name: "weather" });
       yield* Effect.gen(function* () {
-        const log = yield* EventLog.EventLog;
+        const log = yield* RunLog.RunLog;
         yield* workflow.execute({ input: input("r1", [userMessage("u1", "hi")]) });
         // The client sends only its new message: the second run takes the rest from the store.
         yield* workflow.execute({
@@ -2696,7 +2696,7 @@ describe("Runner client history", () => {
                 countingWeatherLayer().layer,
                 counterIds(),
                 serverStores,
-                EventLog.layerMemory,
+                RunLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
             ),
@@ -2782,17 +2782,17 @@ describe("Runner tool progress", () => {
   /** The event log, with `before` run ahead of every append. */
   const slowLog = (before: (event: AgUiSchema.Event) => Effect.Effect<void>) =>
     Layer.effect(
-      EventLog.EventLog,
+      RunLog.RunLog,
       Effect.gen(function* () {
-        const inner = yield* EventLog.EventLog;
-        return EventLog.EventLog.of({
+        const inner = yield* RunLog.RunLog;
+        return RunLog.RunLog.of({
           ...inner,
           append: (threadId, runId, event) => Effect.andThen(before(event), inner.append(threadId, runId, event)),
         });
       }),
-    ).pipe(Layer.provide(EventLog.layerMemory));
+    ).pipe(Layer.provide(RunLog.layerMemory));
 
-  const followLog = Effect.flatMap(EventLog.EventLog, (log) =>
+  const followLog = Effect.flatMap(RunLog.RunLog, (log) =>
     Stream.runCollect(Stream.unwrap(log.subscribe("t1", "r1"))).pipe(Effect.map((s) => s.map((e) => e.event))),
   );
 
@@ -2954,7 +2954,7 @@ describe("Runner tool progress", () => {
                 progressLayer().layer,
                 counterIds(),
                 serverStores,
-                EventLog.layerMemory,
+                RunLog.layerMemory,
                 WorkflowEngine.layerMemory,
               ),
             ),

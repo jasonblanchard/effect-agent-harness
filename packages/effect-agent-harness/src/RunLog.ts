@@ -9,12 +9,9 @@ export interface Stored {
   readonly event: AgUiSchema.Event;
 }
 
-export class EventLogError extends Schema.TaggedError<EventLogError, { readonly brand: unique symbol }>()(
-  "EventLogError",
-  {
-    cause: Schema.Defect(),
-  },
-) {}
+export class RunLogError extends Schema.TaggedError<RunLogError, { readonly brand: unique symbol }>()("RunLogError", {
+  cause: Schema.Defect(),
+}) {}
 
 /** A cursor the run's log never issued, such as a malformed or made-up `Last-Event-ID`. */
 export class InvalidCursor extends Schema.TaggedError<InvalidCursor, { readonly brand: unique symbol }>()(
@@ -32,11 +29,11 @@ export class InvalidCursor extends Schema.TaggedError<InvalidCursor, { readonly 
  * run id, because the client picks the run id: authorising the thread
  * authorises its runs.
  */
-export class EventLog extends Context.Service<
-  EventLog,
+export class RunLog extends Context.Service<
+  RunLog,
   {
     /** Stores the event and assigns it a cursor greater than every earlier one of the run. */
-    readonly append: (threadId: string, runId: string, event: AgUiSchema.Event) => Effect.Effect<Stored, EventLogError>;
+    readonly append: (threadId: string, runId: string, event: AgUiSchema.Event) => Effect.Effect<Stored, RunLogError>;
     /**
      * The run's events after `after` (all of them when omitted), in order;
      * empty for an unknown run. Fails with {@link InvalidCursor} if `after`
@@ -46,7 +43,7 @@ export class EventLog extends Context.Service<
       threadId: string,
       runId: string,
       after?: string,
-    ) => Effect.Effect<ReadonlyArray<Stored>, InvalidCursor | EventLogError>;
+    ) => Effect.Effect<ReadonlyArray<Stored>, InvalidCursor | RunLogError>;
     /**
      * The run's events after `after`, then every later event as it is
      * appended, each once. Completes after yielding a terminal event
@@ -61,11 +58,11 @@ export class EventLog extends Context.Service<
       threadId: string,
       runId: string,
       after?: string,
-    ) => Effect.Effect<Stream.Stream<Stored, EventLogError>, InvalidCursor | EventLogError>;
+    ) => Effect.Effect<Stream.Stream<Stored, RunLogError>, InvalidCursor | RunLogError>;
   }
->()("effect-agent-harness/EventLog") {}
+>()("effect-agent-harness/RunLog") {}
 
-interface RunLog {
+interface RunState {
   readonly events: Array<Stored>;
   readonly pubsub: PubSub.PubSub<Stored>;
 }
@@ -75,12 +72,12 @@ interface RunLog {
  * cursor is the event's zero-based index, written in decimal. For tests,
  * local development and examples.
  */
-export const layerMemory: Layer.Layer<EventLog> = Layer.sync(EventLog, () => {
-  const runs = new Map<string, RunLog>();
+export const layerMemory: Layer.Layer<RunLog> = Layer.sync(RunLog, () => {
+  const runs = new Map<string, RunState>();
   // JSON, so no choice of ids can make two keys collide.
   const key = (threadId: string, runId: string) => JSON.stringify([threadId, runId]);
 
-  const runLog = (runKey: string): Effect.Effect<RunLog> =>
+  const runState = (runKey: string): Effect.Effect<RunState> =>
     Effect.suspend(() => {
       const existing = runs.get(runKey);
       if (existing !== undefined) {
@@ -107,9 +104,9 @@ export const layerMemory: Layer.Layer<EventLog> = Layer.sync(EventLog, () => {
     return index >= 0 && index < events.length ? Effect.succeed(index + 1) : Effect.fail(new InvalidCursor({ cursor }));
   };
 
-  return EventLog.of({
+  return RunLog.of({
     append: (threadId, runId, event) =>
-      Effect.flatMap(runLog(key(threadId, runId)), (log) => {
+      Effect.flatMap(runState(key(threadId, runId)), (log) => {
         const stored = { cursor: String(log.events.length), event };
         log.events.push(stored);
         return Effect.as(PubSub.publish(log.pubsub, stored), stored);
@@ -121,7 +118,7 @@ export const layerMemory: Layer.Layer<EventLog> = Layer.sync(EventLog, () => {
       }),
     subscribe: (threadId, runId, cursor) =>
       Effect.gen(function* () {
-        const log = yield* runLog(key(threadId, runId));
+        const log = yield* runState(key(threadId, runId));
         // Checked now; cursors only grow, so it stays valid.
         const from = yield* start(log.events, cursor);
         return Stream.unwrap(

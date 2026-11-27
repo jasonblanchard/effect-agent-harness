@@ -16,7 +16,7 @@ import {
   HttpApiSecurity,
 } from "effect/http-api";
 import * as Agent from "../src/Agent.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
 import {
@@ -85,7 +85,7 @@ class TestApi extends HttpApi.make("test").add(
         params: RunIds,
         headers: { "last-event-id": Schema.optional(Schema.String) },
         success: HttpApiSchema.StreamSse({ events: StoredEvent }),
-        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+        error: RunLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
       }),
     )
     .middleware(Authentication),
@@ -118,7 +118,7 @@ const serve = (agent: Agent.Any, services: Layer.Layer<any>) => {
       const runAgent = Runner.makeAttached(agent);
       // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context -- `Agent.Any`, see `serve`.
       const detached = yield* Runner.makeDetached(agent, { dependencies: [Principal] });
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       return handlers
         .handle(
           "run",
@@ -127,7 +127,7 @@ const serve = (agent: Agent.Any, services: Layer.Layer<any>) => {
         .handle("start", ({ payload }) => detached.start(payload))
         .handle("events", ({ params, headers }) =>
           log.subscribe(params.threadId, params.runId, headers["last-event-id"]).pipe(
-            Effect.catchTag("EventLogError", Effect.die),
+            Effect.catchTag("RunLogError", Effect.die),
             Effect.map((events) =>
               events.pipe(
                 Stream.map(({ cursor, event }) => ({ id: cursor, event: "message", data: event })),
@@ -142,7 +142,7 @@ const serve = (agent: Agent.Any, services: Layer.Layer<any>) => {
     // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context -- `Agent.Any`, see `serve`.
     Layer.provide(handlers),
     Layer.provide(AuthenticationLayer),
-    Layer.provideMerge(Layer.mergeAll(services, EventLog.layerMemory)),
+    Layer.provideMerge(Layer.mergeAll(services, RunLog.layerMemory)),
     Layer.provide(HttpServer.layerServices),
   );
   const app = HttpRouter.toWebHandler(routes, { disableLogger: true });

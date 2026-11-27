@@ -5,7 +5,7 @@ import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 import { convertMessagesToModelMessages, modelMessagesToUIMessages } from "@tanstack/ai";
 import type { ModelMessage, SubagentPart, UIMessage } from "@tanstack/ai";
-import { Agent, Checkpoint, EventLog, History, Runner, Thread } from "effect-agent-harness";
+import { Agent, Checkpoint, RunLog, History, Runner, Thread } from "effect-agent-harness";
 import { SendEmail, sendEmail } from "../tools/email.tool.ts";
 import { SearchDocs, searchDocs } from "../tools/search-docs.tool.ts";
 import { GetWeather, getWeather } from "../tools/weather.tool.ts";
@@ -76,7 +76,7 @@ const ToolsLayer = AssistantToolkit.toLayer({
 const StoresLayer = Layer.mergeAll(
   History.layerServer.pipe(Layer.provideMerge(Thread.layerMemory)),
   Checkpoint.layerNone,
-  EventLog.layerMemory,
+  RunLog.layerMemory,
 );
 
 const ChatQuery = {
@@ -193,7 +193,7 @@ class ChatApi extends HttpApi.make("chat").add(
         query: ChatQuery,
         headers: ResumeHeaders,
         success: [Hydrate, RunEvents],
-        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+        error: RunLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
       }),
     )
     // POST /api/chat: TanStack AI's `fetchServerSentEvents` posts an AG-UI
@@ -207,7 +207,7 @@ class ChatApi extends HttpApi.make("chat").add(
         payload: AgUiSchema.RunAgentInput,
         headers: ResumeHeaders,
         success: RunEvents,
-        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+        error: RunLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
       }),
     )
     // POST /api/chat/cancel: the page's Stop button. TanStack AI's `stop()`
@@ -226,7 +226,7 @@ const ChatHandlers = HttpApiBuilder.group(
     // reloaded page or a second tab can follow it. A disconnect doesn't stop
     // it; only `detached.cancel` does (the cancel endpoint).
     const detached = yield* Runner.makeDetached(assistant);
-    const log = yield* EventLog.EventLog;
+    const log = yield* RunLog.RunLog;
 
     // A run's log as SSE, after `after`. A crashed run's log never ends, so the
     // stream ends once nothing has arrived for a while; the client reconnects
@@ -234,7 +234,7 @@ const ChatHandlers = HttpApiBuilder.group(
     // (500), and aborts a stream already going; an unissued cursor is a 400.
     const follow = (threadId: string, runId: string, after: string | undefined) =>
       log.subscribe(threadId, runId, after).pipe(
-        Effect.catchTag("EventLogError", Effect.die),
+        Effect.catchTag("RunLogError", Effect.die),
         Effect.map((events) =>
           HttpApiSchema.withHeaders({
             body: events.pipe(

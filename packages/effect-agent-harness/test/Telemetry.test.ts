@@ -6,7 +6,7 @@ import type { AgUiSchema } from "effect/ai";
 import type { Tracer } from "effect";
 import * as Agent from "../src/Agent.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as internal from "../src/internal/telemetry.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Telemetry from "../src/Telemetry.ts";
@@ -680,7 +680,7 @@ describe("per-run span attributes", () => {
         Effect.provide([scriptedModel([...weatherTurn, ...weatherTurn]).layer, WeatherToolkitLayer, tracer.layer]),
         Effect.provideService(Scope.Scope, yield* Scope.make()),
       );
-      const log = yield* EventLog.EventLog;
+      const log = yield* RunLog.RunLog;
       for (const [threadId, userId] of [
         ["t-ada", "ada"],
         ["t-grace", "grace"],
@@ -699,7 +699,7 @@ describe("per-run span attributes", () => {
           expect(attr(span, "user.id")).toBe(userId);
         }
       }
-    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, EventLog.layerMemory))),
+    }).pipe(Effect.provide(Layer.mergeAll(evalLayers, RunLog.layerMemory))),
   );
 });
 

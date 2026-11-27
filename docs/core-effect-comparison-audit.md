@@ -25,7 +25,7 @@ This audit asks, for each abstraction `effect-agent-harness` builds itself, whet
 | `Runner.makeWorkflow`, `Checkpoint.layerWorkflow`   | `effect/workflow` `Workflow`, `Activity`, `DurableDeferred`, `WorkflowEngine`     |
 | `Checkpoint.layerKeyValueStore`                     | `effect/persistence` `KeyValueStore`                                              |
 | Model span attributes                               | `effect/ai` `Telemetry.CurrentSpanTransformer` and its `gen_ai.*` attributes      |
-| `EventLog.layerMemory`                              | `PubSub`, `Stream`                                                                |
+| `RunLog.layerMemory`                                | `PubSub`, `Stream`                                                                |
 | Runner signals, timeouts, cancel polling            | `Deferred`, `Queue`, `Fiber`, `Schedule`, `Effect.race`                           |
 | Errors                                              | `Schema.TaggedError`                                                              |
 
@@ -63,12 +63,12 @@ A `Thread` adapter over `BackingPersistence` or `KeyValueStore` would be possibl
 
 The interface, `Checkpoint.memo`, is the harness's own, but every storage layer uses core Effect. `layerKeyValueStore` stores each step's `Exit` in `effect/persistence`'s `KeyValueStore`, which brings memory, file system, SQL and Web Storage backends. `layerWorkflow` wraps `effect/workflow` `Activity`. `layerNone` stores nothing.
 
-### `EventLog`: keep
+### `RunLog`: keep
 
 **Nearest core counterparts:** `effect/eventlog`, `PersistedQueue`.
 
-- **`effect/eventlog`** is a local-first, replicated, optionally encrypted journal of typed events with handlers and compaction. It has nothing to do with a per-run log of AG-UI events with cursors for SSE reconnects, despite the shared name.
-- **`PersistedQueue`** hands each item to one consumer, at least once. `EventLog.subscribe` gives every subscriber every event, in order, from a cursor.
+- **`effect/eventlog`** is a local-first, replicated, optionally encrypted journal of typed events with handlers and compaction. It has nothing to do with a per-run log of AG-UI events with cursors for SSE reconnects. The module was called `EventLog` until it was renamed to `RunLog` to avoid this name clash.
+- **`PersistedQueue`** hands each item to one consumer, at least once. `RunLog.subscribe` gives every subscriber every event, in order, from a cursor.
 
 ### `Runner`: keep
 
@@ -101,7 +101,7 @@ If `effect/ai` ever exports the first two, switch to the exported versions.
 ## Optional follow-ups
 
 1. **Tool-argument capture.** `Telemetry.layerCaptureContent` and `Toolkit.RecordToolArguments` both control `gen_ai.tool.call.arguments`, and both write it to the same `execute_tool` span. Either document that `layerCaptureContent` already covers it, or have `ContentCapture` read `RecordToolArguments` too, so users have one switch. This is low priority: turning both on just sets the same attribute twice.
-2. **SQL store layers.** `effect/sql` (`SqlClient`) would make it possible to ship `Thread.layerSql` and `EventLog.layerSql`. A conditional `UPDATE` would make `claim` atomic, which `KeyValueStore` can't do. These would be new layers rather than replacements, and only worth building if users ask for a ready-made durable backend.
+2. **SQL store layers.** `effect/sql` (`SqlClient`) would make it possible to ship `Thread.layerSql` and `RunLog.layerSql`. A conditional `UPDATE` would make `claim` atomic, which `KeyValueStore` can't do. These would be new layers rather than replacements, and only worth building if users ask for a ready-made durable backend.
 3. **Media in frontend tool results.** `answers` reduces a client `tool` message's content parts to text and logs a warning for the rest. `toPrompt` doesn't help here: it passes the content parts through as an unconverted result value. Supporting media in tool results would need its own design.
 
 ## Not relevant here

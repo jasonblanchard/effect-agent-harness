@@ -34,7 +34,7 @@ flowchart LR
   end
   subgraph Backend Adapters
     TH[("Thread · durable history<br/>Messages.Entry { id, runId?, subagentRunId?,<br/>message: Prompt.Message }")]
-    EL[("EventLog · per run<br/>EventLog.Stored { cursor, event: AgUiSchema.Event }")]
+    EL[("RunLog · per run<br/>RunLog.Stored { cursor, event: AgUiSchema.Event }")]
     CP[("Checkpoint · per step<br/>system → string<br/>model:n → Agent.ModelStep {assistant: Prompt.Prompt}<br/>tool:callId → Agent.ToolStep")]
   end
 
@@ -78,7 +78,7 @@ Each row is one moment, with time running down the table. A cell names what that
 | Tool call     | `c1`       |
 | Tool result   | `t1`       |
 
-The "AG-UI event" column is what the client receives. Detached and workflow runners also append each of those events to the run's `EventLog` with an increasing cursor, which is how a client reconnects. An attached runner streams them straight to the response. A system prompt given as an effect adds a `system` memo before step 1.
+The "AG-UI event" column is what the client receives. Detached and workflow runners also append each of those events to the run's `RunLog` with an increasing cursor, which is how a client reconnects. An attached runner streams them straight to the response. A system prompt given as an effect adds a `system` memo before step 1.
 
 **Open:** the runner starts the run and calls `History.beginAttempt`.
 
@@ -344,9 +344,9 @@ _`src/Thread.ts`._
 - **Why:** it is what a store learns through `runEnded` when a run ends. It gives the store a hook for compaction and bookkeeping without exposing the event stream to it.
 - **Workflows:** live run.
 
-#### `EventLog.Stored`
+#### `RunLog.Stored`
 
-_`src/EventLog.ts`._
+_`src/RunLog.ts`._
 
 - **Holds:** an `AgUiSchema.Event` and the cursor the log gave it, which is sent as the SSE `id`.
 - **Why:** it lets a client watch a run that outlives its request, and reconnect where it stopped. Only detached and workflow runners write it. It is not the history.
@@ -426,7 +426,7 @@ A client that lost its state reads the thread back.
 Detached and workflow runners only.
 
 1. `restore` with `rejoin` leaves out the active run's assistant entries and names that run in `activeRun`.
-2. The client subscribes to the run's `EventLog.Stored` [own] events, from the start or after its `Last-Event-ID`.
+2. The client subscribes to the run's `RunLog.Stored` [own] events, from the start or after its `Last-Event-ID`.
 3. Each message is seen once: older ones from the snapshot, and the active run's from the log.
 
 ### Crash recovery
@@ -461,7 +461,7 @@ An agent hands work to another agent through a tool call.
 | Response.AnyPart             |         ○         |       ○        |          |       ○       |         |        |                |     ○     |
 | Messages.Entry               |         ●         |       ○        |    ●     |       ●       |    ○    |   ○    |       ○        |     ●     |
 | Agent.RunOptions             |         ○         |       ○        |    ○     |       ○       |         |        |       ○        |     ○     |
-| EventLog.Stored              |                   |                |          |               |         |   ○    |       ●        |           |
+| RunLog.Stored                |                   |                |          |               |         |   ○    |       ●        |           |
 | ModelStep / ToolStep         |                   |                |    ●     |               |         |        |       ○        |     ●     |
 | History.Restored             |                   |                |          |               |    ●    |   ●    |                |           |
 
@@ -474,4 +474,4 @@ An agent hands work to another agent through a tool call.
 
 ---
 
-Source: `packages/effect-agent-harness/src` (`Messages`, `Agent`, `History`, `Thread`, `EventLog`, `Checkpoint`, `internal/conversions`, `internal/events`, `internal/hooks`, `internal/publish`), against `effect@4.1.4`.
+Source: `packages/effect-agent-harness/src` (`Messages`, `Agent`, `History`, `Thread`, `RunLog`, `Checkpoint`, `internal/conversions`, `internal/events`, `internal/hooks`, `internal/publish`), against `effect@4.1.4`.

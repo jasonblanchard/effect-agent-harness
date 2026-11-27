@@ -3,7 +3,7 @@ import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { AgUiSchema, AgUiServer, Toolkit } from "effect/ai";
 import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
-import { Agent, Checkpoint, EventLog, Runner, Telemetry } from "effect-agent-harness";
+import { Agent, Checkpoint, RunLog, Runner, Telemetry } from "effect-agent-harness";
 import { AuthContext, Authentication, AuthenticationLayer } from "./auth.ts";
 import { spanAttributes, TracingLayer } from "./telemetry.ts";
 import { SendEmail, sendEmail } from "./tools/email.tool.ts";
@@ -44,7 +44,7 @@ const ToolsLayer = AssistantToolkit.toLayer({ "get-weather": getWeather, "send-e
 // No thread store: the client owns the transcript and sends it whole with
 // every run (the default client history), so nothing is kept between runs but
 // the event log. Swap these for durable implementations in production.
-const StoresLayer = Layer.mergeAll(Checkpoint.layerNone, EventLog.layerMemory);
+const StoresLayer = Layer.mergeAll(Checkpoint.layerNone, RunLog.layerMemory);
 
 // -----------------------------------------------------------------------------
 // The API
@@ -94,7 +94,7 @@ export class AgentApi extends HttpApi.make("agent").add(
         success: HttpApiSchema.WithHeaders(HttpApiSchema.StreamSse({ events: StoredEvent }), {
           "cache-control": Schema.Literal("no-cache"),
         }),
-        error: EventLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
+        error: RunLog.InvalidCursor.pipe(HttpApiSchema.status(400)),
       }),
     )
     .middleware(Authentication),
@@ -117,7 +117,7 @@ const AgentHandlers = HttpApiBuilder.group(
         }),
       ),
     });
-    const log = yield* EventLog.EventLog;
+    const log = yield* RunLog.RunLog;
 
     return handlers
       .handle(
@@ -139,7 +139,7 @@ const AgentHandlers = HttpApiBuilder.group(
       .handle("events", ({ params, headers }) =>
         log.subscribe(params.threadId, params.runId, headers["last-event-id"]).pipe(
           // A store failure is the server's fault (500); an unissued cursor stays the client's (400).
-          Effect.catchTag("EventLogError", Effect.die),
+          Effect.catchTag("RunLogError", Effect.die),
           Effect.map((events) =>
             HttpApiSchema.withHeaders({
               // A store failure mid-stream aborts the response, as a failing body would.

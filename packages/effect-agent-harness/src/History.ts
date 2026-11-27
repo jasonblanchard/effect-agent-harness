@@ -92,7 +92,7 @@ export const layerServer: Layer.Layer<History, never, Thread.Thread> = Layer.eff
 
 export interface RestoreOptions {
   /**
-   * Set this only on a route that serves joins from the `EventLog`, which means
+   * Set this only on a route that serves joins from the `RunLog`, which means
    * runs started with `Runner.makeDetached` or `Runner.makeWorkflow`. `Runner.makeAttached` claims the thread but never
    * writes to the log, so a client told to join one of its runs waits for
    * events that never come.

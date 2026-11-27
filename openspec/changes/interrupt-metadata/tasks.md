@@ -11,7 +11,7 @@
 - [ ] 2.2 Hook returning metadata from the interrupt id and `runId`, with two pending approvals: each interrupt carries its own metadata, and the other fields equal the no-hook output
 - [ ] 2.3 Hook returning `undefined` for one interrupt: only the other carries `metadata`
 - [ ] 2.4 Throwing hook: no `RUN_ERROR`, that interrupt has no `metadata`, the outcome still lists every approval, and a warning is logged
-- [ ] 2.5 Detached run with the hook: the `RUN_FINISHED` read back from the `EventLog` carries the same `metadata` as the live event
+- [ ] 2.5 Detached run with the hook: the `RUN_FINISHED` read back from the `RunLog` carries the same `metadata` as the live event
 - [ ] 2.6 Resuming an interrupt that carried `metadata`, with extra fields on the resume entry, records the approval as usual
 - [ ] 2.7 Pass every event sequence the new tests produce through `verify`
 

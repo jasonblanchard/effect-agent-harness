@@ -57,7 +57,7 @@ This is a deliberate trade off between completeness and simplicity.
 - **History** - how messages state is prepared for a run. Choose between client authoritative history or server authoritative history.
 - **Thread** - abstract thread storage and lifecycle. Use the built ins or bring your own.
 - **Checkpoint** - captures moments of the agent lifecycle that you would journal in a durable compute log.
-- **EventLog** - Stream of AG-UI events. Use the built ins (ie SSE, in memory) or bring your own (durable streams). TODO: This one needs to be re-named due to name collision with Effect's EventLog. These are different.
+- **RunLog** - Stream of AG-UI events of each run. Use the built ins (ie SSE, in memory) or bring your own (durable streams). Not to be confused with Effect's `effect/eventlog`, an event-sourcing journal.
 
 Check out the [architecture](./docs/architecture.md) docs for more details.
 

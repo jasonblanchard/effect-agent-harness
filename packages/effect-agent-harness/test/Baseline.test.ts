@@ -9,7 +9,7 @@ import { KeyValueStore } from "effect/persistence";
 import type { AgUiSchema } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
-import * as EventLog from "../src/EventLog.ts";
+import * as RunLog from "../src/RunLog.ts";
 import * as Runner from "../src/Runner.ts";
 import {
   ApprovalToolkit,
@@ -273,7 +273,7 @@ describe("baseline: attached runs", () => {
 
 describe("baseline: detached runs", () => {
   const ledger = Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory));
-  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, EventLog.layerMemory);
+  const shared = () => Layer.mergeAll(ledger, counterIds(), serverStores, RunLog.layerMemory);
 
   const start = (scope: Scope.Scope, agent: Agent.Any, steps: ReadonlyArray<Step>, run: AgUiSchema.RunAgentInput) =>
     Effect.gen(function* () {
@@ -285,15 +285,15 @@ describe("baseline: detached runs", () => {
       return runner;
     });
 
-  const log = Effect.flatMap(EventLog.EventLog, (events) => events.read("t1", "r1"));
+  const log = Effect.flatMap(RunLog.RunLog, (events) => events.read("t1", "r1"));
   const waitFor = (predicate: (event: AgUiSchema.Event) => boolean) =>
-    Effect.flatMap(EventLog.EventLog, (events) =>
+    Effect.flatMap(RunLog.RunLog, (events) =>
       Stream.unwrap(events.subscribe("t1", "r1")).pipe(
         Stream.takeUntil((s) => predicate(s.event)),
         Stream.runDrain,
       ),
     );
-  const complete = Effect.flatMap(EventLog.EventLog, (events) =>
+  const complete = Effect.flatMap(RunLog.RunLog, (events) =>
     Stream.runCollect(Stream.unwrap(events.subscribe("t1", "r1"))).pipe(Effect.map((all) => all.map((s) => s.event))),
   );
 

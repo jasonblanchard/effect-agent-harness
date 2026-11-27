@@ -1,6 +1,6 @@
 ## Context
 
-`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `AgUiSchema.Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `makeAttached`/`make` stream it, and `makeDetached` and `makeWorkflow` publish it to the `EventLog`. `Interrupt.metadata` is already an optional, open `Metadata` (`Record<string, Schema.Json>`) in `AgUiSchema`, so the hook's values must be JSON; effect-agent-harness never sets it.
+`AgUi.fold` projects `Agent.Event`s onto AG-UI. On `Finished` with approvals pending, it builds one `AgUiSchema.Interrupt` per approval (`id` = approval id, `reason: "tool-approval"`, `toolCallId`, `message`, `responseSchema` = the `ApprovalResponse` JSON Schema) inside a `RUN_FINISHED` interrupt outcome. Every runner reaches the client through `fold`: `makeAttached`/`make` stream it, and `makeDetached` and `makeWorkflow` publish it to the `RunLog`. `Interrupt.metadata` is already an optional, open `Metadata` (`Record<string, Schema.Json>`) in `AgUiSchema`, so the hook's values must be JSON; effect-agent-harness never sets it.
 
 TanStack AI 1.0's client (read from the installed 1.0.0 source) treats an interrupt as resolvable only when `metadata["tanstack:interruptBinding"]` holds a binding of a version it knows. The minimal form is:
 

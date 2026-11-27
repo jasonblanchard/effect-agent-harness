@@ -2,7 +2,7 @@
 
 Effect-based AG-UI agent library. pnpm monorepo:
 
-- `packages/effect-agent-harness` — the library (`Agent`, `Messages`, `History`, `Thread`, `Checkpoint`, `EventLog`, `Runner`, `Telemetry` modules). Its only runtime dependency is `effect` (a peer dependency). The AG-UI protocol schemas and the HTTP endpoint come from `effect/ai` (`AgUiSchema`, `AgUiServer`); the library has no protocol schema or HTTP code of its own (it builds `HttpApiError.BadRequest` only because `AgUiServer.Agent`, which `Runner.toAgUiServerAgent` returns, requires it). See its `AGENTS.md`.
+- `packages/effect-agent-harness` — the library (`Agent`, `Messages`, `History`, `Thread`, `Checkpoint`, `RunLog`, `Runner`, `Telemetry` modules). Its only runtime dependency is `effect` (a peer dependency). The AG-UI protocol schemas and the HTTP endpoint come from `effect/ai` (`AgUiSchema`, `AgUiServer`); the library has no protocol schema or HTTP code of its own (it builds `HttpApiError.BadRequest` only because `AgUiServer.Agent`, which `Runner.toAgUiServerAgent` returns, requires it). See its `AGENTS.md`.
 - `packages/examples/ag-ui` — a runnable example wiring the library to Anthropic. See its `AGENTS.md`.
 - `packages/examples/tanstack` — a browser chat (TanStack Start + TanStack AI) on an effect-agent-harness backend. See its `AGENTS.md`.
 - `openspec/` — spec-driven change proposals (see "Planning changes" below).
