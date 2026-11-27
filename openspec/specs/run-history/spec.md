@@ -41,7 +41,7 @@ A workflow-backed run SHALL use the history provided where its workflow layer is
 Under the client history, the model prompt SHALL be the agent's system prompt followed by the input's `messages` that carry no `subagentRunId`, converted in order, with every tool result placed directly after the assistant message holding its tool call. Messages carrying a `subagentRunId` SHALL be converted the same way and kept as the named subagent's entries, which SHALL NOT be sent to the agent's model. The conversion SHALL be:
 - **`user` message with text:** a user message with that text.
 - **`assistant` message:** an assistant message with its text and its tool calls, each call's arguments decoded from JSON.
-- **`tool` message:** the result of the tool call named by its `toolCallId`. When the message has `error` set, the result SHALL be failed and hold the error text. Otherwise, string content that parses as JSON SHALL be the parsed value, any other string SHALL be itself, and a list of content parts SHALL be its `text` parts joined in order. When several tool messages answer the same call, the first SHALL be used.
+- **`tool` message:** the result of the tool call named by its `toolCallId`. When the message has `error` set, the result SHALL be failed and hold the error text. Otherwise, string content that parses as JSON SHALL be the parsed value, any other string SHALL be itself, and a list of content parts SHALL be its `text` parts joined in order; that result SHALL be failed when the message's metadata carries `effect/ai`'s failure marker (see the agui-agent-loop requirement "Failed tool results are marked"). When several tool messages answer the same call, the first SHALL be used.
 - **`system`/`developer` message:** a system message only when the runner is configured to allow client system messages, and dropped otherwise.
 - **Any other message,** including a `user` message without text: dropped.
 
@@ -78,6 +78,10 @@ The run SHALL NOT reject the history for differing from what an earlier run prod
 #### Scenario: Child messages sent back
 - **WHEN** the input holds a `researcher` call, the child's assistant and tool messages tagged with its `subagentRunId`, the call's tool message and a new user message
 - **THEN** the model receives the call, its result and the new user message, and none of the child's messages
+
+#### Scenario: Failure marker without an error
+- **WHEN** the input holds a `get-weather` call and a tool message for it with content `"Unknown location"` and `metadata["effect/ai"]` `{ "isFailure": true }`, and no `error`
+- **THEN** the model receives the call followed by a failed result holding "Unknown location"
 
 ### Requirement: Unusable client messages are dropped with a warning
 Under the client history, the run SHALL drop, rather than reject:

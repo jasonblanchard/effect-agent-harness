@@ -16,15 +16,19 @@ import {
   Stream,
   Tracer,
 } from "effect";
-import { AgUiSchema, Prompt } from "effect/ai";
+import { AgUiSchema, AgUiServer, Prompt } from "effect/ai";
+import { HttpApiError } from "effect/http-api";
 import type { Tool } from "effect/ai";
 import { DurableDeferred, Workflow, WorkflowEngine } from "effect/workflow";
 import * as Agent from "./Agent.ts";
-import * as AgUi from "./AgUi.ts";
 import * as Checkpoint from "./Checkpoint.ts";
 import * as EventLog from "./EventLog.ts";
 import * as History from "./History.ts";
+import * as Events from "./internal/events.ts";
 import * as internal from "./internal/history.ts";
+import { OnRunFailed, OnStepFinished, reportFailure } from "./internal/hooks.ts";
+import { closeOpen, conflateActivity, publish } from "./internal/publish.ts";
+import { conflictingTool } from "./internal/tools.ts";
 import * as internalTelemetry from "./internal/telemetry.ts";
 import * as Messages from "./Messages.ts";
 import * as Telemetry from "./Telemetry.ts";
@@ -175,16 +179,6 @@ export class RunInputMismatch extends Schema.TaggedError<RunInputMismatch, { rea
 
 const InputJson = Schema.toCodecJson(AgUiSchema.RunAgentInput);
 
-/**
- * A tool the client advertised, as the agent offers it. AG-UI leaves `parameters` optional, and the agent passes
- * the schema to the model as given, so a tool without one takes no arguments.
- */
-const frontendTool = (tool: AgUiSchema.Tool): Agent.FrontendTool => ({
-  name: tool.name,
-  description: tool.description,
-  parameters: tool.parameters ?? { type: "object", properties: {} },
-});
-
 /** What names a run to cancel: a cancel route has only the ids, not the input. */
 export interface RunIds {
   readonly threadId: string;
@@ -194,14 +188,20 @@ export interface RunIds {
 /** A run's key. JSON, so no choice of ids can make two keys collide. */
 const runKey = (run: RunIds): string => JSON.stringify([run.threadId, run.runId]);
 
-/** Ends the stream with a `Failed` event instead of failing it. Interruption passes through. */
-const failInBand = <R>(stream: Stream.Stream<Agent.Event, unknown, R>): Stream.Stream<Agent.Event, never, R> =>
-  Stream.catchCause(stream, (cause) =>
-    Cause.hasInterruptsOnly(cause)
-      ? // An interrupt-only cause has no failures, so its error type is irrelevant.
-        Stream.failCause(cause as Cause.Cause<never>)
-      : Stream.make(internal.failed(cause)),
-  );
+/**
+ * Ends the stream with `RUN_ERROR` instead of failing it, reporting the cause to `OnRunFailed` as the agent's run
+ * reports its own. Interruption passes through.
+ */
+const failInBand = <R>(
+  stream: Stream.Stream<AgUiSchema.Event, unknown, R>,
+): Stream.Stream<AgUiSchema.Event, never, R> =>
+  Stream.catchCause(stream, (cause) => {
+    if (Cause.hasInterruptsOnly(cause)) {
+      // An interrupt-only cause has no failures, so its error type is irrelevant.
+      return Stream.failCause(cause as Cause.Cause<never>);
+    }
+    return Stream.fromEffect(Effect.as(reportFailure(cause), internal.failed(cause)));
+  });
 
 /**
  * Builds the per-run layer, which reads the per-run dependencies from the
@@ -236,13 +236,14 @@ const currentHistory: Effect.Effect<internal.Service> = Effect.map(
  *    and loaded thread plus what the client may add to it;
  * 4. project those entries, memoised as the `prompt` checkpoint so a resumed
  *    run uses the projection the crashed attempt used;
- * 5. run the agent with the run's info (the input's ids and `forwardedProps`),
- *    the client's frontend tools and the per-run services, handing each
- *    step's entries to the history as it finishes;
+ * 5. run the agent on the input and the per-run services, which hands each
+ *    step's entries to the history as it finishes, before the step's
+ *    `STEP_FINISHED`;
  * 6. hand the terminal event to the history, however the run ended, before
  *    it is emitted (the server history reports the end and releases the
  *    thread there, so the client's next run finds it free);
- * 7. project the events onto AG-UI.
+ * 7. publish the events: replayed work an earlier attempt already published
+ *    is dropped, and the library's markers are removed.
  *
  * Every checkpoint is scoped by the thread id as well as the run id, so a run
  * id the client reuses on another thread replays nothing.
@@ -264,12 +265,12 @@ const agUiRun =
     input: AgUiSchema.RunAgentInput,
     how?: {
       /** The log of an earlier attempt this one completes. */
-      readonly resumed?: ReadonlyArray<AgUi.Event> | undefined;
+      readonly resumed?: ReadonlyArray<AgUiSchema.Event> | undefined;
       /** The run's cancel signal (`Agent.RunInput.cancelled`). */
       readonly cancelled?: Effect.Effect<void> | undefined;
     },
   ): Stream.Stream<
-    AgUi.Event,
+    AgUiSchema.Event,
     never,
     Requirements<Tools, R, Dependencies, ROut, RIn> | DependencyServices<Dependencies>
   > => {
@@ -295,31 +296,36 @@ const agUiRun =
           );
 
           return Agent.run(agent, {
-            runId,
-            threadId,
-            props: input.forwardedProps,
+            input,
             prompt: prompt.value,
-            frontendTools: input.tools.map(frontendTool),
             subagentPrompts: subagentPrompts.value,
             cancelled: how?.cancelled,
           }).pipe(
+            // The attempt's own `RUN_STARTED` goes out first, before anything that can fail.
+            Stream.filter((event) => event.type !== "RUN_STARTED"),
+            // The run commits each step itself, before the step's `STEP_FINISHED`.
+            Stream.provideService(OnStepFinished, attempt.commit),
             // The run's events queue up here while a slow consumer (an event log append) holds the pipeline, so
-            // this is where superseded progress is dropped: before the commits, which must not run ahead of it.
-            AgUi.conflateProgress,
-            Stream.tap((event) => (event._tag === "StepFinished" ? attempt.commit(event.entries) : Effect.void)),
+            // this is where superseded progress is dropped.
+            conflateActivity,
           );
         }),
       ).pipe(
         failInBand,
         // After the catch, so a run that failed anywhere above is reported too.
-        Stream.mapEffect((event) =>
-          event._tag === "Finished" || event._tag === "Failed" ? attempt.end(event) : Effect.succeed(event),
+        Stream.mapEffect((event): Effect.Effect<AgUiSchema.Event> =>
+          Events.isTerminal(event) ? attempt.end(event) : Effect.succeed(event),
         ),
       );
 
     // The per-run layer's scope is this stream's: it closes when the attempt ends.
     const events = Stream.unwrap(
       Effect.gen(function* () {
+        // Refused before anything is stored, so the client can retry the same run id with its tools renamed.
+        const conflict = conflictingTool(agent, input.tools);
+        if (conflict !== undefined) {
+          return yield* new Agent.FrontendToolConflict({ toolName: conflict });
+        }
         const services = yield* resolveServices(options);
         const checkpoint = yield* Checkpoint.Checkpoint;
         const fingerprint = JSON.stringify(yield* Effect.orDie(Schema.encodeEffect(InputJson)(input)));
@@ -344,7 +350,7 @@ const agUiRun =
       }),
     ).pipe(failInBand);
     return traced(agent, input, (onFailed) =>
-      AgUi.fold(input, { resumed: how?.resumed })(Stream.tap(events, onFailed)),
+      publish(how?.resumed)(Stream.prepend(Stream.tap(events, onFailed), [Events.runStarted(input)])),
     );
   };
 
@@ -352,14 +358,15 @@ const agUiRun =
  * Runs an attempt under its root span: `invoke_agent {name}`, in a new trace
  * linked to the caller's span, so a backend sees the run as its own GenAI
  * trace. The event stream never fails, so the span's outcome is set from the
- * `Failed` event (`error.type` and a failed exit) rather than from the
- * stream's exit.
+ * `RUN_ERROR` event (`error.type` from its code) and the cause reported to
+ * `OnRunFailed` (the exit the span ends with), rather than from the stream's
+ * exit. The exporter records that cause as the span's one `exception` event.
  */
 const traced = <R>(
   agent: Agent.Agent<any, any>,
   input: AgUiSchema.RunAgentInput,
-  run: (onFailed: (event: Agent.Event) => Effect.Effect<void>) => Stream.Stream<AgUi.Event, never, R>,
-): Stream.Stream<AgUi.Event, never, R> =>
+  run: (onFailed: (event: AgUiSchema.Event) => Effect.Effect<void>) => Stream.Stream<AgUiSchema.Event, never, R>,
+): Stream.Stream<AgUiSchema.Event, never, R> =>
   Stream.unwrap(
     Effect.gen(function* () {
       const caller = yield* Effect.option(Effect.currentParentSpan);
@@ -378,21 +385,31 @@ const traced = <R>(
           [Attr.runId]: input.runId,
         },
       });
-      let failed: Extract<Agent.Event, { _tag: "Failed" }> | undefined;
-      const onFailed = (event: Agent.Event) =>
+      let failed: AgUiSchema.RunErrorEvent | undefined;
+      let failure: Cause.Cause<unknown> | undefined;
+      const onFailed = (event: AgUiSchema.Event) =>
         Effect.sync(() => {
-          if (event._tag === "Failed") {
+          if (event.type === "RUN_ERROR") {
             failed = event;
           }
         });
 
       return run(onFailed).pipe(
+        // Every failure that ends the run in `RUN_ERROR` is reported here first, with its original cause.
+        Stream.provideService(OnRunFailed, (cause) =>
+          Effect.andThen(
+            Effect.sync(() => {
+              failure = cause;
+            }),
+            Effect.logError("effect-agent-harness: the run failed", cause),
+          ),
+        ),
         Stream.provideService(Tracer.ParentSpan, span),
         Stream.onExit((exit) =>
           Effect.map(Clock.currentTimeNanos, (now) => {
-            if (failed !== undefined && Exit.isSuccess(exit)) {
+            if (failed !== undefined && failure !== undefined && Exit.isSuccess(exit)) {
               span.attribute(Attr.errorType, failed.code ?? "Error");
-              span.end(now, Exit.fail(failed.error));
+              span.end(now, Exit.failCause(failure));
             } else {
               span.end(now, exit);
             }
@@ -432,7 +449,7 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
   const runWith = agUiRun<Tools, R, readonly [], ROut, E, RIn>(agent, options);
   return (
     input: AgUiSchema.RunAgentInput,
-  ): Stream.Stream<AgUi.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
+  ): Stream.Stream<AgUiSchema.Event, never, Requirements<Tools, R, readonly [], ROut, RIn>> =>
     Stream.unwrap(
       Effect.gen(function* () {
         // The run is forked and read through a queue, so a consumer that stops early cancels it instead of
@@ -442,7 +459,7 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
         // scope, whose own finalizer would wait for the fiber however long it took: the finalizer below
         // owns its lifetime.
         const cancel = yield* Deferred.make<void>();
-        const queue = yield* Queue.unbounded<AgUi.Event, Cause.Done>();
+        const queue = yield* Queue.unbounded<AgUiSchema.Event, Cause.Done>();
         // A run that doesn't end in time (a hung store, a long uninterruptible handler) is interrupted
         // without waiting for it, and the history releases what it holds without reporting an end, so a
         // disconnect can't hold the request, or a shutdown, for longer than `cancelTimeout`. An
@@ -465,9 +482,41 @@ export const makeAttached = <Tools extends Record<string, Tool.Any>, R, ROut = n
             }),
         );
         // The run drains into the queue at once, so a slow consumer's backlog is here.
-        return AgUi.conflateActivity(Stream.fromQueue(queue));
+        return conflateActivity(Stream.fromQueue(queue));
       }),
     );
+};
+
+/**
+ * Adapts an agent to `effect/ai`'s `AgUiServer.Agent`, so it can be served
+ * wherever `effect/ai`'s own `AgUiServer.agent(...)` is:
+ * `AgUiServer.layerHttp({ path, agent })` or `AgUiServer.agentHandler(agent)`.
+ *
+ * Not a runner of its own: every run is a {@link makeAttached} run with these
+ * `options`, cancelled when its client disconnects. What it adds is the check
+ * `effect/ai`'s agent makes before the event stream opens: an input whose
+ * frontend tools reuse the name of one of the agent's tools or subagents is
+ * rejected with `HttpApiError.BadRequest`, which the endpoint answers with
+ * status 400 (a run started any other way ends with `RUN_ERROR` code
+ * `FrontendToolConflict` instead).
+ *
+ * `AgUiServer.agentHandler` captures its services once, when the route is
+ * built, so a run served this way sees only those, never what middleware
+ * provides per request, such as an authenticated principal. For per-request
+ * services, serve {@link makeAttached} through `AgUiServer.endpoint` and
+ * `AgUiServer.handler((input) => run(input))`.
+ */
+export const toAgUiServerAgent = <Tools extends Record<string, Tool.Any>, R, ROut = never, E = never, RIn = never>(
+  agent: Agent.Agent<Tools, R>,
+  options?: AttachedOptions<ROut, E, RIn>,
+): AgUiServer.Agent<Requirements<Tools, R, readonly [], ROut, RIn>> => {
+  const run = makeAttached(agent, options);
+  return {
+    run: (input) =>
+      conflictingTool(agent, input.tools) !== undefined
+        ? Effect.fail(new HttpApiError.BadRequest({}))
+        : Effect.succeed(run(input)),
+  };
 };
 
 /**
@@ -494,16 +543,16 @@ const detached =
     const runWith = agUiRun<Tools, R, Dependencies, ROut, E, RIn>(agent, options);
     return Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      const append = (event: AgUi.Event) => log.append(input.threadId, input.runId, event);
+      const append = (event: AgUiSchema.Event) => log.append(input.threadId, input.runId, event);
       // Without a cursor, the read cannot fail with `InvalidCursor`.
       const history = (yield* log
         .read(input.threadId, input.runId)
         .pipe(Effect.catchTag("InvalidCursor", Effect.die))).map((stored) => stored.event);
       const last = history.at(-1);
-      if (last !== undefined && AgUi.isTerminal(last)) {
+      if (last !== undefined && Events.isTerminal(last)) {
         return;
       }
-      yield* Effect.forEach(AgUi.closeOpen(history), append, { discard: true });
+      yield* Effect.forEach(closeOpen(history), append, { discard: true });
       const events =
         history.length === 0
           ? runWith(input, { cancelled })
@@ -580,7 +629,7 @@ export const makeDetached = <
             Effect.map((stored) => stored.at(-1)),
             Effect.onError(() => (earlier === undefined ? forget : Effect.void)),
           );
-          if (last !== undefined && AgUi.isTerminal(last.event)) {
+          if (last !== undefined && Events.isTerminal(last.event)) {
             return yield* forget;
           }
           // Read now, so the forked run has the dependencies its caller provided.

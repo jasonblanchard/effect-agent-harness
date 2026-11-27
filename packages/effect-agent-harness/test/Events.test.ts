@@ -3,8 +3,9 @@ import { Effect, Exit, Schema, Stream } from "effect";
 import { AgUiSchema, AiError, Prompt } from "effect/ai";
 import type { Response } from "effect/ai";
 import * as Agent from "../src/Agent.ts";
-import * as AgUi from "../src/AgUi.ts";
+import * as Events from "../src/internal/events.ts";
 import {
+  agentRun,
   ApprovalToolkit,
   countingApprovalLayer,
   evalLayers,
@@ -19,6 +20,7 @@ import {
   type Step,
   text,
   toolCall,
+  types,
   verify,
   wholeReasoning,
 } from "./fixtures.ts";
@@ -115,14 +117,14 @@ describe("AgUiSchema.RunAgentInput", () => {
   );
 });
 
-describe("AgUi events", () => {
+describe("event builders", () => {
   it("builds step events and an interrupt outcome the client accepts", async () => {
     const input = { threadId: "t1", runId: "r1" };
-    const events: Array<AgUi.Event> = [
-      AgUi.runStarted(input),
-      AgUi.stepStarted("step-1"),
-      AgUi.stepFinished("step-1"),
-      AgUi.runInterrupted(input, [{ id: "a1", reason: "tool-approval", toolCallId: "c1" }]),
+    const events: Array<AgUiSchema.Event> = [
+      Events.runStarted(input),
+      Events.stepStarted("step-1"),
+      Events.stepFinished("step-1"),
+      Events.runInterrupted(input, [{ id: "a1", reason: "tool-approval", toolCallId: "c1" }]),
     ];
     await verify(events);
     expect(events.at(-1)).toEqual({
@@ -134,7 +136,7 @@ describe("AgUi events", () => {
   });
 
   it("builds the approval interrupt for a tool call", () => {
-    expect(AgUi.approvalInterrupt({ approvalId: "a1", toolCallId: "c1", toolName: "send-email" })).toEqual({
+    expect(Events.approvalInterrupt({ approvalId: "a1", toolCallId: "c1", toolName: "send-email" })).toEqual({
       id: "a1",
       reason: "tool-approval",
       toolCallId: "c1",
@@ -145,26 +147,23 @@ describe("AgUi events", () => {
 });
 
 // -----------------------------------------------------------------------------
-// fold
+// The events a run emits
 // -----------------------------------------------------------------------------
 
 const agent = Agent.define({ toolkit: ApprovalToolkit });
 const prompt = Prompt.make([{ role: "user", content: "What is the weather in Paris?" }]);
 
-/** Runs the core on a scripted model and projects it onto AG-UI; every sequence is verified. */
-const foldRun = (steps: ReadonlyArray<Step>, frontendTools?: ReadonlyArray<Agent.FrontendTool>) =>
+/** Runs the agent on a scripted model; every sequence is verified. */
+const foldRun = (steps: ReadonlyArray<Step>, tools?: ReadonlyArray<AgUiSchema.Tool>) =>
   Effect.gen(function* () {
     const model = scriptedModel(steps);
-    const events = yield* Agent.run(agent, { runId: "r1", threadId: "t1", prompt, frontendTools }).pipe(
-      AgUi.fold({ threadId: "t1", runId: "r1" }),
+    const events = yield* agentRun(agent, { prompt, input: { tools: [...(tools ?? [])] } }).pipe(
       Stream.runCollect,
       Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers]),
     );
     yield* Effect.promise(() => verify(events));
     return Array.from(events);
   });
-
-const types = (events: ReadonlyArray<AgUi.Event>) => events.map((event) => event.type);
 
 const modelFailure = AiError.make({
   module: "Test",
@@ -175,7 +174,7 @@ const modelFailure = AiError.make({
 describe("verify", () => {
   it("rejects an event the AG-UI schema does not declare", async () => {
     await expect(
-      verify([{ ...AgUi.runStarted({ threadId: "t1", runId: "r1" }), extra: true } as AgUi.Event]),
+      verify([{ ...Events.runStarted({ threadId: "t1", runId: "r1" }), extra: true } as AgUiSchema.Event]),
     ).rejects.toThrow(/extra/);
   });
 
@@ -190,7 +189,7 @@ describe("verify", () => {
   });
 });
 
-describe("AgUi.fold", () => {
+describe("Agent.run events", () => {
   it.effect("projects a text-only reply", () =>
     Effect.gen(function* () {
       const events = yield* foldRun([[...text("0", "Hel", "lo"), finish("stop")]]);
@@ -237,10 +236,10 @@ describe("AgUi.fold", () => {
         "RUN_FINISHED",
       ]);
       expect(events.filter((e) => e.type === "STEP_STARTED" || e.type === "STEP_FINISHED")).toEqual([
-        AgUi.stepStarted("step-1"),
-        AgUi.stepFinished("step-1"),
-        AgUi.stepStarted("step-2"),
-        AgUi.stepFinished("step-2"),
+        Events.stepStarted("step-1"),
+        Events.stepFinished("step-1"),
+        Events.stepStarted("step-2"),
+        Events.stepFinished("step-2"),
       ]);
       const toolStart = events.find((e) => e.type === "TOOL_CALL_START");
       expect(toolStart).toEqual({
@@ -454,19 +453,19 @@ describe("AgUi.fold", () => {
   );
 });
 
-describe("AgUi.fold reasoning", () => {
-  const block = (messageId: string, ...deltas: ReadonlyArray<string>): ReadonlyArray<AgUi.Event> => [
-    AgUi.reasoningStart(messageId),
-    AgUi.reasoningMessageStart(messageId),
-    ...deltas.map((delta) => AgUi.reasoningMessageContent(messageId, delta)),
-    AgUi.reasoningMessageEnd(messageId),
-    AgUi.reasoningEnd(messageId),
+describe("Agent.run reasoning events", () => {
+  const block = (messageId: string, ...deltas: ReadonlyArray<string>): ReadonlyArray<AgUiSchema.Event> => [
+    Events.reasoningStart(messageId),
+    Events.reasoningMessageStart(messageId),
+    ...deltas.map((delta) => Events.reasoningMessageContent(messageId, delta)),
+    Events.reasoningMessageEnd(messageId),
+    Events.reasoningEnd(messageId),
   ];
-  const first = AgUi.reasoningMessageId("id-1", 0);
-  const second = AgUi.reasoningMessageId("id-1", 1);
+  const first = Events.reasoningMessageId("id-1", 0);
+  const second = Events.reasoningMessageId("id-1", 1);
 
   /** The events of one step's parts, without the run and step events around them. */
-  const stepEvents = (events: ReadonlyArray<AgUi.Event>) => events.slice(2, -2);
+  const stepEvents = (events: ReadonlyArray<AgUiSchema.Event>) => events.slice(2, -2);
 
   it.effect("streams a reasoning block before the reply, span and message sharing an id", () =>
     Effect.gen(function* () {
@@ -478,37 +477,21 @@ describe("AgUi.fold reasoning", () => {
         { type: "REASONING_MESSAGE_CONTENT", messageId: first, delta: " me think" },
         { type: "REASONING_MESSAGE_END", messageId: first },
         { type: "REASONING_END", messageId: first },
-        AgUi.textMessageStart("id-1"),
-        AgUi.textMessageContent("id-1", "Hi"),
-        AgUi.textMessageEnd("id-1"),
+        Events.textMessageStart("id-1"),
+        Events.textMessageContent("id-1", "Hi"),
+        Events.textMessageEnd("id-1"),
       ]);
     }),
   );
 
-  it.effect("emits a block delivered whole with one content event", () =>
-    Effect.gen(function* () {
-      const part = (part: Response.AnyPart): Agent.Event => ({
-        _tag: "ModelPart",
-        step: 1,
-        messageId: "m1",
-        part,
-        replayed: false,
-      });
-      const input = { threadId: "t1", runId: "r1" };
-      const events = Array.from(
-        yield* Stream.fromIterable<Agent.Event>([
-          { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
-          // No text, so nothing shows, but it takes its place among the step's blocks.
-          part(wholeReasoning("")),
-          part(wholeReasoning("Done thinking")),
-          { _tag: "StepFinished", step: 1, entries: [], replayed: false },
-          { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
-        ]).pipe(AgUi.fold(input), Stream.runCollect),
-      );
-      yield* Effect.promise(() => verify(events));
-      expect(stepEvents(events)).toEqual(block(AgUi.reasoningMessageId("m1", 1), "Done thinking"));
-    }),
-  );
+  it("emits a block delivered whole with one content event", () => {
+    const emitter = new Events.StepEmitter("m1");
+    // No text, so nothing shows, but it takes its place among the step's blocks.
+    expect(emitter.part(wholeReasoning(""))).toEqual([]);
+    expect(emitter.part(wholeReasoning("Done thinking"))).toEqual(
+      block(Events.reasoningMessageId("m1", 1), "Done thinking"),
+    );
+  });
 
   it.effect("emits nothing for a block with no text, and never a signature", () =>
     Effect.gen(function* () {
@@ -539,9 +522,9 @@ describe("AgUi.fold reasoning", () => {
       ]);
       expect(stepEvents(events)).toEqual([
         ...block(first, "a"),
-        AgUi.textMessageStart("id-1"),
-        AgUi.textMessageContent("id-1", "Hi"),
-        AgUi.textMessageEnd("id-1"),
+        Events.textMessageStart("id-1"),
+        Events.textMessageContent("id-1", "Hi"),
+        Events.textMessageEnd("id-1"),
         ...block(second, "b"),
       ]);
       expect(first).not.toBe(second);
@@ -557,7 +540,7 @@ describe("AgUi.fold reasoning", () => {
       ]);
       expect(events.flatMap((e) => (e.type === "REASONING_START" ? [e.messageId] : []))).toEqual([
         first,
-        AgUi.reasoningMessageId("id-3", 0),
+        Events.reasoningMessageId("id-3", 0),
       ]);
     }),
   );
@@ -655,78 +638,13 @@ describe("AgUi.fold reasoning", () => {
   );
 });
 
-describe("AgUi.closeOpen", () => {
-  it("closes the spans an aborted attempt left open", async () => {
-    const input = { threadId: "t1", runId: "r1" };
-    const history: Array<AgUi.Event> = [
-      AgUi.runStarted(input),
-      AgUi.stepStarted("step-1"),
-      AgUi.textMessageStart("m1"),
-      AgUi.textMessageContent("m1", "a"),
-      AgUi.toolCallStart("c1", "get-weather", "m1"),
-    ];
-    const closers = AgUi.closeOpen(history);
-    expect(closers).toEqual([AgUi.textMessageEnd("m1"), AgUi.toolCallEnd("c1"), AgUi.stepFinished("step-1")]);
-    await verify([...history, ...closers, AgUi.runFinished(input)]);
-    expect(AgUi.closeOpen([...history, ...closers])).toEqual([]);
-  });
-
-  it("closes a reasoning message and its span, after text and before tool calls", async () => {
-    const input = { threadId: "t1", runId: "r1" };
-    const history: Array<AgUi.Event> = [
-      AgUi.runStarted(input),
-      AgUi.stepStarted("step-1"),
-      AgUi.textMessageStart("m1"),
-      AgUi.reasoningStart("b1"),
-      AgUi.reasoningMessageStart("b1"),
-      AgUi.reasoningMessageContent("b1", "a"),
-      AgUi.toolCallStart("c1", "get-weather", "m1"),
-    ];
-    const closers = AgUi.closeOpen(history);
-    expect(closers).toEqual([
-      AgUi.textMessageEnd("m1"),
-      AgUi.reasoningMessageEnd("b1"),
-      AgUi.reasoningEnd("b1"),
-      AgUi.toolCallEnd("c1"),
-      AgUi.stepFinished("step-1"),
-    ]);
-    await verify([...history, ...closers, AgUi.runFinished(input)]);
-    expect(AgUi.closeOpen([...history, ...closers])).toEqual([]);
-  });
-
-  it("closes only the span of a log that stops between a block's two starts", async () => {
-    const input = { threadId: "t1", runId: "r1" };
-    const history: Array<AgUi.Event> = [AgUi.runStarted(input), AgUi.stepStarted("step-1"), AgUi.reasoningStart("b1")];
-    const closers = AgUi.closeOpen(history);
-    expect(closers).toEqual([AgUi.reasoningEnd("b1"), AgUi.stepFinished("step-1")]);
-    await verify([...history, ...closers, AgUi.runFinished(input)]);
-  });
-
-  it("closes only the span of a log that stops between a block's two ends", async () => {
-    const input = { threadId: "t1", runId: "r1" };
-    const history: Array<AgUi.Event> = [
-      AgUi.runStarted(input),
-      AgUi.stepStarted("step-1"),
-      AgUi.reasoningStart("b1"),
-      AgUi.reasoningMessageStart("b1"),
-      AgUi.reasoningMessageContent("b1", "a"),
-      AgUi.reasoningMessageEnd("b1"),
-    ];
-    const closers = AgUi.closeOpen(history);
-    expect(closers).toEqual([AgUi.reasoningEnd("b1"), AgUi.stepFinished("step-1")]);
-    await verify([...history, ...closers, AgUi.runFinished(input)]);
-  });
-});
-
-describe("AgUi.fold tool progress", () => {
+describe("Agent.run tool progress events", () => {
   const progressAgent = Agent.define({ toolkit: ProgressToolkit });
-  const input = { threadId: "t1", runId: "r1" };
 
-  /** Runs the progress agent on a scripted model and projects it onto AG-UI; every sequence is verified. */
+  /** Runs the progress agent on a scripted model; every sequence is verified. */
   const foldProgress = (steps: ReadonlyArray<Step>) =>
     Effect.gen(function* () {
-      const events = yield* Agent.run(progressAgent, { runId: "r1", threadId: "t1", prompt }).pipe(
-        AgUi.fold(input),
+      const events = yield* agentRun(progressAgent, { prompt }).pipe(
         Stream.runCollect,
         Effect.provide([scriptedModel(steps).layer, progressLayer().layer, evalLayers]),
       );
@@ -734,26 +652,8 @@ describe("AgUi.fold tool progress", () => {
       return Array.from(events);
     });
 
-  const snapshots = (events: ReadonlyArray<AgUi.Event>) =>
+  const snapshots = (events: ReadonlyArray<AgUiSchema.Event>) =>
     events.filter((e): e is AgUiSchema.ActivitySnapshotEvent => e.type === "ACTIVITY_SNAPSHOT");
-
-  /** Projects synthetic agent events, verifying the sequence. */
-  const foldEvents = (events: ReadonlyArray<Agent.Event>) =>
-    Effect.gen(function* () {
-      const folded = Array.from(yield* Stream.fromIterable(events).pipe(AgUi.fold(input), Stream.runCollect));
-      yield* Effect.promise(() => verify(folded));
-      return folded;
-    });
-
-  const progress = (step: number, messageId: string | undefined, toolCallId: string, value: unknown): Agent.Event => ({
-    _tag: "ToolProgress",
-    step,
-    messageId,
-    toolCallId,
-    toolName: "search",
-    encodedValue: value,
-    replayed: false,
-  });
 
   it.effect("streams progress as activity snapshots between the call's end and its result", () =>
     Effect.gen(function* () {
@@ -816,117 +716,63 @@ describe("AgUi.fold tool progress", () => {
     }),
   );
 
-  it.effect("gives a call id the provider reuses in a later step a different activity id", () =>
-    Effect.gen(function* () {
-      const events = yield* foldEvents([
-        { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
-        progress(1, "m1", "c1", { done: 1 }),
-        { _tag: "StepFinished", step: 1, entries: [], replayed: false },
-        { _tag: "StepStarted", step: 3, messageId: "m3", replayed: false },
-        progress(3, "m3", "c1", { done: 1 }),
-        { _tag: "StepFinished", step: 3, entries: [], replayed: false },
-        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
-      ]);
-      const [first, second] = snapshots(events);
-      expect(first!.messageId).not.toBe(second!.messageId);
-    }),
-  );
+  it("gives a call id the provider reuses in a later step a different activity id", () => {
+    expect(Events.activityMessageId("m1", "c1")).not.toBe(Events.activityMessageId("m3", "c1"));
+  });
 
-  it.effect("derives an approved step-0 call's activity id from its approval", () =>
-    Effect.gen(function* () {
-      const events = yield* foldEvents([
-        progress(0, undefined, "c1", { done: 1 }),
-        progress(0, undefined, "c1", { done: 2 }),
-        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
-      ]);
-      const ids = snapshots(events).map((e) => e.messageId);
-      expect(ids).toHaveLength(2);
-      expect(ids[0]).toBe(ids[1]);
-      expect(ids[0]).not.toBe(Agent.approvalIdFor("c1"));
-    }),
-  );
+  it("derives an approved step-0 call's activity id from its approval", () => {
+    expect(Events.activityMessageId(undefined, "c1")).toBe(Events.activityMessageId(undefined, "c1"));
+    expect(Events.activityMessageId(undefined, "c1")).not.toBe(Agent.approvalIdFor("c1"));
+  });
 
-  it.effect("closes a call the model left open before its first snapshot", () =>
-    Effect.gen(function* () {
-      const events = yield* foldEvents([
-        { _tag: "StepStarted", step: 1, messageId: "m1", replayed: false },
-        {
-          _tag: "ModelPart",
-          step: 1,
-          messageId: "m1",
-          part: { type: "tool-params-start", id: "c1", name: "search" } as Response.AnyPart,
-          replayed: false,
-        },
-        progress(1, "m1", "c1", { done: 1 }),
-        { _tag: "StepFinished", step: 1, entries: [], replayed: false },
-        { _tag: "Finished", outcome: { _tag: "Success", pendingToolCalls: [] } },
-      ]);
-      expect(types(events).slice(2, 5)).toEqual(["TOOL_CALL_START", "TOOL_CALL_END", "ACTIVITY_SNAPSHOT"]);
-    }),
-  );
+  it("closes a call the model left open before its first snapshot, once", () => {
+    const emitter = new Events.StepEmitter("m1");
+    expect(emitter.part({ type: "tool-params-start", id: "c1", name: "search" } as Response.AnyPart)).toEqual([
+      Events.toolCallStart("c1", "search", "m1"),
+    ]);
+    expect(emitter.closeTool("c1")).toEqual([Events.toolCallEnd("c1")]);
+    expect(emitter.closeTool("c1")).toEqual([]);
+    expect(emitter.close()).toEqual([]);
+  });
 });
 
-describe("AgUi.conflateActivity", () => {
-  const snapshot = (messageId: string, done: number) => AgUi.activitySnapshot(messageId, "search", "c1", { done });
-  const result = AgUi.toolCallResult("m9", "c1", "{}");
+describe("event markers and attribution", () => {
+  const result = Events.toolCallResult("m1", "c1", "{}", true);
 
-  it.effect("keeps only the last snapshot of each activity in a chunk, in its place", () =>
-    Effect.gen(function* () {
-      const chunk = [snapshot("a", 1), AgUi.stepStarted("step-2"), snapshot("a", 2), snapshot("b", 1), result];
-      const out = Array.from(yield* Stream.make(...chunk).pipe(AgUi.conflateActivity, Stream.runCollect));
-      expect(out).toEqual([AgUi.stepStarted("step-2"), snapshot("a", 2), snapshot("b", 1), result]);
-    }),
-  );
-
-  it.effect("drops nothing across chunks", () =>
-    Effect.gen(function* () {
-      const stream = Stream.make(snapshot("a", 1)).pipe(Stream.concat(Stream.make(snapshot("a", 2))));
-      const out = Array.from(yield* stream.pipe(AgUi.conflateActivity, Stream.runCollect));
-      expect(out).toEqual([snapshot("a", 1), snapshot("a", 2)]);
-    }),
-  );
-});
-
-describe("AgUi.conflateProgress", () => {
-  const progress = (toolCallId: string, done: number): Agent.Event => ({
-    _tag: "ToolProgress",
-    step: 1,
-    messageId: "m1",
-    toolCallId,
-    toolName: "search",
-    encodedValue: { done },
-    replayed: false,
+  it("marks a replayed event and removes only its own marker", () => {
+    const marked = Events.markReplayed(result);
+    expect(Events.isReplayed(marked)).toBe(true);
+    expect(marked.metadata).toEqual({ "effect/ai": { isFailure: true }, "effect-agent-harness": { replayed: true } });
+    expect(Events.unmarked(marked)).toEqual(result);
+    expect(Events.unmarked(Events.markReplayed(Events.toolCallResult("m1", "c1", "{}")))).toEqual(
+      Events.toolCallResult("m1", "c1", "{}"),
+    );
+    expect(Events.isReplayed(result)).toBe(false);
   });
-  const wrapped = (subagentRunId: string, event: Agent.Event): Agent.Event => ({
-    _tag: "Subagent",
-    subagentRunId,
-    name: "searcher",
-    description: undefined,
-    parentToolCallId: "c0",
-    parentMessageId: "m0",
-    event,
-  });
-  const started: Agent.Event = { _tag: "StepStarted", step: 2, messageId: "m2", replayed: false };
 
-  it.effect("keeps only the last progress of each call in a chunk, at any subagent depth", () =>
-    Effect.gen(function* () {
-      const chunk = [
-        progress("c1", 1),
-        wrapped("s1", progress("c1", 1)),
-        started,
-        progress("c1", 2),
-        progress("c2", 1),
-        wrapped("s1", progress("c1", 2)),
-        wrapped("s2", progress("c1", 1)),
-      ];
-      const out = Array.from(yield* Stream.make(...chunk).pipe(AgUi.conflateProgress, Stream.runCollect));
-      expect(out).toEqual([
-        started,
-        progress("c1", 2),
-        progress("c2", 1),
-        wrapped("s1", progress("c1", 2)),
-        wrapped("s2", progress("c1", 1)),
-      ]);
-    }),
-  );
+  it("attributes a child's event to it unless a deeper subagent owns it", () => {
+    expect(Events.attributeToChild(Events.textMessageStart("m1"), "s1")).toEqual({
+      ...Events.textMessageStart("m1"),
+      subagentRunId: "s1",
+    });
+    const deeper = { ...Events.textMessageStart("m1"), subagentRunId: "s2" };
+    expect(Events.attributeToChild(deeper, "s1")).toEqual(deeper);
+    const started = {
+      type: "SUBAGENT_STARTED",
+      subagentRunId: "s2",
+      name: "researcher",
+      parentToolCallId: "c1",
+      parentMessageId: "m1",
+    } as const;
+    expect(JSON.stringify(Events.attributeToChild(started, "s1"))).toBe(
+      JSON.stringify({
+        type: "SUBAGENT_STARTED",
+        subagentRunId: "s2",
+        name: "researcher",
+        parentSubagentRunId: "s1",
+        parentToolCallId: "c1",
+        parentMessageId: "m1",
+      }),
+    );
+  });
 });

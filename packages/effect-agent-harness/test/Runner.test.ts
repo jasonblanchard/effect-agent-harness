@@ -2,11 +2,11 @@ import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Queue, Schema, Scope, Stream } from "effect";
 import { KeyValueStore } from "effect/persistence";
 import { expectTypeOf } from "vitest";
-import { AgUiSchema, Prompt, Tool, Toolkit } from "effect/ai";
+import { AgUiSchema, AgUiServer, Prompt, Tool, Toolkit } from "effect/ai";
 import type { Response } from "effect/ai";
 import { WorkflowEngine } from "effect/workflow";
 import * as Agent from "../src/Agent.ts";
-import * as AgUi from "../src/AgUi.ts";
+import * as Events from "../src/internal/events.ts";
 import * as Checkpoint from "../src/Checkpoint.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as History from "../src/History.ts";
@@ -50,7 +50,7 @@ const input = (
 
 const userMessage = (id: string, content: string): AgUiSchema.Message => ({ id, role: "user", content });
 
-const types = (events: ReadonlyArray<AgUi.Event>) => events.map((event) => event.type);
+const types = (events: ReadonlyArray<AgUiSchema.Event>) => events.map((event) => event.type);
 
 /** The reasoning parts of every assistant message in `prompt`. */
 const reasoningParts = (prompt: Prompt.Prompt) =>
@@ -235,6 +235,28 @@ describe("Runner.makeAttached", () => {
       ]).pipe(Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]));
       expect(model.prompts[0]!.content.map((m) => m.role)).toEqual(["system", "user"]);
       expect(model.prompts[0]!.content[0]).toMatchObject({ content: "Be helpful." });
+    }),
+  );
+  it.effect("keeps the run's usage when the store fails to record its end", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Hi"), finish("stop", { input: 10, output: 3 })]]);
+      // The store records every step, then fails to record the run's end.
+      const failingEnd = Layer.effect(
+        Thread.Thread,
+        Effect.map(Thread.Thread, (thread) => ({
+          ...thread,
+          runEnded: () => Effect.fail(new Thread.ThreadError({ cause: "disk full" })),
+        })),
+      ).pipe(Layer.provide(Thread.layerMemory));
+      const [run] = yield* runAgUi(weatherAgent, [input("r1", [userMessage("u1", "Hi")])]).pipe(
+        Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers]),
+        Effect.provide(History.layerServer.pipe(Layer.provide(failingEnd))),
+      );
+      expect(run!.at(-1)).toMatchObject({
+        type: "RUN_ERROR",
+        code: "ThreadError",
+        usage: [{ inputTokens: 10, outputTokens: 3 }],
+      });
     }),
   );
 });
@@ -649,6 +671,80 @@ describe("Runner.makeAttached frontend tools", () => {
   ];
   const picked = toolAnswer("c_pick", { name: "a.txt" });
 
+  it.effect("ends a run whose frontend tool has one of the agent's names in-band, and releases the thread", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Hi."), finish("stop")]]);
+      const [refused, next] = yield* runAgUi(approvalAgent, [
+        { ...input("r1", [userMessage("u1", "Hi")]), tools: [{ name: "get-weather", description: "The client's" }] },
+        input("r2", [userMessage("u1", "Hi")]),
+      ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, serverStores]));
+      expect(types(refused!)).toEqual(["RUN_STARTED", "RUN_ERROR"]);
+      expect(refused!.at(-1)).toMatchObject({ code: "FrontendToolConflict" });
+      expect(next!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+      expect(model.prompts).toHaveLength(1);
+    }),
+  );
+
+  it.effect("stores nothing for a refused input, so the same run id can be retried with its tools renamed", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([[...text("0", "Hi."), finish("stop")]]);
+      const ask = input("r1", [userMessage("u1", "Hi")]);
+      const [refused, retried] = yield* runAgUi(approvalAgent, [
+        { ...ask, tools: [{ name: "get-weather", description: "The client's" }] },
+        { ...ask, tools: [{ name: "get-browser-weather", description: "The client's" }] },
+      ]).pipe(
+        Effect.provide([
+          model.layer,
+          countingApprovalLayer().layer,
+          Checkpoint.layerKeyValueStore.pipe(Layer.provide(KeyValueStore.layerMemory)),
+          counterIds(),
+          serverStores,
+        ]),
+      );
+      expect(refused!.at(-1)).toMatchObject({ code: "FrontendToolConflict" });
+      // Neither the input nor the client's message was stored by the refused attempt.
+      expect(retried!.at(-1)).toMatchObject({ type: "RUN_FINISHED", outcome: { type: "success" } });
+      expect(model.prompts[0]!.content.filter((message) => message.role === "user")).toHaveLength(1);
+    }),
+  );
+
+  it.effect("stores a frontend answer that carries only the failure marker as a failed result", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([pickStep, [...text("0", "No file, then."), finish("stop")]]);
+      const failed: AgUiSchema.Message = {
+        ...toolAnswer("c_pick", "no file"),
+        metadata: { "effect/ai": { isFailure: true } },
+      };
+      yield* runAgUi(approvalAgent, [
+        withTools(input("r1", [userMessage("u1", "Pick a file")])),
+        withTools(input("r2", [...clientAfterPickTurn, failed])),
+      ]).pipe(Effect.provide([model.layer, countingApprovalLayer().layer, evalLayers, serverStores]));
+      expect(model.prompts[1]!.content.at(-1)).toMatchObject({
+        content: [{ type: "tool-result", id: "c_pick", result: "no file", isFailure: true }],
+      });
+    }),
+  );
+
+  it.effect("reads a failed result back with the metadata its TOOL_CALL_RESULT carried", () =>
+    Effect.gen(function* () {
+      const model = scriptedModel([
+        [...toolCall("c1", "get-weather", { location: "Nowhere" }), finish("tool-calls")],
+        [...text("0", "Unknown."), finish("stop")],
+      ]);
+      const [events] = yield* runAgUi(approvalAgent, [input("r1", [userMessage("u1", "Weather in Nowhere?")])]).pipe(
+        Effect.provide([model.layer, countingApprovalLayer().layer]),
+      );
+      const live = events!.find((event) => event.type === "TOOL_CALL_RESULT");
+      const { messages } = yield* History.restore("t1");
+      const restored = messages.find((message) => message.role === "tool");
+      expect(live?.metadata).toEqual({ "effect/ai": { isFailure: true } });
+      expect(restored).toMatchObject({
+        id: live?.type === "TOOL_CALL_RESULT" ? live.messageId : "",
+        metadata: live?.metadata,
+      });
+    }).pipe(Effect.provide([evalLayers, serverStores])),
+  );
+
   it.effect("ends with the pending call and takes the client's result in the next run", () =>
     Effect.gen(function* () {
       const model = scriptedModel([pickStep, [...text("0", "You picked a.txt."), finish("stop")]]);
@@ -931,7 +1027,7 @@ describe("Runner thread history", () => {
         return { ...result, commits: spy.log.filter((line) => line.startsWith("commit r2")), prompts: model.prompts };
       });
 
-    const reasoningIds = (events: ReadonlyArray<AgUi.Event>) =>
+    const reasoningIds = (events: ReadonlyArray<AgUiSchema.Event>) =>
       events.flatMap((e) => (e.type === "REASONING_START" ? [e.messageId] : []));
 
     it.effect("reads reasoning back under its events' ids, with its deltas joined", () =>
@@ -1125,7 +1221,7 @@ describe("Runner.makeAttached prompt memo", () => {
     const spy = spyThread();
     return Effect.gen(function* () {
       const run1 = input("r1", [userMessage("u1", "Weather in Paris?")]);
-      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUi.Event) => boolean) =>
+      const attempt = (steps: ReadonlyArray<Step>, stopAfter?: (event: AgUiSchema.Event) => boolean) =>
         Effect.gen(function* () {
           const model = scriptedModel(steps);
           const events = Runner.makeAttached(weatherAgent)(run1);
@@ -1460,9 +1556,9 @@ describe("Runner.makeDetached", () => {
   it.effect("completes a log that stops between a reasoning block's two starts", () =>
     Effect.gen(function* () {
       const log = yield* EventLog.EventLog;
-      yield* log.append("t1", "r1", AgUi.runStarted(run1));
-      yield* log.append("t1", "r1", AgUi.stepStarted("step-1"));
-      yield* log.append("t1", "r1", AgUi.reasoningStart("lost:reasoning:0"));
+      yield* log.append("t1", "r1", Events.runStarted(run1));
+      yield* log.append("t1", "r1", Events.stepStarted("step-1"));
+      yield* log.append("t1", "r1", Events.reasoningStart("lost:reasoning:0"));
       const before = yield* log.read("t1", "r1");
 
       yield* start(yield* Scope.make(), [[...text("0", "18°C"), finish("stop")]]);
@@ -1633,29 +1729,29 @@ describe("Runner.makeWorkflow", () => {
 // Run info
 // -----------------------------------------------------------------------------
 
-describe("Runner run info", () => {
+describe("Runner run input", () => {
   const WhoAmI = Tool.make("who-am-i", {
     parameters: Schema.Struct({}),
     success: Schema.Boolean,
-    dependencies: [Agent.CurrentRun],
+    dependencies: [AgUiServer.RunInput],
   });
   const WhoAmIToolkit = Toolkit.make(WhoAmI);
 
-  /** An agent whose system prompt and only tool both record the run info they see. */
+  /** An agent whose system prompt and only tool both record the AG-UI input they see. */
   const recordingAgent = () => {
-    const bySystem: Array<Agent.RunInfo> = [];
-    const byTool: Array<Agent.RunInfo> = [];
+    const bySystem: Array<AgUiSchema.RunAgentInput> = [];
+    const byTool: Array<AgUiSchema.RunAgentInput> = [];
     const agent = Agent.define({
       toolkit: WhoAmIToolkit,
       system: Effect.gen(function* () {
-        bySystem.push(yield* Agent.CurrentRun);
+        bySystem.push(yield* AgUiServer.RunInput);
         return "Be helpful.";
       }),
     });
     const handlers = WhoAmIToolkit.toLayer({
       "who-am-i": () =>
         Effect.gen(function* () {
-          byTool.push(yield* Agent.CurrentRun);
+          byTool.push(yield* AgUiServer.RunInput);
           return true;
         }),
     });
@@ -1677,13 +1773,15 @@ describe("Runner run info", () => {
       return events;
     });
 
-  it.effect("passes forwardedProps to the system prompt as props, with the input's ids", () =>
+  it.effect("gives the system prompt and tools the run's AG-UI input, unchanged", () =>
     Effect.gen(function* () {
-      const { agent, handlers, bySystem } = recordingAgent();
-      yield* runOnce(agent, { ...input("r1", [userMessage("u1", "hi")]), forwardedProps: { locale: "fr" } }).pipe(
+      const { agent, handlers, bySystem, byTool } = recordingAgent();
+      const run = { ...input("r1", [userMessage("u1", "hi")]), forwardedProps: { locale: "fr" }, state: { cart: 2 } };
+      yield* runOnce(agent, run).pipe(
         Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, serverStores]),
       );
-      expect(bySystem).toEqual([{ runId: "r1", threadId: "t1", props: { locale: "fr" } }]);
+      expect(bySystem).toEqual([run]);
+      expect(byTool).toEqual([run]);
     }),
   );
 
@@ -1694,8 +1792,26 @@ describe("Runner run info", () => {
         Effect.provide([scriptedModel(whoAmITurn()).layer, handlers, evalLayers, serverStores]),
       );
       expect(bySystem).toHaveLength(1);
-      expect(bySystem[0]!.props).toBeUndefined();
+      expect(bySystem[0]!.forwardedProps).toBeUndefined();
     }),
+  );
+
+  it.effect("gives tools the client's messages as sent while the model receives the whole thread", () =>
+    Effect.gen(function* () {
+      const { agent, handlers, byTool } = recordingAgent();
+      const model = scriptedModel([[...text("0", "Hello."), finish("stop")], ...whoAmITurn()]);
+      const [first] = yield* runAgUi(agent, [input("r1", [userMessage("u1", "hi")])]).pipe(
+        Effect.provide([model.layer, handlers]),
+      );
+      const reply = first!.find((event) => event.type === "TEXT_MESSAGE_START")!;
+      const sent = [
+        { id: (reply as { messageId: string }).messageId, role: "assistant" as const, content: "Hello." },
+        userMessage("u2", "who am I?"),
+      ];
+      yield* runAgUi(agent, [input("r2", sent)]).pipe(Effect.provide([model.layer, handlers]));
+      expect(byTool.map((run) => run.messages)).toEqual([sent]);
+      expect(model.prompts[1]!.content.map((message) => message.role)).toEqual(["system", "user", "assistant", "user"]);
+    }).pipe(Effect.provide([evalLayers, serverStores])),
   );
 
   it.effect("never stores the system prompt in the thread", () =>
@@ -1892,7 +2008,7 @@ describe("Runner run contexts", () => {
         return stream.pipe(Stream.provideContext(yield* Effect.context<Stream.Services<typeof stream>>()));
       });
       const stream = yield* route.pipe(Effect.provideService(AuthContext, { userId: "u1" }));
-      expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUi.Event, never, never>>();
+      expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUiSchema.Event, never, never>>();
       const events = Array.from(yield* Stream.runCollect(stream));
       yield* Effect.promise(() => verify(events));
       expect(handlers.seen).toEqual(["u1@tenant-u1"]);
@@ -2608,7 +2724,7 @@ describe("Runner.makeAttached streams", () => {
       const stream = yield* handler.pipe(
         Effect.provide([model.layer, countingWeatherLayer().layer, evalLayers, serverStores]),
       );
-      expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUi.Event, never, never>>();
+      expectTypeOf(stream).toEqualTypeOf<Stream.Stream<AgUiSchema.Event, never, never>>();
       const events = yield* Stream.runCollect(stream);
       expect(types(events)).toEqual([
         "RUN_STARTED",
@@ -2654,17 +2770,17 @@ describe("Runner tool progress", () => {
       Stream.concat(Stream.fromIterable(parts)),
     );
 
-  const snapshotsOf = (events: ReadonlyArray<AgUi.Event>) =>
+  const snapshotsOf = (events: ReadonlyArray<AgUiSchema.Event>) =>
     events.flatMap((e) => (e.type === "ACTIVITY_SNAPSHOT" ? [e.content as { done: number }] : []));
 
   /** Every snapshot comes before the call's result. */
-  const beforeResult = (events: ReadonlyArray<AgUi.Event>) => {
+  const beforeResult = (events: ReadonlyArray<AgUiSchema.Event>) => {
     const resultAt = events.findIndex((e) => e.type === "TOOL_CALL_RESULT" && e.toolCallId === "c_search");
     return events.every((e, i) => e.type !== "ACTIVITY_SNAPSHOT" || i < resultAt);
   };
 
   /** The event log, with `before` run ahead of every append. */
-  const slowLog = (before: (event: AgUi.Event) => Effect.Effect<void>) =>
+  const slowLog = (before: (event: AgUiSchema.Event) => Effect.Effect<void>) =>
     Layer.effect(
       EventLog.EventLog,
       Effect.gen(function* () {
@@ -2798,7 +2914,7 @@ describe("Runner tool progress", () => {
       ];
       // Both readers keep up: the handler waits for each snapshot to be read (or logged) before the next.
       const read = yield* Queue.unbounded<void>();
-      const ack = (event: AgUi.Event) =>
+      const ack = (event: AgUiSchema.Event) =>
         event.type === "ACTIVITY_SNAPSHOT" ? Queue.offer(read, undefined) : Effect.void;
       const attached = yield* Runner.makeAttached(progressAgent)(run1).pipe(
         Stream.tap(ack),

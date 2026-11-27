@@ -1,11 +1,12 @@
 import { Context, Effect, Layer, PubSub, Schema, Stream } from "effect";
-import * as AgUi from "./AgUi.ts";
+import type { AgUiSchema } from "effect/ai";
+import * as Events from "./internal/events.ts";
 
 /** An AG-UI event as stored in the log, with the cursor the log assigned to it. */
 export interface Stored {
   /** Opaque and strictly increasing within a run. Sent to clients as the SSE `id`. */
   readonly cursor: string;
-  readonly event: AgUi.Event;
+  readonly event: AgUiSchema.Event;
 }
 
 export class EventLogError extends Schema.TaggedError<EventLogError, { readonly brand: unique symbol }>()(
@@ -35,7 +36,7 @@ export class EventLog extends Context.Service<
   EventLog,
   {
     /** Stores the event and assigns it a cursor greater than every earlier one of the run. */
-    readonly append: (threadId: string, runId: string, event: AgUi.Event) => Effect.Effect<Stored, EventLogError>;
+    readonly append: (threadId: string, runId: string, event: AgUiSchema.Event) => Effect.Effect<Stored, EventLogError>;
     /**
      * The run's events after `after` (all of them when omitted), in order;
      * empty for an unknown run. Fails with {@link InvalidCursor} if `after`
@@ -127,7 +128,7 @@ export const layerMemory: Layer.Layer<EventLog> = Layer.sync(EventLog, () => {
           Effect.gen(function* () {
             // Subscribe before taking the snapshot, so no event falls between the two.
             const subscription = yield* PubSub.subscribe(log.pubsub);
-            const ended = log.events.findIndex((stored) => AgUi.isTerminal(stored.event));
+            const ended = log.events.findIndex((stored) => Events.isTerminal(stored.event));
             const history = log.events.slice(from);
             if (ended !== -1) {
               // Nothing is appended after the terminal event.
@@ -138,7 +139,7 @@ export const layerMemory: Layer.Layer<EventLog> = Layer.sync(EventLog, () => {
               Stream.filter((stored) => Number(stored.cursor) > last),
             );
             return Stream.concat(Stream.fromIterable(history), live).pipe(
-              Stream.takeUntil((stored) => AgUi.isTerminal(stored.event)),
+              Stream.takeUntil((stored) => Events.isTerminal(stored.event)),
             );
           }),
         );

@@ -1,0 +1,115 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "search",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{\"query\":\"q\",\"sources\":2}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c2",
+      "toolCallName": "count",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c2",
+      "delta": "{\"to\":3}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c2"
+    },
+    {
+      "type": "ACTIVITY_SNAPSHOT",
+      "messageId": "id-1:activity:c1",
+      "activityType": "search",
+      "content": {
+        "done": 2,
+        "of": 2
+      },
+      "metadata": {
+        "effect-agent-harness:toolCallId": "c1"
+      }
+    },
+    {
+      "type": "ACTIVITY_SNAPSHOT",
+      "messageId": "id-1:activity:c2",
+      "activityType": "count",
+      "content": {
+        "value": 2
+      },
+      "metadata": {
+        "effect-agent-harness:toolCallId": "c2"
+      }
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-2",
+      "toolCallId": "c1",
+      "content": "{\"done\":2,\"of\":2,\"hits\":3}",
+      "role": "tool"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-3",
+      "toolCallId": "c2",
+      "content": "3",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-4",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-4",
+      "delta": "Done."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-4"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1",
+      "outcome": {
+        "type": "success"
+      }
+    }
+  ]
+]

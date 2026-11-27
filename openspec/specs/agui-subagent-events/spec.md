@@ -1,7 +1,7 @@
 # agui-subagent-events Specification
 
 ## Purpose
-Projects child agent runs onto the AG-UI event stream: the subagent lifecycle events, attribution of every child event to its subagent, independent span tracking per subagent, and attribution of child interrupts.
+The AG-UI events of child agent runs, which the run that spawns them emits in its own stream: the subagent lifecycle events, attribution of every child event to its subagent, independent span tracking per subagent, and attribution of child interrupts.
 
 ## Requirements
 ### Requirement: Subagent lifecycle events

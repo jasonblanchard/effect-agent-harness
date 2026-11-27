@@ -3,7 +3,7 @@ import { Result, Schema } from "effect";
 import { Prompt } from "effect/ai";
 import type { AgUiSchema } from "effect/ai";
 import * as Agent from "../../src/Agent.ts";
-import * as AgUi from "../../src/AgUi.ts";
+import * as Events from "../../src/internal/events.ts";
 import * as Conversions from "../../src/internal/conversions.ts";
 import * as Messages from "../../src/Messages.ts";
 
@@ -216,7 +216,7 @@ describe("delta", () => {
     });
 
     it("treats reasoning rows as unknown, so they neither anchor nor match", () => {
-      const row = clientMessage(AgUi.reasoningMessageId("m1", 0), "reasoning", "Thinking");
+      const row = clientMessage(Events.reasoningMessageId("m1", 0), "reasoning", "Thinking");
       const client = [clientMessage("u1", "user", "Hi"), row, clientMessage("m1", "assistant", "Hello"), u2];
       expect(Conversions.delta(stored, client)).toEqual(Result.succeed([u2]));
       expect(Conversions.delta(stored, [row, u2])).toEqual(Result.fail(new Conversions.HistoryMismatch()));
@@ -372,7 +372,7 @@ describe("restore", () => {
       messages: [
         { id: "u1", role: "user", content: "Weather?" },
         // Ahead of the text it followed: an assistant message has one `content`.
-        { id: AgUi.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
+        { id: Events.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
         {
           id: "m1",
           role: "assistant",
@@ -390,15 +390,15 @@ describe("restore", () => {
 
   it("returns each block with text in order, numbered among all the entry's blocks", () => {
     expect(Conversions.restore([assistantReasoning("m1", ["", "First", "", "Second"], "Hi")]).messages).toEqual([
-      { id: AgUi.reasoningMessageId("m1", 1), role: "reasoning", content: "First" },
-      { id: AgUi.reasoningMessageId("m1", 3), role: "reasoning", content: "Second" },
+      { id: Events.reasoningMessageId("m1", 1), role: "reasoning", content: "First" },
+      { id: Events.reasoningMessageId("m1", 3), role: "reasoning", content: "Second" },
       { id: "m1", role: "assistant", content: "Hi" },
     ]);
   });
 
   it("returns an entry holding only reasoning with no assistant message", () => {
     expect(Conversions.restore([assistantReasoning("m1", ["Thinking"])]).messages).toEqual([
-      { id: AgUi.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
+      { id: Events.reasoningMessageId("m1", 0), role: "reasoning", content: "Thinking" },
     ]);
   });
 
@@ -418,7 +418,7 @@ describe("restore", () => {
       toolResult("t1", "c1", 1),
     ];
     expect(Conversions.restore(entries).messages.map((message) => message.id)).toEqual([
-      AgUi.reasoningMessageId("m1", 0),
+      Events.reasoningMessageId("m1", 0),
       "m1",
       "t1",
     ]);
@@ -457,6 +457,7 @@ describe("restore", () => {
       toolCallId: "c1",
       content: '"Out of range"',
       error: "Out of range",
+      metadata: { "effect/ai": { isFailure: true } },
     });
     expect(Conversions.delta(entries, [...messages, clientMessage("u3", "user", "Thanks")])).toEqual(
       Result.succeed([clientMessage("u3", "user", "Thanks")]),
@@ -494,7 +495,7 @@ describe("restore", () => {
     ];
     expect(Conversions.restore(entries).interrupts).toEqual({
       runId: "r1",
-      pending: [AgUi.approvalInterrupt({ approvalId: "ap1", toolCallId: "c1", toolName: "get-weather" })],
+      pending: [Events.approvalInterrupt({ approvalId: "ap1", toolCallId: "c1", toolName: "get-weather" })],
     });
     // Without a recorded run.
     expect(Conversions.restore([assistantCall("m1", "c1", "ap1")]).interrupts?.runId).toBeUndefined();

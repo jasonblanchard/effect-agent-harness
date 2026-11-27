@@ -122,7 +122,10 @@ const AgentHandlers = HttpApiBuilder.group(
     return handlers
       .handle(
         "run",
-        // The endpoint provides the handler's context, including the principal, to the stream it reads.
+        // The endpoint provides the handler's context, including the principal, to the stream it reads. An app with
+        // no per-request services could serve `Runner.toAgUiServerAgent(assistant)` through `AgUiServer.layerHttp`
+        // instead, as `effect/ai`'s own agent is served; that captures its services once, so the principal
+        // couldn't reach the run.
         AgUiServer.handler((input) =>
           Stream.unwrap(
             Effect.map(AuthContext, (principal) =>

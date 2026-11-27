@@ -1,0 +1,84 @@
+[
+  [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1",
+      "protocolVersion": "1.0"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-1",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-1",
+      "delta": "Let me check."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "toolu_1",
+      "toolCallName": "get-weather",
+      "parentMessageId": "id-1"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "toolu_1",
+      "delta": "{\"location\":\"Paris\"}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "toolu_1"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "id-2",
+      "toolCallId": "toolu_1",
+      "content": "{\"temperature\":18}",
+      "role": "tool"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-1"
+    },
+    {
+      "type": "STEP_STARTED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "id-3",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "id-3",
+      "delta": "It is 18°C."
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "id-3"
+    },
+    {
+      "type": "STEP_FINISHED",
+      "stepName": "step-2"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1",
+      "outcome": {
+        "type": "success"
+      }
+    }
+  ]
+]

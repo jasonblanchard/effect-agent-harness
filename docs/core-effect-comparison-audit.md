@@ -1,6 +1,6 @@
 # Core Effect Comparison Audit
 
-_Audited 2026-11-25 against `effect@4.1.4`, the pinned version._
+_Audited 2026-11-27 against `effect@4.1.4`, the pinned version._
 
 This audit asks, for each abstraction `effect-agent-harness` builds itself, whether a module in core Effect could replace it. It covers every module in the installed package: `effect`, `effect/ai`, `effect/persistence`, `effect/workflow`, `effect/eventlog`, `effect/cluster`, `effect/encoding` and the rest. Sources are the package's own code and doc comments, not web docs.
 
@@ -14,17 +14,20 @@ This audit asks, for each abstraction `effect-agent-harness` builds itself, whet
 
 ## Already built on core Effect
 
-| Harness                                           | Core Effect it uses                                                           |
-| ------------------------------------------------- | ----------------------------------------------------------------------------- |
-| AG-UI protocol types and HTTP binding             | `effect/ai` `AgUiSchema`, `AgUiServer.endpoint` / `handler`                   |
-| Model calls, tools, toolkits, ids                 | `LanguageModel.streamText`, `Tool`, `Toolkit`, `IdGenerator`                  |
-| Prompt and entry content                          | `Prompt` (each `Messages.Entry` wraps a `Prompt.Message`)                     |
-| `Runner.makeWorkflow`, `Checkpoint.layerWorkflow` | `effect/workflow` `Workflow`, `Activity`, `DurableDeferred`, `WorkflowEngine` |
-| `Checkpoint.layerKeyValueStore`                   | `effect/persistence` `KeyValueStore`                                          |
-| Model span attributes                             | `effect/ai` `Telemetry.CurrentSpanTransformer` and its `gen_ai.*` attributes  |
-| `EventLog.layerMemory`                            | `PubSub`, `Stream`                                                            |
-| Runner signals, timeouts, cancel polling          | `Deferred`, `Queue`, `Fiber`, `Schedule`, `Effect.race`                       |
-| Errors                                            | `Schema.TaggedError`                                                          |
+| Harness                                             | Core Effect it uses                                                               |
+| --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| AG-UI protocol types and HTTP binding               | `effect/ai` `AgUiSchema`, `AgUiServer.endpoint` / `handler`                       |
+| The run's AG-UI input, as tools and prompts read it | `effect/ai` `AgUiServer.RunInput`, the service `AgUiServer.agent` provides        |
+| `Runner.toAgUiServerAgent`                          | `effect/ai` `AgUiServer.Agent`, served by `AgUiServer.layerHttp` / `agentHandler` |
+| A failed `TOOL_CALL_RESULT`'s marker                | `effect/ai`'s `metadata["effect/ai"].isFailure`, which `AgUi.toPrompt` reads      |
+| Model calls, tools, toolkits, ids                   | `LanguageModel.streamText`, `Tool`, `Toolkit`, `IdGenerator`                      |
+| Prompt and entry content                            | `Prompt` (each `Messages.Entry` wraps a `Prompt.Message`)                         |
+| `Runner.makeWorkflow`, `Checkpoint.layerWorkflow`   | `effect/workflow` `Workflow`, `Activity`, `DurableDeferred`, `WorkflowEngine`     |
+| `Checkpoint.layerKeyValueStore`                     | `effect/persistence` `KeyValueStore`                                              |
+| Model span attributes                               | `effect/ai` `Telemetry.CurrentSpanTransformer` and its `gen_ai.*` attributes      |
+| `EventLog.layerMemory`                              | `PubSub`, `Stream`                                                                |
+| Runner signals, timeouts, cancel polling            | `Deferred`, `Queue`, `Fiber`, `Schedule`, `Effect.race`                           |
+| Errors                                              | `Schema.TaggedError`                                                              |
 
 ## Module by module
 
@@ -46,14 +49,14 @@ A `Thread` adapter over `BackingPersistence` or `KeyValueStore` would be possibl
 
 **Nearest core counterparts:** `AgUiServer.agent`, `Chat.streamText` with `maxSteps`, and `LanguageModel`'s own tool resolution and approvals.
 
-`AgUiServer.agent` is a complete AG-UI agent, but it has no approvals, subagents, checkpoints, cancellation or server history. `Agent.run` calls `LanguageModel.streamText` with `disableToolCallResolution: true` and runs tool calls itself, because each call has to go through `Checkpoint.memo` and the cancellation guard, and a subagent call is run by the loop rather than by the toolkit.
+`AgUiServer.agent` is a complete AG-UI agent, but it has no approvals, subagents, checkpoints, cancellation or server history. `Agent.run` now emits AG-UI itself, as `AgUiServer.agent`'s stream does, and provides the same `AgUiServer.RunInput`, so tools port between them unchanged and `Runner.toAgUiServerAgent` serves an agent wherever `AgUiServer.agent` is served. It calls `LanguageModel.streamText` with `disableToolCallResolution: true` and runs tool calls itself, because each call has to go through `Checkpoint.memo` and the cancellation guard, and a subagent call is run by the loop rather than by the toolkit.
 
-### `AgUi`: keep
+### AG-UI event building (`internal/events.ts`): keep
 
 **Nearest core counterparts:** `effect/ai` `AgUi.fromStreamParts`, `AgUi.withRunLifecycle`, `AgUi.toPrompt`.
 
-- **`fromStreamParts`** converts raw `Response` parts and drops approval requests. `AgUi.fold` works on `Agent.Event`, which carries approvals, subagents, tool progress, replayed steps and cancellation.
-- **`withRunLifecycle`** ends any subagent still open with `SUBAGENT_ERROR`. `closeOpen` deliberately leaves subagents open, so the next attempt of a detached or workflow run can carry on with them. That makes the two incompatible.
+- **`fromStreamParts`** converts raw `Response` parts into AG-UI, as the loop's own step emitter (`internal/events.ts`) does. It can't stand in for it: it takes message ids from the provider, which aren't deterministic across a replay (the loop mints them inside checkpoints), derives no reasoning message ids that `History.restore` can reproduce, and emits no activity. Its failure marker is the one the loop adopts.
+- **`withRunLifecycle`** ends any subagent still open with `SUBAGENT_ERROR`. It still wraps a run served through `AgUiServer.handler`, harmlessly: the run's own lifecycle is complete. The runners' internal `closeOpen` (`internal/publish.ts`) deliberately leaves subagents open, so the next attempt of a detached or workflow run can carry on with them. That makes the two incompatible.
 - **`toPrompt`** returns a `Prompt` without message ids. The history conversions use it for user message content, but they need their own code for the rest, because they key everything by AG-UI id.
 
 ### `Checkpoint`: keep

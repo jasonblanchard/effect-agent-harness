@@ -16,7 +16,6 @@ import {
   HttpApiSecurity,
 } from "effect/http-api";
 import * as Agent from "../src/Agent.ts";
-import type * as AgUi from "../src/AgUi.ts";
 import * as EventLog from "../src/EventLog.ts";
 import * as Runner from "../src/Runner.ts";
 import * as Thread from "../src/Thread.ts";
@@ -286,6 +285,80 @@ describe("HttpAgent through the AG-UI endpoint", () => {
 });
 
 // -----------------------------------------------------------------------------
+// In place of effect/ai's own agent
+// -----------------------------------------------------------------------------
+
+/**
+ * Serves `agent` as `effect/ai`'s own agent is served: `AgUiServer.layerHttp` with the adapted agent, its services
+ * provided when the route is built. No history is provided, so the runs use the client history.
+ */
+const serveAsAgent = (agent: Agent.Any, services: Layer.Layer<any>) => {
+  // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context -- `Agent.Any`, see `serve`.
+  const routes = AgUiServer.layerHttp({ path: "/agent", agent: Runner.toAgUiServerAgent(agent) }).pipe(
+    Layer.provide(services),
+    Layer.provide(HttpServer.layerServices),
+  );
+  const app = HttpRouter.toWebHandler(routes, { disableLogger: true });
+  disposers.push(app.dispose);
+  return (request: Request) => app.handler(request);
+};
+
+describe("Runner.toAgUiServerAgent through AgUiServer.layerHttp", () => {
+  const clientOf = (handler: (request: Request) => Promise<Response>, threadId: string) =>
+    new HttpAgent({
+      url: "http://localhost/agent",
+      threadId,
+      fetch: (url, init) => handler(new Request(url, init)),
+    });
+
+  it("runs a conversation with a tool call, as effect/ai's agent would serve it", async () => {
+    const model = scriptedModel([
+      [...toolCall("toolu_1", "get-weather", { location: "Paris" }), finish("tool-calls", { input: 3 })],
+      [...text("0", "It is 18°C."), finish("stop", { input: 4 })],
+    ]);
+    const handler = serveAsAgent(weatherAgent, Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers));
+    const agent = clientOf(handler, "swap");
+    agent.messages.push({ id: randomUUID(), role: "user", content: "Weather in Paris?" });
+    const finished: Array<unknown> = [];
+    await agent.runAgent({}, { onRunFinishedEvent: ({ event }) => void finished.push(event) });
+    expect(agent.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    expect(agent.messages[2]).toMatchObject({ role: "tool", content: '{"temperature":18}' });
+    expect(finished).toEqual([expect.objectContaining({ usage: [{ inputTokens: 7, totalTokens: 7 }] })]);
+  });
+
+  it("rejects a frontend tool named like one of the agent's with 400, before the stream and the model", async () => {
+    const model = scriptedModel([[...text("0", "Hi"), finish("stop")]]);
+    const handler = serveAsAgent(weatherAgent, Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers));
+    const response = await post(handler, "/agent", {
+      ...input("r1", [{ id: "u1", role: "user", content: "Hi" }]),
+      tools: [{ name: "get-weather", description: "The client's", parameters: { type: "object" } }],
+    });
+    expect(response.status).toBe(400);
+    expect(response.headers.get("content-type")).not.toContain("text/event-stream");
+    expect(model.prompts).toEqual([]);
+  });
+
+  it("keeps a failed result failed when the client sends its history back", async () => {
+    const model = scriptedModel([
+      [...toolCall("toolu_1", "get-weather", { location: "Nowhere" }), finish("tool-calls")],
+      [...text("0", "I couldn't find it."), finish("stop")],
+      [...text("0", "Sorry again."), finish("stop")],
+    ]);
+    const handler = serveAsAgent(weatherAgent, Layer.mergeAll(model.layer, WeatherToolkitLayer, evalLayers));
+    const agent = clientOf(handler, "failures");
+    agent.messages.push({ id: randomUUID(), role: "user", content: "Weather in Nowhere?" });
+    await agent.runAgent();
+    // The client keeps the marker the result carried on the tool message it built.
+    expect(agent.messages[2]).toMatchObject({ role: "tool", metadata: { "effect/ai": { isFailure: true } } });
+
+    agent.messages.push({ id: randomUUID(), role: "user", content: "Try again?" });
+    await agent.runAgent();
+    const resent = model.prompts[2]!.content.find((message) => message.role === "tool");
+    expect(resent).toMatchObject({ content: [{ type: "tool-result", id: "toolu_1", isFailure: true }] });
+  });
+});
+
+// -----------------------------------------------------------------------------
 // What the wire carries
 // -----------------------------------------------------------------------------
 
@@ -311,7 +384,7 @@ describe("the AG-UI endpoint", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     expect(response.headers.get("cache-control")).toBe("no-cache");
-    return parseEvents(await response.text()).map((frame) => JSON.parse(frame.data) as AgUi.Event);
+    return parseEvents(await response.text()).map((frame) => JSON.parse(frame.data) as AgUiSchema.Event);
   };
 
   it("sends exactly the run's own lifecycle and terminal event, for an interrupt", async () => {
@@ -418,14 +491,14 @@ const whoAmISteps = () => [
   [...text("0", "You are u1."), finish("stop")],
 ];
 
-const resultOf = (events: ReadonlyArray<AgUi.Event>) =>
+const resultOf = (events: ReadonlyArray<AgUiSchema.Event>) =>
   events.flatMap((event) => (event.type === "TOOL_CALL_RESULT" ? [event.content] : []));
 
 describe("services the middleware provides", () => {
   it("reach the tool handlers of an attached run", async () => {
     const handler = serve(whoAmIAgent, Layer.mergeAll(scriptedModel(whoAmISteps()).layer, WhoAmILayer, evalLayers));
     const response = await post(handler, "/agent", input("r1", [{ id: "u1", role: "user", content: "Who am I?" }]));
-    const events = parseEvents(await response.text()).map((frame) => JSON.parse(frame.data) as AgUi.Event);
+    const events = parseEvents(await response.text()).map((frame) => JSON.parse(frame.data) as AgUiSchema.Event);
     expect(resultOf(events)).toEqual(['{"userId":"u1"}']);
   });
 
@@ -438,7 +511,7 @@ describe("services the middleware provides", () => {
     expect(events.status).toBe(200);
     const frames = parseEvents(await events.text());
     expect(frames.map((frame) => frame.id)).toEqual(frames.map((_, i) => String(i)));
-    const decoded = frames.map((frame) => JSON.parse(frame.data) as AgUi.Event);
+    const decoded = frames.map((frame) => JSON.parse(frame.data) as AgUiSchema.Event);
     expect(decoded[0]!.type).toBe("RUN_STARTED");
     expect(decoded.at(-1)!.type).toBe("RUN_FINISHED");
     expect(resultOf(decoded)).toEqual(['{"userId":"u1"}']);

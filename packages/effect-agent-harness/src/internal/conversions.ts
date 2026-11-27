@@ -1,10 +1,10 @@
 import type { AgUiSchema } from "effect/ai";
-import { Option, Result, Schema } from "effect";
+import { Option, Predicate, Result, Schema } from "effect";
 import { AgUi as EffectAgUi, Prompt } from "effect/ai";
 import { Base64 } from "effect/encoding";
 import * as Agent from "../Agent.ts";
-import * as AgUi from "../AgUi.ts";
 import type { Entry } from "../Messages.ts";
+import * as Events from "./events.ts";
 
 // -----------------------------------------------------------------------------
 // The private half of `Messages`: the conversions the two histories run. Not
@@ -146,11 +146,11 @@ const userContent = (message: AgUiSchema.UserMessage): ReadonlyArray<Prompt.User
     .content.flatMap((converted) => (converted.role === "user" ? converted.content : []))
     .filter((part) => part.type !== "text" || part.text.length > 0);
 
-const decodeApprovalResponse = Schema.decodeUnknownOption(AgUi.ApprovalResponse);
+const decodeApprovalResponse = Schema.decodeUnknownOption(Events.ApprovalResponse);
 
 /**
  * The interrupt ids of the `resolved` answers whose payload is not an
- * {@link AgUi.ApprovalResponse}. {@link resume} denies such an answer, which is
+ * `Agent.ApprovalResponse`. {@link resume} denies such an answer, which is
  * safe but easy to miss, so the runner logs a warning naming them.
  */
 export const malformedAnswers = (entries: ReadonlyArray<AgUiSchema.ResumeEntry>): ReadonlyArray<string> =>
@@ -175,7 +175,7 @@ export class UnansweredInterrupt extends Schema.TaggedError<UnansweredInterrupt,
 /**
  * Approval responses for every approval request in `stored` that has none
  * yet. A request is approved only when its resume entry is `resolved` with
- * an {@link AgUi.ApprovalResponse} payload whose `approved` is `true`;
+ * an `Agent.ApprovalResponse` payload whose `approved` is `true`;
  * otherwise it is denied with the payload's `reason`, or "cancelled" /
  * "denied". A payload that is not an `ApprovalResponse` denies the request. If any pending request has no resume entry, the
  * result is `UnansweredInterrupt` naming each of them. Resume entries that
@@ -310,9 +310,23 @@ export const answers = (
 };
 
 /**
+ * Whether a client's `tool` message is a failed result: it has `error` set, or
+ * carries the marker `effect/ai` puts on a failed result's `metadata`, which an
+ * AG-UI client copies from the `TOOL_CALL_RESULT` onto the message it builds.
+ */
+const isFailedToolMessage = (message: AgUiSchema.ToolMessage): boolean => {
+  if (message.error !== undefined) {
+    return true;
+  }
+  const marker = message.metadata?.[Events.FAILURE_KEY];
+  return Predicate.hasProperty(marker, "isFailure") && marker.isFailure === true;
+};
+
+/**
  * A client `tool` message as the result entry for its call, keyed by the
  * message's id, decoded as {@link answers} describes, and whether parts other
- * than text were dropped.
+ * than text were dropped. A failed result holds the message's `error`, or its
+ * content when only the failure marker says it failed.
  */
 const resultEntry = (
   message: AgUiSchema.ToolMessage,
@@ -329,7 +343,7 @@ const resultEntry = (
             id: toolCallId,
             name: toolName,
             result: decoded.result,
-            isFailure: message.error !== undefined,
+            isFailure: isFailedToolMessage(message),
             providerExecuted: false,
           }),
         ],
@@ -634,15 +648,19 @@ const shown = (entry: Entry): AgUiSchema.Message | undefined => {
       if (result === undefined) {
         return undefined;
       }
-      // Encoded as `TOOL_CALL_RESULT` encodes it. A failed result also carries its error, which is how a
-      // client's history marks one (see `answers`).
+      // Encoded as `TOOL_CALL_RESULT` encodes it. A failed result also carries the failure marker that event
+      // carried, which an AG-UI client copies onto the tool message it builds, and its error, which AG-UI's tool
+      // message defines for a failure (see `answers`).
       return {
         id,
         role: "tool",
         toolCallId: result.id,
-        content: JSON.stringify(result.result ?? null),
+        content: Events.resultContent(result.result),
         ...(result.isFailure
-          ? { error: typeof result.result === "string" ? result.result : JSON.stringify(result.result ?? null) }
+          ? {
+              error: typeof result.result === "string" ? result.result : Events.resultContent(result.result),
+              metadata: { [Events.FAILURE_KEY]: { isFailure: true } },
+            }
           : {}),
       };
     }
@@ -687,7 +705,7 @@ const reasoningOf = ({ id, message }: Entry): ReadonlyArray<AgUiSchema.Reasoning
         .flatMap((part, n) =>
           part.text.length === 0
             ? []
-            : [{ id: AgUi.reasoningMessageId(id, n), role: "reasoning" as const, content: part.text }],
+            : [{ id: Events.reasoningMessageId(id, n), role: "reasoning" as const, content: part.text }],
         )
     : [];
 
@@ -783,7 +801,7 @@ export const restore = (stored: ReadonlyArray<Entry>, activeRunId?: string): Res
             // One active run per thread, so every open request is the last interrupted run's.
             runId: pending.at(-1)!.entry.runId,
             pending: pending.map((request) =>
-              AgUi.approvalInterrupt({
+              Events.approvalInterrupt({
                 approvalId: request.approvalId,
                 toolCallId: request.toolCallId,
                 toolName: toolNames.get(request.toolCallId) ?? "",

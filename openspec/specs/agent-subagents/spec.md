@@ -4,6 +4,7 @@
 Lets an agent delegate part of a run to other agents: declaring subagents, offering them to the parent's model as tools, running each call as a child agent inside the parent's run, and suspending and resuming a child that waits for approval.
 
 ## Requirements
+
 ### Requirement: Subagents are declared as agent definitions
 An agent definition SHALL accept a subagents setting holding a list of agents, each an agent definition. A subagent's name SHALL be the tool name the parent's model calls, the subagent's name in the events, and its name in telemetry. An agent definition SHALL accept a description, an optional input schema, a context mode (`brief` by default, or `conversation`) and an optional conversion from its outcome to the result returned to a parent; these SHALL apply when the agent runs as a subagent. Defining an agent SHALL fail when one of its subagents has no name, has a name that is not 1 to 64 letters, digits, `_` or `-`, or has the same name as one of the agent's tools or another of its subagents. The services a child requires SHALL be part of what the parent definition requires.
 
@@ -43,7 +44,7 @@ Each subagent SHALL be offered to the parent's model as a tool with the subagent
 - **THEN** the parent's model is offered `pick-file` and the child's model is not
 
 ### Requirement: A subagent call runs the child inside the parent's run
-A call to a subagent tool in a step that finishes with reason `tool-calls` or `stop` SHALL run the child agent with the parent's thread id, run id, run properties and services, and with the child's own system prompt, tools and step limit. The child SHALL have an id determined by the spawning tool call's id alone. The child's model steps and tool calls SHALL be checkpointed under names that cannot collide with the parent's or another child's, so a run executed again replays the child's completed work and never repeats its tool handlers. Several subagent calls in one step SHALL run concurrently, like other tool calls.
+A call to a subagent tool in a step that finishes with reason `tool-calls` or `stop` SHALL run the child agent with the parent's AG-UI input with its `tools` emptied (so the parent's thread id, run id and properties, and no frontend tools) and the parent's services, and with the child's own system prompt, tools and step limit. The child SHALL NOT be offered the input's frontend tools. Its system prompt and tool handlers SHALL see that input through the run input service. The child SHALL have an id determined by the spawning tool call's id alone. The child's model steps and tool calls SHALL be checkpointed under names that cannot collide with the parent's or another child's, so a run executed again replays the child's completed work and never repeats its tool handlers. Several subagent calls in one step SHALL run concurrently, like other tool calls.
 
 #### Scenario: Child replayed after a crash
 - **WHEN** a run with a ledger-backed checkpoint store crashes after the child's first tool call completed, and the same run id is executed again
@@ -56,6 +57,10 @@ A call to a subagent tool in a step that finishes with reason `tool-calls` or `s
 #### Scenario: Same call, same id
 - **WHEN** two runs on different threads each call `researcher` with the same tool call id
 - **THEN** both children have the same id
+
+#### Scenario: Child reads the parent's input
+- **WHEN** a run with `forwardedProps` `{ locale: "fr" }` calls `researcher`, whose tool reads the run input service
+- **THEN** that tool sees the parent's input with `tools` empty, with `forwardedProps` `{ locale: "fr" }`, and the child's model is not offered the parent's frontend tools
 
 ### Requirement: The child's prompt
 The child's prompt SHALL begin with its brief: a user message holding the call's `prompt` field when the subagent has no input schema, and otherwise the call's input encoded as JSON. Under the `brief` context mode the prompt SHALL be the brief alone. Under the `conversation` mode it SHALL be the user messages and the assistant text of the prompt the parent's model received for the step that made the call, followed by the brief; it SHALL NOT hold the parent's system prompt, tool calls or tool results. The child's system prompt SHALL be its own.
@@ -84,11 +89,11 @@ When the child finishes successfully, the spawning call's result SHALL be the ch
 - **THEN** the spawning call gets a failed result naming the step limit, and the parent's model is called again
 
 ### Requirement: Child entries are carried by the parent step
-A child's entries SHALL name the child as their owner. They SHALL be carried by the step-finished event of the parent step that made the call, after that step's assistant entry and before its tool entries. The child's brief SHALL NOT be stored: each time the child runs, its prompt SHALL be rebuilt as the parent prefix (under the `conversation` mode), the brief from the spawning call's input, then the child's own entries. The parent's prompt SHALL NOT contain any entry owned by a child.
+A child's entries SHALL name the child as their owner. They SHALL be handed to the step-finished hook with the entries of the parent step that made the call, after that step's assistant entry and before its tool entries, and SHALL NOT be committed on their own. The child's brief SHALL NOT be stored: each time the child runs, its prompt SHALL be rebuilt as the parent prefix (under the `conversation` mode), the brief from the spawning call's input, then the child's own entries. The parent's prompt SHALL NOT contain any entry owned by a child.
 
 #### Scenario: Entries of a step with a subagent call
 - **WHEN** parent step 1 calls `researcher`, whose child makes one tool call and then replies
-- **THEN** step 1's step-finished event carries the parent's assistant entry, the child's assistant, tool and assistant entries owned by the child, then the parent's tool entry for the call
+- **THEN** the step-finished hook receives, once for step 1, the parent's assistant entry, the child's assistant, tool and assistant entries owned by the child, then the parent's tool entry for the call
 
 #### Scenario: Parent prompt
 - **WHEN** the parent's model is called in step 2

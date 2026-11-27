@@ -20,32 +20,33 @@ From left to right: the browser, what crosses the wire, what the run computes wi
 ```mermaid
 flowchart LR
   subgraph Client
-    B["Browser<br/>keeps its own Message[]<br/>built by folding streamed events,<br/>sent back as the next run's input"]
+    B["Browser<br/>keeps its own AgUiSchema.Message[]<br/>built by folding streamed events,<br/>sent back as the next run's input"]
   end
   subgraph Wire["AG-UI wire"]
-    RAI["RunAgentInput<br/>messages: Message[]<br/>resume: answers[]<br/>tools (frontend)<br/>forwardedProps<br/>threadId, runId"]
-    EV["AgUi.Event<br/>RUN_STARTED<br/>STEP_* · TEXT_MESSAGE_*<br/>REASONING_*<br/>TOOL_CALL_* · RESULT<br/>SUBAGENT_*<br/>RUN_FINISHED | ERROR"]
-    RES["History.Restored<br/>messages: Message[]<br/>interrupts<br/>pendingToolCalls<br/>activeRun"]
+    RAI["AgUiSchema.RunAgentInput<br/>messages: AgUiSchema.Message[]<br/>resume: AgUiSchema.ResumeEntry[]<br/>tools: AgUiSchema.Tool[] (frontend)<br/>forwardedProps<br/>threadId, runId"]
+    EV["AgUiSchema.Event<br/>RUN_STARTED<br/>STEP_* · TEXT_MESSAGE_*<br/>REASONING_*<br/>TOOL_CALL_* · RESULT<br/>SUBAGENT_*<br/>RUN_FINISHED | ERROR"]
+    RES["History.Restored<br/>messages: AgUiSchema.Message[]<br/>interrupts: AgUiSchema.Interrupt[]<br/>pendingToolCalls<br/>activeRun"]
   end
   subgraph Run
-    RI["Agent.RunInput<br/>prompt: Prompt<br/>frontendTools<br/>subagentPrompts"]
+    RI["Agent.RunOptions<br/>input: AgUiSchema.RunAgentInput<br/>prompt: Prompt.Prompt<br/>subagentPrompts: Prompt.Prompt by id"]
     RP["Response.AnyPart<br/>the model's streamed output:<br/>text, reasoning, tool-call…"]
-    AE["Agent.Event<br/>StepStarted · ModelPart<br/>ToolResult<br/>ApprovalRequested<br/>StepFinished{entries}<br/>Finished | Failed<br/>Subagent{event}"]
+    AE["Agent.run<br/>the loop: emits AG-UI events,<br/>hands each step's entries<br/>to OnStepFinished"]
   end
   subgraph Backend Adapters
-    TH[("Thread · durable history<br/>Entry { id, runId?, subagentRunId?,<br/>message: Prompt.Message }")]
-    EL[("EventLog · per run<br/>Stored { cursor, event: AgUi.Event }")]
-    CP[("Checkpoint · per step<br/>system → string<br/>model:n → ModelStep {assistant: Prompt}<br/>tool:callId → ToolStep")]
+    TH[("Thread · durable history<br/>Messages.Entry { id, runId?, subagentRunId?,<br/>message: Prompt.Message }")]
+    EL[("EventLog · per run<br/>EventLog.Stored { cursor, event: AgUiSchema.Event }")]
+    CP[("Checkpoint · per step<br/>system → string<br/>model:n → Agent.ModelStep {assistant: Prompt.Prompt}<br/>tool:callId → Agent.ToolStep")]
   end
 
   B -->|"POST"| RAI
   RAI -->|"delta · ingest"| RI
   TH -->|"load · project"| RI
-  RI -->|"model call"| RP
-  RP -->|"ModelPart"| AE
-  AE -->|"AgUi.fold"| EV
+  RI -->|"Agent.run"| AE
+  AE -->|"model call"| RP
+  RP -->|"StepEmitter"| AE
+  AE -->|"publish"| EV
   EV -->|"SSE"| B
-  AE -->|"commit entries"| TH
+  AE -->|"OnStepFinished · commit"| TH
   AE -.->|"append"| EL
   AE -.->|"Checkpoint.memo"| CP
   TH -->|"History.restore · toAgUi"| RES
@@ -81,40 +82,40 @@ The "AG-UI event" column is what the client receives. Detached and workflow runn
 
 **Open:** the runner starts the run and calls `History.beginAttempt`.
 
-| Moment      | Client                                                                                            | AG-UI event                                       | Run (`Agent.Event`)                                                                         | Thread (`Entry`)                                                                                                                                                                                          | Checkpoint (memo name → value)                                                                                  |
-| ----------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| request     | [wire] `RunAgentInput`: messages `[u1 user "Weather in Philly?"]`, no tools, thread `t`, run `r1` | [wire] `RUN_STARTED`, sent first, before any work |                                                                                             |                                                                                                                                                                                                           |                                                                                                                 |
-| fingerprint |                                                                                                   |                                                   |                                                                                             |                                                                                                                                                                                                           | [store] `input → string`: the encoded input. Reusing `r1` with a different input fails with `RunInputMismatch`. |
-| history     |                                                                                                   |                                                   |                                                                                             | [store] `claim(t, r1)`, then `load → []`. `delta` finds the client's new messages, `[u1]`, and `ingest` turns them into entries. [own] `commit [u1]`: `u1` is a user entry with a text part and run `r1`. |                                                                                                                 |
-| prompt      |                                                                                                   |                                                   | [own] `Agent.RunInput`: the prompt comes from the memo. `Agent.run` adds the system prompt. |                                                                                                                                                                                                           | [store] `prompt → Prompt` (`project(entries)`: `[user]`). [store] `subagent-prompts → {}`.                      |
+| Moment      | Client                                                                                            | AG-UI event                                       | Run (`Agent.run`)                                                                                      | Thread (`Entry`)                                                                                                                                                                                          | Checkpoint (memo name → value)                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| request     | [wire] `RunAgentInput`: messages `[u1 user "Weather in Philly?"]`, no tools, thread `t`, run `r1` | [wire] `RUN_STARTED`, sent first, before any work |                                                                                                        |                                                                                                                                                                                                           |                                                                                                                 |
+| fingerprint |                                                                                                   |                                                   |                                                                                                        |                                                                                                                                                                                                           | [store] `input → string`: the encoded input. Reusing `r1` with a different input fails with `RunInputMismatch`. |
+| history     |                                                                                                   |                                                   |                                                                                                        | [store] `claim(t, r1)`, then `load → []`. `delta` finds the client's new messages, `[u1]`, and `ingest` turns them into entries. [own] `commit [u1]`: `u1` is a user entry with a text part and run `r1`. |                                                                                                                 |
+| prompt      |                                                                                                   |                                                   | [own] `Agent.RunOptions`: the input, and the prompt from the memo. `Agent.run` adds the system prompt. |                                                                                                                                                                                                           | [store] `prompt → Prompt` (`project(entries)`: `[user]`). [store] `subagent-prompts → {}`.                      |
 
 **Step 1:** the model streams, then its tool calls run.
 
-| Moment     | Client                           | AG-UI event                                                                                                                 | Run (`Agent.Event`)                                                                                                                 | Thread (`Entry`)                                                                                                                              | Checkpoint (memo name → value)                                                                                                                   |
-| ---------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| step start |                                  | [wire] `STEP_STARTED`                                                                                                       | [own] `StepStarted`: step 1, with a newly minted message id `m1`                                                                    |                                                                                                                                               |                                                                                                                                                  |
-| reasoning  | shows the thinking as it arrives | [wire] `REASONING_START`, `REASONING_MESSAGE_START`, `CONTENT` × n, `END`, `REASONING_END`. Id `m1:reasoning:0`. Text only. | [own] `ModelPart` × n, each carrying [model] reasoning parts. The signature stays in the part's options and never reaches the wire. |                                                                                                                                               |                                                                                                                                                  |
-| tool call  |                                  | [wire] `TOOL_CALL_START c1` (`parentMessageId m1`), `TOOL_CALL_ARGS` × n                                                    | [own] `ModelPart` × n, each carrying [model] tool-call parts                                                                        |                                                                                                                                               |                                                                                                                                                  |
-| model done |                                  |                                                                                                                             |                                                                                                                                     |                                                                                                                                               | [store] `model:1 → ModelStep`: `{messageId m1, assistant: Prompt, toolCalls [c1], finishReason "tool-calls"}`. Stored once the stream completes. |
-| tool runs  |                                  |                                                                                                                             | The `get_weather` handler runs inside its memo.                                                                                     |                                                                                                                                               | [store] `tool:c1 → ToolStep`: `Result {messageId t1, encodedResult, isFailure false}`                                                            |
-| results    |                                  | [wire] `TOOL_CALL_END c1`, then `TOOL_CALL_RESULT` (message id `t1`, content is the result as JSON)                         | [own] `ToolResult`, emitted once every call in the step has finished                                                                |                                                                                                                                               |                                                                                                                                                  |
-| step end   |                                  | [wire] `STEP_FINISHED`, sent only after the commit to its right                                                             | [own] `StepFinished`: entries `[m1, t1]`                                                                                            | [own] `commit [m1, t1]`. `m1` is an assistant entry with a reasoning part and a tool-call part. `t1` is a tool entry with a tool-result part. |                                                                                                                                                  |
+| Moment     | Client                           | AG-UI event                                                                                                                 | Run (`Agent.run`)                                                                                                       | Thread (`Entry`)                                                                                                                              | Checkpoint (memo name → value)                                                                                                                   |
+| ---------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| step start |                                  | [wire] `STEP_STARTED`                                                                                                       | mints the message id `m1` inside the `model:1` memo, and emits `STEP_STARTED`                                           |                                                                                                                                               |                                                                                                                                                  |
+| reasoning  | shows the thinking as it arrives | [wire] `REASONING_START`, `REASONING_MESSAGE_START`, `CONTENT` × n, `END`, `REASONING_END`. Id `m1:reasoning:0`. Text only. | [model] reasoning parts drive the step's emitter. The signature stays in the part's options and never reaches the wire. |                                                                                                                                               |                                                                                                                                                  |
+| tool call  |                                  | [wire] `TOOL_CALL_START c1` (`parentMessageId m1`), `TOOL_CALL_ARGS` × n                                                    | [model] tool-call parts drive the step's emitter                                                                        |                                                                                                                                               |                                                                                                                                                  |
+| model done |                                  |                                                                                                                             |                                                                                                                         |                                                                                                                                               | [store] `model:1 → ModelStep`: `{messageId m1, assistant: Prompt, toolCalls [c1], finishReason "tool-calls"}`. Stored once the stream completes. |
+| tool runs  |                                  |                                                                                                                             | The `get_weather` handler runs inside its memo.                                                                         |                                                                                                                                               | [store] `tool:c1 → ToolStep`: `Result {messageId t1, encodedResult, isFailure false}`                                                            |
+| results    |                                  | [wire] `TOOL_CALL_END c1`, then `TOOL_CALL_RESULT` (message id `t1`, content is the result as JSON)                         | emits the results once every call in the step has finished                                                              |                                                                                                                                               |                                                                                                                                                  |
+| step end   |                                  | [wire] `STEP_FINISHED`, sent only after the commit to its right                                                             | hands the entries `[m1, t1]` to `OnStepFinished`, then emits `STEP_FINISHED`                                            | [own] `commit [m1, t1]`. `m1` is an assistant entry with a reasoning part and a tool-call part. `t1` is a tool entry with a tool-result part. |                                                                                                                                                  |
 
 **Step 2:** the model answers in text. There are no tool calls, so the loop stops.
 
-| Moment     | Client                          | AG-UI event                                                                    | Run (`Agent.Event`)                                     | Thread (`Entry`)                                                 | Checkpoint (memo name → value)                                                     |
-| ---------- | ------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| step start |                                 | [wire] `STEP_STARTED`                                                          | [own] `StepStarted`: step 2, message id `m2`            |                                                                  |                                                                                    |
-| text       | shows the tokens as they arrive | [wire] `TEXT_MESSAGE_START m2`, `TEXT_MESSAGE_CONTENT` × n, `TEXT_MESSAGE_END` | [own] `ModelPart` × n, each carrying [model] text parts |                                                                  |                                                                                    |
-| model done |                                 |                                                                                |                                                         |                                                                  | [store] `model:2 → ModelStep`: `{messageId m2, toolCalls [], finishReason "stop"}` |
-| step end   |                                 | [wire] `STEP_FINISHED`                                                         | [own] `StepFinished`: entries `[m2]`                    | [own] `commit [m2]`: `m2` is an assistant entry with a text part |                                                                                    |
+| Moment     | Client                          | AG-UI event                                                                    | Run (`Agent.run`)                            | Thread (`Entry`)                                                 | Checkpoint (memo name → value)                                                     |
+| ---------- | ------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| step start |                                 | [wire] `STEP_STARTED`                                                          | mints `m2`, and emits `STEP_STARTED`         |                                                                  |                                                                                    |
+| text       | shows the tokens as they arrive | [wire] `TEXT_MESSAGE_START m2`, `TEXT_MESSAGE_CONTENT` × n, `TEXT_MESSAGE_END` | [model] text parts drive the step's emitter  |                                                                  |                                                                                    |
+| model done |                                 |                                                                                |                                              |                                                                  | [store] `model:2 → ModelStep`: `{messageId m2, toolCalls [], finishReason "stop"}` |
+| step end   |                                 | [wire] `STEP_FINISHED`                                                         | hands the entries `[m2]` to `OnStepFinished` | [own] `commit [m2]`: `m2` is an assistant entry with a text part |                                                                                    |
 
-**Close:** `attempt.end` runs before the terminal event is sent.
+**Close:** the runner hands the terminal event to `attempt.end` before sending it.
 
-| Moment   | Client                                              | AG-UI event                                                                                  | Run (`Agent.Event`)                                        | Thread (`Entry`)                                                                                    | Checkpoint |
-| -------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
-| outcome  |                                                     |                                                                                              | [own] `Finished`: outcome `Success`, no pending tool calls | [store] `runEnded(t, r1, Success)`, the store's hook for compaction. Then [store] `release(t, r1)`. |            |
-| terminal | The stream ends. The client now holds its messages. | [wire] `RUN_FINISHED`, sent after the release so the client's next run finds the thread free |                                                            |                                                                                                     |            |
+| Moment   | Client                                              | AG-UI event                                                                                  | Run (`Agent.run`)                                     | Thread (`Entry`)                                                                                    | Checkpoint |
+| -------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
+| outcome  |                                                     |                                                                                              | builds `RUN_FINISHED` outcome `success`, with `usage` | [store] `runEnded(t, r1, Success)`, the store's hook for compaction. Then [store] `release(t, r1)`. |            |
+| terminal | The stream ends. The client now holds its messages. | [wire] `RUN_FINISHED`, sent after the release so the client's next run finds the thread free |                                                       |                                                                                                     |            |
 
 ### After the run
 
@@ -139,7 +140,7 @@ The "AG-UI event" column is what the client receives. Detached and workflow runn
 
 **If `get_weather` needed approval:**
 
-- `tool:c1` stores `ApprovalRequested` instead of a result, and the run emits `ApprovalRequested`.
+- `tool:c1` stores `ApprovalRequested` instead of a result, and the call gets no `TOOL_CALL_RESULT`.
 - Step 1 commits only `m1`, which now has a tool-approval-request part. There is no `t1`.
 - The run ends `Interrupted`: `runEnded(Interrupted)` is called, then `RUN_FINISHED` is sent with an `Interrupt`.
 - In the next run, the `resume` answer becomes a tool-approval-response entry, and step 0 runs or denies the call.
@@ -154,8 +155,8 @@ The "AG-UI event" column is what the client receives. Detached and workflow runn
 **If the process died after `model:1` was stored:**
 
 - A workflow runner, or a restarted detached run, executes `r1` again.
-- `input`, `prompt` and `model:1` come back from the store. `StepStarted` has `replayed: true`, and no `ModelPart`s are emitted.
-- `closeOpen` closes the spans the dead attempt left open in the log, and `fold` drops replayed events.
+- `input`, `prompt` and `model:1` come back from the store. The replayed step emits nothing, and its entries go to `OnStepFinished` again (commits are idempotent).
+- `closeOpen` closes the spans the dead attempt left open in the log. A replayed tool result or subagent end is emitted marked `metadata["effect-agent-harness"]` `{ replayed: true }`, and the runner's `publish` sends it only if the log lacks it, without the marker.
 - `tool:c1` was never stored, so the handler runs now, and the run carries on live from there.
 
 ## How they nest
@@ -163,7 +164,7 @@ The "AG-UI event" column is what the client receives. Detached and workflow runn
 Two nestings carry the design:
 
 - A stored `Entry` wraps an `effect/ai` message without changing it.
-- An `Agent.Event` carries both a model part, for the wire, and the entries a step produced, for the store.
+- `Agent.run` emits AG-UI events, for the wire, and hands the entries each step produced to its runner through `OnStepFinished`, for the store.
 
 ### `Messages.Entry` [own]
 
@@ -186,31 +187,25 @@ One per run request.
 - `messages: Message[]` [wire]:
   - `user`, `system`, `developer`, `reasoning`: a `content` (a string, or content parts on user messages)
   - `assistant`: `content` plus `toolCalls[]` of `{id, function: {name, arguments: string}}`
-  - `tool`: `toolCallId`, `content`, `error?`
+  - `tool`: `toolCallId`, `content`, `error?`, and `metadata["effect/ai"].isFailure` when the client copied a failed result's marker
 - `resume: answers[]` [wire], one per open interrupt
-  - `payload: AgUi.ApprovalResponse` [own]: `approved` (a boolean) and `reason?`, which is given to the model when the call is denied
+  - `payload: Agent.ApprovalResponse` [own]: `approved` (a boolean) and `reason?`, which is given to the model when the call is denied
 
-### `Agent.Event` [own]
+### What `Agent.run` emits [wire]
 
-The run's internal stream.
+The run's own stream is AG-UI, `AgUiSchema.Event` (21 of its event types; see the type catalog), with two markers in `metadata`:
 
-- `StepStarted` `{step, messageId}`
-- `ModelPart.part: Response.AnyPart` [model]
-- `ToolResult` `{toolCallId, encodedResult, isFailure}`
-- `ApprovalRequested` `{approvalId, toolCallId}`
-- `StepFinished.entries: Entry[]` [own]: what gets committed
-- `Finished.outcome: Outcome` [own]: `Success{pendingToolCalls}`, `Interrupted{approvals, pendingToolCalls}` or `Cancelled`
-- `Failed` `{error, code}`
-- `Subagent.event: Agent.Event` [own]: recursive, with one wrapper per level of nesting
+- `"effect/ai": { isFailure: true }` on a failed `TOOL_CALL_RESULT`, as `effect/ai`'s own agent marks one. It stays on the wire, and clients copy it onto the tool message they send back.
+- `"effect-agent-harness": { replayed: true }` on a replayed `TOOL_CALL_RESULT` or subagent lifecycle event. Runners remove it.
 
-Every event except `Finished` and `Failed` has a `replayed` flag, which is true when the step was served from a checkpoint.
+A child's events are its own run's, tagged with its `subagentRunId` by the parent that forwards them, between `SUBAGENT_STARTED` and its end. The terminal event carries `usage`. What AG-UI can't carry leaves the stream: each step's `Entry[]` [own] goes to the internal `OnStepFinished` hook, and a failure's original cause goes to the internal `OnRunFailed` hook, which the runner uses to log it and to end the run's span with it.
 
 ### `RUN_FINISHED` [wire]
 
 The event that ends a successful or interrupted run.
 
 - `pendingToolCallIds`: frontend calls left for the client
-- `Interrupt` [wire], built by `AgUi.approvalInterrupt`:
+- `Interrupt` [wire], built by the internal `approvalInterrupt` (`internal/events.ts`):
   - `id` (the approval id), `reason: "tool-approval"`, `toolCallId`, `subagentRunId?`
   - `responseSchema`: the JSON Schema of `ApprovalResponse`
 
@@ -263,25 +258,25 @@ _`effect/ai`._
 - **Why:** it is what the client keeps and sends back, and its `id` is what `delta` matches against stored entries. It loses things the model needs (provider options, the order of parts, approval parts), so it is never what's stored.
 - **Workflows:** live run, client history, restore.
 
-#### `AgUi.Event`
+#### `AgUiSchema.Event`
 
-_`src/AgUi.ts`, a union of `AgUiSchema` events._
+_`effect/ai`; the run emits 21 of its types._
 
-- **Holds:** twenty event types covering the run lifecycle, steps, text messages, reasoning spans and messages, tool calls and results, and the subagent lifecycle.
+- **Holds:** the 21 event types the run emits, covering the run lifecycle, steps, text messages, reasoning spans and messages, tool calls, results and progress (`ACTIVITY_SNAPSHOT`), and the subagent lifecycle. The library has no narrower type of its own.
 - **Why:** it describes a run while it happens, in small increments, so a UI can show tokens as they arrive. A finished message is never sent; the client folds the deltas into one. Only text reaches it, never provider metadata.
 - **Workflows:** live run, rejoin, subagents, crash recovery.
 
 #### `AgUiSchema.Interrupt`
 
-_Built by `AgUi.approvalInterrupt`._
+_Built by the internal `approvalInterrupt` (`internal/events.ts`)._
 
 - **Holds:** an open approval request: its id (the approval id), `reason: "tool-approval"`, the tool call, a prompt for the user, and the JSON Schema of the expected answer.
 - **Why:** it is AG-UI's generic way to pause a run for a human. A live run sends it in `RUN_FINISHED`, and `restore` returns it, so a reloaded client can still answer.
 - **Workflows:** approval, restore.
 
-#### `AgUi.ApprovalResponse` [own]
+#### `Agent.ApprovalResponse` [own]
 
-_`src/AgUi.ts`._
+_`src/internal/events.ts`, exported by `Agent`._
 
 - **Holds:** `approved`, and an optional `reason`.
 - **Why:** AG-UI leaves the shape of an interrupt's answer up to the server. This is the library's contract for it, published as `responseSchema` so a generic client knows what to send. A malformed answer denies the call.
@@ -321,41 +316,25 @@ _`src/Messages.ts`._
   - `subagentRunId` keeps each agent's prompt to its own entries.
 - **Workflows:** live run, client history, restore, subagents.
 
-#### `Agent.RunInput`
+#### `Agent.RunOptions`
 
 _`src/Agent.ts`._
 
 - **Holds:**
-  - the run ids and props
-  - a `Prompt` without the system prompt
-  - the frontend tools
+  - the run's AG-UI input, `RunAgentInput` [wire]: its ids, `forwardedProps`, frontend `tools`, `state`; provided to the agent as `AgUiServer.RunInput`
+  - a `Prompt` without the system prompt: the conversation, which the loop takes from here and never from `input.messages`
   - the prompts of suspended subagents
   - a cancellation signal
-- **Why:** it keeps the agent loop independent of AG-UI and of which history is in use. Whichever history built it, the loop sees a Prompt.
+- **Why:** the input is what the client asked for, and the prompt is what the history made of it. Under the server history they differ: `messages` is only the client's delta. Whichever history built the prompt, the loop sees a Prompt.
 - **Workflows:** live run, client history, subagents.
 
-#### `Agent.Event`
+#### `OnStepFinished` (internal)
 
-_`src/Agent.ts`._
+_`src/internal/hooks.ts`._
 
-- **Holds:**
-  - step boundaries
-  - model parts
-  - tool results
-  - approval requests
-  - each step's finished `entries`
-  - the run's outcome or failure
-  - wrapped subagent events
-- **Why:** one stream feeds two consumers: `AgUi.fold` turns it into wire events, and the history commits `StepFinished.entries`. Its `replayed` flag lets a resumed run rebuild its state without sending clients what they already saw.
-- **Workflows:** live run, approval, crash recovery, subagents.
-
-#### `Agent.Outcome`, `Approval`, `PendingToolCall`
-
-_`src/Agent.ts`._
-
-- **Holds:** how the run ended: success or interrupted, with the approvals it is waiting for and the frontend calls it left.
-- **Why:** this is the run's end state before it becomes wire format. It becomes `RUN_FINISHED` (with interrupts and `pendingToolCallIds`), and the `Thread.RunOutcome` passed to `runEnded`.
-- **Workflows:** approval, frontend tool.
+- **Holds:** the function that receives each step's `Entry[]` before its `STEP_FINISHED`: a runner's history `commit`, or a parent run collecting its child's entries into the calling step. Its sibling `ChildReport` tells a parent whether its child replayed, and the approvals it waits for.
+- **Why:** entries hold what AG-UI can't carry (reasoning signatures, file parts, approval and frontend marks, owners), so they leave the event stream through a service rather than on an event. It's internal: evals read the events, and check what's stored through a runner and `History.restore`.
+- **Workflows:** live run, crash recovery, subagents.
 
 #### `Thread.RunOutcome`
 
@@ -369,7 +348,7 @@ _`src/Thread.ts`._
 
 _`src/EventLog.ts`._
 
-- **Holds:** an `AgUi.Event` and the cursor the log gave it, which is sent as the SSE `id`.
+- **Holds:** an `AgUiSchema.Event` and the cursor the log gave it, which is sent as the SSE `id`.
 - **Why:** it lets a client watch a run that outlives its request, and reconnect where it stopped. Only detached and workflow runners write it. It is not the history.
 - **Workflows:** rejoin, crash recovery.
 
@@ -400,10 +379,10 @@ The common path when the server owns the transcript.
 1. The client sends a `RunAgentInput` [wire].
 2. The run claims the thread and loads its `Entry[]` [own].
 3. `delta` matches the ids of the client's `Message`s [wire] to stored entries. `ingest` turns the new user messages into entries, and they are committed.
-4. `project` builds a `Prompt` [model] for the `Agent.RunInput` [own].
-5. The model streams `Response.AnyPart`s [model], each wrapped in an `Agent.Event` [own].
-6. `AgUi.fold` sends `AgUi.Event`s [wire] to the client.
-7. Each `StepFinished.entries` is committed to the Thread.
+4. `project` builds a `Prompt` [model] for the `Agent.RunOptions` [own], next to the input.
+5. The model streams `Response.AnyPart`s [model], and `Agent.run` turns them into `AgUiSchema.Event`s [wire].
+6. The runner's `publish` sends them to the client.
+7. Each step's entries are committed to the Thread through `OnStepFinished`, before the step's `STEP_FINISHED`.
 8. `runEnded` gets a `RunOutcome` [own], the claim is released, and then `RUN_FINISHED` is sent.
 
 ### Live run, client history
@@ -413,7 +392,7 @@ The default. Nothing is stored.
 1. The client sends a `RunAgentInput` [wire] holding its whole transcript.
 2. `fromHistory` turns every `Message` [wire] into an `Entry` [own] in memory.
 3. From here it is the same as the server path, except that commits and `runEnded` do nothing.
-4. The client folds the `AgUi.Event`s [wire] into its own messages and keeps them.
+4. The client folds the `AgUiSchema.Event`s [wire] into its own messages and keeps them.
 
 ### Approval interrupt and resume
 
@@ -455,7 +434,7 @@ Detached and workflow runners only.
 A workflow run is executed again after its process died.
 
 1. `Checkpoint.memo` replays the stored `ModelStep` and `ToolStep` [own] exits instead of calling the model or the tools.
-2. Their `Agent.Event`s [own] carry `replayed: true`, and `fold` drops them.
+2. They emit nothing, except a replayed tool result or subagent end, marked in `metadata`; `publish` sends that only if the log lacks it.
 3. `closeOpen` closes the spans the dead attempt left open in the log.
 4. Commits are idempotent by entry id, so replayed steps are not stored twice.
 
@@ -463,8 +442,8 @@ A workflow run is executed again after its process died.
 
 An agent hands work to another agent through a tool call.
 
-1. The child's events arrive as `Subagent{event}`, wrapped once per level of nesting.
-2. `fold` emits `SUBAGENT_STARTED`, `SUBAGENT_FINISHED` or `SUBAGENT_ERROR`, and tags the child's events with `subagentRunId`.
+1. The parent runs the child's `Agent.run` and forwards its events, tagged with the child's `subagentRunId` unless a deeper subagent owns them.
+2. The parent emits `SUBAGENT_STARTED` before the child's first event, and `SUBAGENT_ERROR`, `SUBAGENT_FINISHED suspended`, or `SUBAGENT_FINISHED` with the result just before the spawning call's `TOOL_CALL_RESULT`.
 3. The child's entries are stored with `subagentRunId`, and `project` builds each agent's prompt from its own entries only.
 4. A suspended child is resumed from `subagentPrompts`, which `projectSuspended` builds.
 
@@ -476,25 +455,23 @@ An agent hands work to another agent through a tool call.
 | ---------------------------- | :---------------: | :------------: | :------: | :-----------: | :-----: | :----: | :------------: | :-------: |
 | RunAgentInput                |         ○         |       ○        |    ○     |       ○       |         |        |                |           |
 | AgUiSchema.Message           |         ○         |       ○        |          |       ○       |    ●    |   ●    |                |     ●     |
-| AgUi.Event                   |         ●         |       ●        |    ●     |       ●       |         |   ○    |       ●        |     ●     |
+| AgUiSchema.Event             |         ●         |       ●        |    ●     |       ●       |         |   ○    |       ●        |     ●     |
 | Interrupt / ApprovalResponse |                   |                |    ●     |               |    ●    |        |                |     ●     |
 | Prompt.Message               |         ●         |       ●        |    ●     |       ●       |    ○    |        |       ○        |     ●     |
 | Response.AnyPart             |         ○         |       ○        |          |       ○       |         |        |                |     ○     |
 | Messages.Entry               |         ●         |       ○        |    ●     |       ●       |    ○    |   ○    |       ○        |     ●     |
-| Agent.RunInput               |         ○         |       ○        |    ○     |       ○       |         |        |       ○        |     ○     |
-| Agent.Event                  |         ●         |       ●        |    ●     |       ●       |         |        |       ●        |     ●     |
-| Agent.Outcome                |         ●         |       ●        |    ●     |       ●       |         |        |                |           |
+| Agent.RunOptions             |         ○         |       ○        |    ○     |       ○       |         |        |       ○        |     ○     |
 | EventLog.Stored              |                   |                |          |               |         |   ○    |       ●        |           |
 | ModelStep / ToolStep         |                   |                |    ●     |               |         |        |       ○        |     ●     |
 | History.Restored             |                   |                |          |               |    ●    |   ●    |                |           |
 
 ## Why not one shape
 
-- **The wire is incremental, and storage is whole.** `AgUi.Event` exists so a UI can show a run as it streams. The history needs finished messages, so events are logged per run only to support reconnects.
+- **The wire is incremental, and storage is whole.** `AgUiSchema.Event` exists so a UI can show a run as it streams. The history needs finished messages, so events are logged per run only to support reconnects.
 - **The client's shape loses things the model needs.** `AgUiSchema.Message` drops provider options (such as thinking signatures), the order of parts within a turn, and approval parts. Converting from Prompt to AG-UI is always possible; the reverse is not.
 - **Prompt messages don't know about threads.** `Entry` adds the id the client sees, the run that committed it, and the subagent that owns it. History matching, rejoin and subagent prompts all depend on those.
-- **The agent loop shouldn't know about AG-UI.** `Agent.Event` and `Agent.RunInput` sit between the model and the wire, so one run feeds both what the client sees and what the store keeps, under either history.
+- **The loop speaks AG-UI, but stores Prompt.** `Agent.run` emits what the client sees directly, and hands what the store keeps to its runner on the side, so one run feeds both under either history without a second event vocabulary between them.
 
 ---
 
-Source: `packages/effect-agent-harness/src` (`Messages`, `Agent`, `AgUi`, `History`, `Thread`, `EventLog`, `Checkpoint`, `internal/conversions`), against `effect@4.1.4`.
+Source: `packages/effect-agent-harness/src` (`Messages`, `Agent`, `History`, `Thread`, `EventLog`, `Checkpoint`, `internal/conversions`, `internal/events`, `internal/hooks`, `internal/publish`), against `effect@4.1.4`.
